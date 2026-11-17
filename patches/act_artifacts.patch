@@ -1,0 +1,12 @@
+--- a/pkg/artifacts/artifacts_v4.go
++++ b/pkg/artifacts/artifacts_v4.go
+@@ -254,3 +254,3 @@
+ 	uploadURL := "http://" + host + strings.TrimSuffix(r.prefix, "/") +
+-		"/" + endp + "?sig=" + base64.URLEncoding.EncodeToString(r.buildSignature(endp, expires, artifactName, taskID)) + "&expires=" + url.QueryEscape(expires) + "&artifactName=" + url.QueryEscape(artifactName) + "&taskID=" + fmt.Sprint(taskID)
++		"/" + endp + "?sig=" + url.QueryEscape(base64.URLEncoding.EncodeToString(r.buildSignature(endp, expires, artifactName, taskID))) + "&expires=" + url.QueryEscape(expires) + "&artifactName=" + url.QueryEscape(artifactName) + "&taskID=" + fmt.Sprint(taskID)
+ 	return uploadURL
+@@ -288,3 +288,3 @@
+ 	}
+-	err = protojson.Unmarshal(body, req)
++	err = (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, req)
+ 	if err != nil {

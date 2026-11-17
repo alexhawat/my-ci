@@ -1,0 +1,19 @@
+FROM golang:1.26.10-bookworm@sha256:5de7c99eb78ca5e515a4c340235d0955ec5964a5071c492c15503d7c267da473 AS act
+ARG ACT_COMMIT=2540ba6c49dfbafe167d655e4044921cd2ed19e7
+WORKDIR /src
+RUN git init && git remote add origin https://github.com/nektos/act.git \
+    && git fetch --depth=1 origin "$ACT_COMMIT" && git checkout --detach FETCH_HEAD
+# Accept additive protobuf metadata and percent-encode the signed URL's base64
+# padding so Azure's query parser preserves it. Signature verification stays strict.
+COPY patches/act_artifacts.patch /tmp/act_artifacts.patch
+RUN git apply /tmp/act_artifacts.patch
+COPY patches/act_artifacts_test.go pkg/artifacts/localci_metadata_test.go
+COPY patches/act_action_cache.patch /tmp/act_action_cache.patch
+RUN git apply /tmp/act_action_cache.patch
+COPY patches/act_action_cache_test.go pkg/runner/localci_action_cache_test.go
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go test ./pkg/artifacts -skip TestArtifactFlow \
+    && go test -short ./pkg/runner -run '^TestLocalCI' \
+    && CGO_ENABLED=0 go build -ldflags '-X main.version=0.2.97-localci.2' -o /out/act .
+FROM docker:29-dind@sha256:4bbc7223f81db790097c6dea42fb93e05b8fead4f0431fbe6ccaba6e8473201c
+RUN apk add --no-cache git curl nodejs python3 bash
+COPY --from=act /out/act /usr/local/bin/act

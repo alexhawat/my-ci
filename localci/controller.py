@@ -1,0 +1,306 @@
+import asyncio
+import contextlib
+import json
+import os
+import shutil
+import time
+from pathlib import Path
+
+from cryptography.fernet import Fernet
+
+from localci.github import GitHub
+from localci.policy import eligible
+from localci.reporting import comment_body, reports
+from localci.review_reconcile import reconcile_legacy_reviews
+from localci.runner import Runner
+from localci.store import Store
+
+
+class Controller:
+    def __init__(self, root: Path):
+        self.root = root
+        root.mkdir(parents=True, exist_ok=True)
+        self.store = Store(root / "localci.db")
+        self.github = GitHub(Path(os.environ.get("LOCALCI_TOKEN_FILE", "/run/secrets/github-token")))
+        key = root / "encryption.key"
+        with self.store.writer():
+            if not key.exists():
+                fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(Fernet.generate_key())
+        self.cipher = Fernet(key.read_bytes())
+        self.github.app_credentials = lambda: self.secrets("__github_app__", "app")
+        self.capacity: dict = {}
+        self.login = ""
+        self.error = ""
+        self.last_poll = 0.0
+        self.last_discovery = 0.0
+        self.lock = asyncio.Lock()
+        self.publish_lock = asyncio.Lock()
+        self.publish_retries: dict[str, tuple[int, float]] = {}
+        self.wake = asyncio.Event()
+        self.base_url = os.environ.get("LOCALCI_URL", "http://localhost:8787").rstrip("/")
+        self.host_label = os.environ.get("LOCALCI_HOST_LABEL", "local worker")
+
+    def status(self):
+        rows = self.store.rows("SELECT value FROM settings WHERE key='worker_status'")
+        status = (
+            json.loads(rows[0]["value"])
+            if rows
+            else {
+                "login": self.login,
+                "error": self.error,
+                "last_poll": self.last_poll,
+                "capacity": self.capacity,
+                "heartbeat": 0,
+            }
+        )
+        status["online"] = bool(status.get("heartbeat") and time.time() - status["heartbeat"] < 30)
+        return status
+
+    def notify(self, *, discover=False):
+        # Durable requests cross the dashboard/worker process boundary.
+        import uuid
+
+        with self.store.connect() as db:
+            for key in ["worker_wake", "worker_sync"] if discover else ["worker_wake"]:
+                db.execute(
+                    "INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, uuid.uuid4().hex),
+                )
+        self.wake.set()
+
+    async def heartbeat(self):
+        seen = {}
+        while True:
+            rows = await asyncio.to_thread(
+                self.store.rows, "SELECT key,value FROM settings WHERE key IN ('worker_wake','worker_sync')"
+            )
+            for row in rows:
+                if seen.get(row["key"]) != row["value"]:
+                    seen[row["key"]] = row["value"]
+                    if row["key"] == "worker_sync":
+                        self.last_discovery = 0
+                    self.wake.set()
+            await asyncio.to_thread(
+                self.store.execute,
+                "INSERT INTO settings VALUES('worker_status',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (
+                    json.dumps(
+                        {
+                            "login": self.login,
+                            "error": self.error,
+                            "last_poll": self.last_poll,
+                            "capacity": self.capacity,
+                            "heartbeat": time.time(),
+                        }
+                    ),
+                ),
+            )
+            await asyncio.sleep(2)
+
+    def secrets(self, repo: str, scope: str) -> dict[str, str]:
+        return {
+            row["name"].split(":", 1)[1]: self.cipher.decrypt(row["ciphertext"].encode()).decode()
+            for row in self.store.rows(
+                "SELECT * FROM secrets WHERE repo=? AND name LIKE ?", (repo, scope + ":%")
+            )
+        }
+
+    async def discover(self):
+        self.login, repos = await self.github.discover()
+        await asyncio.to_thread(self.store.discover, repos)
+        self.last_discovery = time.time()
+
+    async def poll(self):
+        async with self.lock:
+            if time.time() - self.last_discovery > 600:
+                await self.discover()
+            for repo in await asyncio.to_thread(self.store.rows, "SELECT * FROM repos WHERE enabled=1"):
+                try:
+                    prs = await self.github.pages(f"repos/{repo['name']}/pulls?state=open")
+                    await asyncio.to_thread(self.store.cancel_stale, repo["name"], prs)
+                    await asyncio.to_thread(self.store.replace_prs, repo["name"], prs)
+                    for pr in prs:
+                        if eligible(pr, repo["name"]):
+                            await asyncio.to_thread(
+                                self.store.enqueue, repo["name"], pr, json.loads(repo["config"])
+                            )
+                    await asyncio.to_thread(
+                        self.store.execute, "UPDATE repos SET error='' WHERE name=?", (repo["name"],)
+                    )
+                except Exception as exc:
+                    await asyncio.to_thread(
+                        self.store.execute, "UPDATE repos SET error=? WHERE name=?", (str(exc), repo["name"])
+                    )
+            self.last_poll = time.time()
+            self.error = ""
+            await self.publish()
+
+    def reports(self, run):
+        values = [*self.secrets(run["repo"], "ci").values(), *self.secrets(run["repo"], "review").values()]
+        if self.github.token_path.is_file():
+            values.append(self.github.token())
+        return reports(run, self.root, self.store, values)
+
+    async def publish(self):
+        async with self.publish_lock:
+            await self._publish()
+
+    async def _publish(self):
+        await asyncio.to_thread(
+            self.store.execute,
+            """UPDATE runs SET published=1 WHERE state NOT IN ('queued','running') AND EXISTS (
+            SELECT 1 FROM runs newer WHERE newer.repo=runs.repo AND newer.pr=runs.pr AND newer.created>runs.created)""",
+        )
+        # Only the newest attempt for a PR may update its aggregate status. Old completions never overwrite it.
+        for run in await asyncio.to_thread(
+            self.store.rows,
+            """SELECT r.* FROM runs r WHERE r.published=0 AND NOT EXISTS (
+                SELECT 1 FROM runs newer WHERE newer.repo=r.repo AND newer.pr=r.pr AND newer.created>r.created)
+                ORDER BY r.created DESC LIMIT 50""",
+        ):
+            retry_at = self.publish_retries.get(run["id"], (0, 0))[1]
+            if time.time() < retry_at:
+                continue
+            state = {
+                "queued": "pending",
+                "running": "pending",
+                "success": "success",
+                "failure": "failure",
+            }.get(run["state"], "error")
+            description = run["message"] or f"Local CI {run['state']} on {self.host_label}"
+            try:
+                evidence = await asyncio.to_thread(self.reports, run)
+                # Recheck before final phase comments as well as aggregate results.
+                if state != "pending" or evidence:
+                    current = await self.github.request("GET", f"repos/{run['repo']}/pulls/{run['pr']}")
+                    if (current["head"]["sha"], current["base"]["sha"]) != (run["head"], run["base"]):
+                        await asyncio.to_thread(
+                            self.store.execute,
+                            "UPDATE runs SET published=1,publish_error='Superseded revision; not published' WHERE id=?",
+                            (run["id"],),
+                        )
+                        continue
+                reporting = await self.github.status(
+                    run, state, description, f"{self.base_url}/?run={run['id']}"
+                )
+                for kind, report in evidence.items():
+                    await self.github.comment(
+                        run, kind, comment_body(run, kind, report, f"{self.base_url}/?run={run['id']}")
+                    )
+                if reporting:
+                    await asyncio.to_thread(
+                        self.store.execute,
+                        "INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (f"reporting:{run['repo']}", json.dumps(reporting)),
+                    )
+                await asyncio.to_thread(
+                    self.store.execute,
+                    "UPDATE runs SET published=1,publish_error='' WHERE id=? AND state=? AND steps=?",
+                    (run["id"], run["state"], run["steps"]),
+                )
+                self.publish_retries.pop(run["id"], None)
+            except Exception as exc:
+                failures = self.publish_retries.get(run["id"], (0, 0))[0] + 1
+                delay = min(300, 5 * 2 ** (failures - 1))
+                self.publish_retries[run["id"]] = (failures, time.time() + delay)
+                await asyncio.to_thread(
+                    self.store.execute,
+                    "UPDATE runs SET publish_error=? WHERE id=?",
+                    (f"{exc}; retrying with backoff", run["id"]),
+                )
+
+    async def monitor(self):
+        while True:
+            self.wake.clear()
+            try:
+                await self.poll()
+                await asyncio.to_thread(self.prune)
+            except Exception as exc:
+                self.error = str(exc)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.wake.wait(), 60)
+
+    def prune(self):
+        self.store.execute("DELETE FROM run_usage WHERE created<?", (time.time() - 90 * 86400,))
+        cutoff = time.time() - 14 * 86400
+        for run in self.store.rows("SELECT id FROM runs WHERE finished<? AND published=1", (cutoff,)):
+            (self.root / "logs" / f"{run['id']}.log").unlink(missing_ok=True)
+            shutil.rmtree(self.root / "artifacts" / run["id"], ignore_errors=True)
+            self.store.execute("DELETE FROM run_events WHERE run_id=?", (run["id"],))
+            self.store.execute("DELETE FROM resource_samples WHERE run_id=?", (run["id"],))
+            self.store.execute("DELETE FROM runs WHERE id=?", (run["id"],))
+
+    async def worker(self):
+        # Only the exclusive worker service may recover runs and manage containers.
+        await asyncio.to_thread(self.store.reconcile_results)
+        await asyncio.to_thread(reconcile_legacy_reviews, self.store, self.root)
+        runner = Runner(self.store, self.github, self.root, self.secrets)
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "info", "--format", "{{json .}}", stdout=asyncio.subprocess.PIPE
+        )
+        output, _ = await proc.communicate()
+        info = json.loads(output)
+        self.capacity = {"cpus": info["NCPU"], "memory_gb": int(info["MemTotal"] / 2**30)}
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "ps", "-aq", "--filter", "label=localci.worker=true", stdout=asyncio.subprocess.PIPE
+        )
+        output, _ = await proc.communicate()
+        for name in output.decode().split():
+            await runner.cleanup(name)
+        # A crash cannot leave decrypted CI/provider credentials in the data volume.
+        await asyncio.to_thread(shutil.rmtree, self.root / "work", ignore_errors=True)
+        for row in await asyncio.to_thread(self.store.rows, "SELECT id FROM runs WHERE state='running'"):
+            await asyncio.to_thread(
+                self.store.finish, row["id"], "error", "Execution worker restarted; retry this run"
+            )
+        await self.schedule()
+
+    async def execute_run(self, run):
+        runner = Runner(self.store, self.github, self.root, self.secrets)
+        try:
+            await runner.execute(run)
+        except Exception:
+            await asyncio.to_thread(
+                self.store.finish, run["id"], "error", "Worker setup failed; inspect execution worker logs"
+            )
+        await self.publish()
+
+    async def schedule(self):
+        active = {}
+        try:
+            while True:
+                done = {t for t in active if t.done()}
+                for task in done:
+                    try:
+                        task.result()
+                    except Exception as exc:
+                        self.error = f"Run finalization failed: {exc}"
+                    del active[task]
+                settings = await asyncio.to_thread(self.store.settings, self.capacity)
+                # Lowering the limit drains existing runs; it never kills them.
+                while not settings["paused"] and len(active) < settings["max_parallel_runs"]:
+                    # In-flight runs retain their old limits after a settings change.
+                    if sum(v["cpus_per_run"] for v in active.values()) + settings["cpus_per_run"] > max(
+                        1, self.capacity["cpus"] - 2
+                    ) or sum(v["memory_gb_per_run"] for v in active.values()) + settings[
+                        "memory_gb_per_run"
+                    ] > max(2, self.capacity["memory_gb"] - 4):
+                        if await asyncio.to_thread(
+                            self.store.rows, "SELECT id FROM runs WHERE state='queued' LIMIT 1"
+                        ):
+                            self.error = (
+                                "Queued run does not fit configured host capacity; reduce CPU/memory limits "
+                                "or free an active run"
+                            )
+                        break
+                    run = await asyncio.to_thread(self.store.claim, settings)
+                    if not run:
+                        break
+                    active[asyncio.create_task(self.execute_run(run))] = settings
+                await asyncio.sleep(1)
+        finally:
+            for task in active:
+                task.cancel()
+            await asyncio.gather(*active, return_exceptions=True)

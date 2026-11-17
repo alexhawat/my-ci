@@ -1,0 +1,27 @@
+[project]
+name = "localci"
+version = "0.1.0"
+description = "Self-hosted Docker CI and pull-request reviews"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "httpx>=0.28,<1", "pyyaml>=6,<7", "cryptography>=44"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.12", "pyright>=1.1"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["E501", "B008", "ASYNC240"]
+
+[tool.pyright]
+include = ["localci"]
+typeCheckingMode = "basic"

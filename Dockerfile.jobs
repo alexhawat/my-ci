@@ -1,0 +1,22 @@
+FROM --platform=linux/amd64 ghcr.io/catthehacker/ubuntu:act-24.04@sha256:7bf3a8afc2bbfe7fdaf4b9d2716cb2f3634fd21e4f38e26aa17a12cfda80d721
+USER root
+ARG GO_VERSION=1.27.4
+ARG GO_SHA256=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
+ARG CHROME_VERSION=157.0.8103.78-1
+ARG CHROME_SHA256=4d740636b5c96f687798602c5aad6a5a270f44dd02e48db0638ae77aa4867b1b
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz \
+    && echo "${GO_SHA256}  /tmp/go.tar.gz" | sha256sum -c - \
+    && rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+ENV PATH=/usr/local/go/bin:${PATH}
+RUN curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb \
+    && echo "${CHROME_SHA256}  /tmp/chrome.deb" | sha256sum -c - \
+    && test "$(dpkg-deb -f /tmp/chrome.deb Version)" = "${CHROME_VERSION}" \
+    && apt-get update && apt-get install -y --no-install-recommends /tmp/chrome.deb xvfb xauth \
+    && rm /tmp/chrome.deb && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1001 -s /bin/bash runner \
+    && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+    && chmod 440 /etc/sudoers.d/runner
+ENV HOME=/home/runner
+USER runner:root
+RUN go version && test -w "${HOME}"
