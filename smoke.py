@@ -1,6 +1,8 @@
 """Exercise the real runner against local fixture commits, without GitHub writes.
 
-Run inside the controller with LOCALCI_SMOKE_GH_AUTH=1 and its existing gh login.
+Run inside the execution worker service, which has the Docker socket, with
+LOCALCI_SMOKE_GH_AUTH=1 and the host token file (LOCALCI_TOKEN_FILE, default
+/run/secrets/github-token). The real token reaches jobs that run third-party actions.
 """
 
 import asyncio
@@ -118,7 +120,7 @@ async def main():
         git(source, "commit", "-am", "Fixture PR")
         head = git(source, "rev-parse", "HEAD")
         token = root / "token"
-        token.write_text(Path("/run/secrets/github-token").read_text())
+        token.write_text(Path(os.environ.get("LOCALCI_TOKEN_FILE", "/run/secrets/github-token")).read_text())
         token.chmod(0o600)
         store = Store(root / "data" / "db")
         runner = Runner(store, GitHub(token), root / "data", lambda *_: {})

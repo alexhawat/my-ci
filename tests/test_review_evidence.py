@@ -150,7 +150,9 @@ def test_fallback_rejects_unbound_or_invalid_evidence(tmp_path, damage):
     report = reports(run, tmp_path, store, [])["review"]
     assert report["findings_source"] == "unavailable" and report["findings"] == []
     body = comment_body(run, "review", report, "https://private.test")
-    assert "unavailable" in body.lower() and "No findings" not in body
+    # Missing evidence must never read as a clean review.
+    assert "Change-scoped findings are unavailable" in body
+    assert "No change-scoped findings" not in body
 
 
 def test_primary_valid_empty_result_takes_precedence(tmp_path):

@@ -57,7 +57,8 @@ async def main():
         token.write_text("fixture-not-a-credential")
         c = Controller(root / "data")
         c.github = GitHub(token)
-        c.capacity = {"cpus": 32, "memory_gb": 125}
+        # Synthetic capacity: two 4-CPU/8-GiB runs fit after the scheduler's 2-CPU/4-GiB reserve.
+        c.capacity = {"cpus": 10, "memory_gb": 20}
         c.store.save_settings(
             {"max_parallel_runs": 2, "cpus_per_run": 4, "memory_gb_per_run": 8, "paused": False}
         )

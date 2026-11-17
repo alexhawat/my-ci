@@ -110,3 +110,33 @@ def test_public_project_files_exist():
         assert name in files
     assert "MIT License" in (ROOT / "LICENSE").read_text()
     assert os.access(ROOT / "scripts/build_review.sh", os.X_OK)
+
+
+def test_no_private_network_names_or_addresses():
+    # Generic shapes only: no list of real names, so the test itself cannot leak one.
+    expressions = {
+        "tailnet hostname": r"\b[a-z0-9-]+\.ts\.net\b",
+        "CGNAT/tailnet address": r"\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b",
+        "private IPv4 address": r"\b(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b",
+        "private registry namespace": "ghcr" + r"\.io/" + "alexhawat" + r"\b",
+    }
+    failures = [
+        f"{name}: {label}: {match.group(0)}"
+        for name, text in tracked_text().items()
+        for label, pattern in expressions.items()
+        for match in re.finditer(pattern, text, re.I)
+    ]
+    assert not failures, "Private network details in public release:\n" + "\n".join(failures)
+
+
+def test_email_addresses_are_placeholders():
+    # Only dotted domains look like deliverable addresses; action@sha pins and
+    # single-label fixtures such as localci@localhost do not match.
+    allowed = ("example.com", "example.org", "example.net", "users.noreply.github.com", "anthropic.com")
+    failures = []
+    for name, text in tracked_text().items():
+        for match in re.finditer(r"\b[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b", text):
+            domain = match.group(1).casefold()
+            if domain != "github.com" and not any(domain == d or domain.endswith("." + d) for d in allowed):
+                failures.append(f"{name}: {match.group(0)}")
+    assert not failures, "Non-placeholder email addresses in public release:\n" + "\n".join(failures)

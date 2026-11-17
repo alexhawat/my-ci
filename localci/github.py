@@ -58,15 +58,20 @@ class GitHub:
                 raise GitHubError(response.status_code, method, path)
             return response.json() if response.content else None
 
-    async def pages(self, path: str, *, max_pages: int = 100) -> list:
+    async def pages(self, path: str, *, max_pages: int = 100, truncate: bool = False) -> list:
+        """Fetch every page. A caller that acts on the complete list (stale-run
+        cancellation, comment lookup) must never get a silently shortened one, so
+        hitting the cap is an error unless the caller opts into truncation."""
         result = []
         separator = "&" if "?" in path else "?"
         for page in range(1, max_pages + 1):
             values = await self.request("GET", f"{path}{separator}per_page=100&page={page}")
             result.extend(values)
             if len(values) < 100:
-                break
-        return result
+                return result
+        if truncate:
+            return result
+        raise RuntimeError(f"GitHub pagination exceeded {max_pages} pages; refusing a partial result")
 
     async def discover(self):
         user, repos = await asyncio.gather(

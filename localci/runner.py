@@ -1,13 +1,16 @@
 import asyncio
 import base64
 import contextlib
+import functools
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import threading
 import time
+import urllib.parse
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,7 +18,7 @@ from pathlib import Path
 import yaml
 
 from localci.github import GitHub
-from localci.policy import Blocked, dependabot_pr, plan
+from localci.policy import Blocked, dependabot_pr, github_token_referenced, plan, secret_references
 from localci.review_evidence import (
     classify_review,
     configuration_diagnostic,
@@ -30,11 +33,133 @@ class Cancelled(RuntimeError):
     pass
 
 
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# Fragments derived from a secret (its stripped form, individual lines) are redacted
+# only when reasonably long, so short pieces cannot wreck unrelated log text.
+MIN_SECRET_FRAGMENT = 8
+OUTPUT_LINE_LIMIT = 100_000
+OVERSIZED_LINE = "[oversized output line omitted]\n"
+
+
+def strip_controls(text: str) -> str:
+    return _CONTROL.sub("", _ANSI.sub("", text))
+
+
+@functools.lru_cache(maxsize=16)
+def _secret_forms(secrets: tuple[str, ...]) -> tuple[str, ...]:
+    forms: set[str] = set()
+    for secret in filter(None, secrets):
+        # Encodings are never shorter than the value itself.
+        forms |= {
+            secret,
+            base64.b64encode(secret.encode()).decode(),
+            json.dumps(secret)[1:-1],
+            json.dumps(secret, ensure_ascii=False)[1:-1],
+            urllib.parse.quote(secret, safe=""),
+        }
+        # Logs are line-oriented and stripped of control characters: also cover
+        # the normalised value and each line of a multi-line secret.
+        fragments = {strip_controls(secret)}
+        for line in re.split(r"\r\n|\r|\n", secret):
+            fragments |= {line, strip_controls(line)}
+        forms |= {f for f in fragments if len(f) >= MIN_SECRET_FRAGMENT}
+    forms.discard("")
+    return tuple(sorted(forms, key=len, reverse=True))
+
+
 def redact(text: str, secrets: list[str]) -> str:
-    for secret in sorted(filter(None, secrets), key=len, reverse=True):
-        text = text.replace(secret, "[redacted]")
-        text = text.replace(base64.b64encode(secret.encode()).decode(), "[redacted]")
+    for form in _secret_forms(tuple(secrets)):
+        text = text.replace(form, "[redacted]")
     return re.sub(r"(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "[redacted]", text)
+
+
+def sanitize(text: str, secrets: list[str]) -> str:
+    """Redact, strip escapes/control characters, then redact again.
+
+    The first pass catches secrets that themselves contain stripped characters;
+    the second catches secrets split by escapes that stripping rejoined.
+    """
+    return redact(strip_controls(redact(text, secrets)), secrets)
+
+
+AGENT_FILES = {
+    "agents.md",
+    "claude.md",
+    "claude.local.md",
+    "gemini.md",
+    ".cursorrules",
+    "opencode.json",
+    "opencode.jsonc",
+    ".mcp.json",
+}
+AGENT_DIRS = {".cursor", ".claude", ".opencode", ".mergecraft"}
+GITHUB_AGENT_ENTRIES = {"copilot-instructions.md", "instructions"}
+
+
+def remove_agent_configuration(root: Path) -> list[str]:
+    """Delete PR-authored agent instructions/configuration at any depth, case-insensitively.
+
+    Never follows symlinks: a matching link is unlinked itself, and linked
+    directories are not descended into. ``.git`` is skipped.
+    """
+    removed = []
+    for directory, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        parent = Path(directory)
+        kept = []
+        for name in [*dirs, *files]:
+            lowered = name.casefold()
+            if name == ".git" and parent == root:
+                continue
+            match = (
+                lowered in AGENT_FILES
+                or lowered in AGENT_DIRS
+                or (parent.name.casefold() == ".github" and lowered in GITHUB_AGENT_ENTRIES)
+            )
+            target = parent / name
+            if not match:
+                if name in dirs:
+                    kept.append(name)
+                continue
+            if target.is_symlink() or not target.is_dir():
+                target.unlink()
+            else:
+                shutil.rmtree(target)
+            removed.append(str(target.relative_to(root)))
+        dirs[:] = [d for d in dirs if d in kept]
+    return removed
+
+
+def read_export(path: Path, limit: int) -> bytes | None:
+    """Read a file copied out of a container: regular file only, no links, bounded.
+
+    Anything else at the path (symlink, FIFO, device, directory, oversized file)
+    is removed so later readers cannot block on it or follow it.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        fd = None
+    data = None
+    if fd is not None:
+        try:
+            info = os.fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_size <= limit:
+                with os.fdopen(fd, "rb", closefd=False) as handle:
+                    data = handle.read(limit + 1)
+                if len(data) > limit:
+                    data = None
+        finally:
+            os.close(fd)
+    if data is None:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+    return data
 
 
 def offline_review_prompt(head: str, base: str) -> str:
@@ -103,9 +228,7 @@ class Runner:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         if self.log_path.exists() and self.log_path.stat().st_size > 8_000_000:
             return
-        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
-        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)
-        clean = redact(text, self.sensitive)
+        clean = sanitize(text, self.sensitive)
         events = []
         with self.log_path.open("a") as f:
             for line in clean.splitlines():
@@ -142,8 +265,11 @@ class Runner:
         capture: bool = False,
         check: bool = True,
         max_seconds: int = 3600,
+        honor_cancel: bool = True,
     ) -> tuple[int, str]:
-        await asyncio.to_thread(self.cancelled)
+        """Run a command; ``honor_cancel=False`` is for bounded cleanup that must run anyway."""
+        if honor_cancel:
+            await asyncio.to_thread(self.cancelled)
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=cwd,
@@ -159,7 +285,8 @@ class Runner:
             nonlocal output_size
             assert proc.stdout
             pending = b""
-            discarding_line = False
+            # True while skipping the rest of a line already known to exceed the limit.
+            oversized = False
             lines: list[str] = []
             buffered = 0
             last_flush = time.monotonic()
@@ -174,6 +301,21 @@ class Runner:
                     buffered = 0
                 last_flush = time.monotonic()
 
+            def emit(text: str):
+                nonlocal output_size, buffered
+                if capture:
+                    output.append(text)
+                    output_size += len(text)
+                    if output_size > 2_000_000:
+                        raise RuntimeError("Command output exceeded limit")
+                else:
+                    lines.append(text)
+                    buffered += len(text)
+
+            def omit():
+                # Drop the entire line, including its tail, so no secret fragment survives.
+                emit(OVERSIZED_LINE)
+
             while True:
                 try:
                     chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=0.25)
@@ -182,44 +324,40 @@ class Runner:
                     continue
                 if not chunk:
                     break
-                if discarding_line:
-                    if b"\n" not in chunk:
-                        continue
-                    chunk = chunk.split(b"\n", 1)[1]
-                    discarding_line = False
-                pending += chunk
-                while len(pending) <= 100_000 and b"\n" in pending:
-                    line, pending = pending.split(b"\n", 1)
-                    decoded = line.decode(errors="replace") + "\n"
+                start = 0
+                while True:
+                    end = chunk.find(b"\n", start)
+                    piece = chunk[start:] if end < 0 else chunk[start:end]
                     if capture:
-                        output.append(decoded)
-                        output_size += len(decoded)
-                        if output_size > 2_000_000:
+                        # Captured output (workflow files, review.patch) is never logged and must
+                        # stay byte-exact, so long lines are kept; only the total size is bounded.
+                        if len(pending) + len(piece) > 2_000_000:
                             raise RuntimeError("Command output exceeded limit")
+                    elif not oversized and len(pending) + len(piece) > OUTPUT_LINE_LIMIT:
+                        oversized, pending = True, b""
+                        omit()
+                    if end < 0:
+                        if not oversized:
+                            pending += piece  # bounded by the line limit, or the capture limit
+                        break
+                    if oversized:
+                        oversized = False
                     else:
-                        lines.append(decoded)
-                        buffered += len(decoded)
+                        emit((pending + piece).decode(errors="replace") + "\n")
+                    pending = b""
+                    start = end + 1
                 if buffered >= 65536 or time.monotonic() - last_flush >= 0.25:
                     await flush()
-                if len(pending) > 100_000:
-                    # Drop the entire line, including its tail, so no secret fragment survives.
-                    pending = b""
-                    discarding_line = True
-                    lines.append("[oversized output line omitted]\n")
-                    buffered += 33
-            if pending:
-                text = pending.decode(errors="replace")
-                if capture:
-                    output.append(text)
-                else:
-                    lines.append(text)
+            if pending and not oversized:
+                emit(pending.decode(errors="replace"))
             await flush()
 
         reader = asyncio.create_task(consume())
         start = time.monotonic()
         try:
             while proc.returncode is None:
-                await asyncio.to_thread(self.cancelled)
+                if honor_cancel:
+                    await asyncio.to_thread(self.cancelled)
                 if time.monotonic() - start > max_seconds:
                     raise TimeoutError(f"{args[0]} exceeded timeout")
                 if reader.done() and reader.exception():
@@ -239,12 +377,36 @@ class Runner:
             raise RuntimeError(f"{args[0]} exited {code}; see run log")
         return code, "".join(output)
 
+    async def _quiet_docker(self, *args: str) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+            )
+        except OSError:
+            return ""
+        try:
+            output, _ = await asyncio.wait_for(proc.communicate(), 30)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            return ""
+        return output.decode(errors="replace")
+
     async def cleanup(self, name: str):
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "rm", "-fv", name, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(proc.wait(), 30)
+        """Remove a run container and the run network of the same name (idempotent).
+
+        The per-run network is named after the run's CI worker container, so the
+        controller's startup sweep of labelled containers also removes leftover
+        networks. Removing a network that is missing or still in use is a no-op.
+        """
+        await self._quiet_docker("rm", "-fv", name)
+        await self._quiet_docker("network", "rm", name)
+
+    async def cleanup_networks(self):
+        """Remove every leftover per-run network (for startup sweeps); in-use ones are kept."""
+        listing = await self._quiet_docker("network", "ls", "-q", "--filter", "label=localci.worker=true")
+        for network in listing.split():
+            await self._quiet_docker("network", "rm", network)
 
     def step(self, name: str, state: str, message: str = "", **details):
         with self._write_lock:
@@ -284,9 +446,11 @@ class Runner:
         self.log_path = self.root / "logs" / f"{run['id']}.log"
         name = f"localci-run-{run['id']}"
         review_name = name + "-review"
+        network = name
         metrics = None
         resources = config.get("execution", {})
         final_state, message = "success", "All configured checks passed"
+        end_reason = None
         executed = 0
         try:
             work.mkdir(parents=True, mode=0o700)
@@ -355,8 +519,14 @@ class Runner:
                     data, notes = plan(text, set(secrets), config.get("variables", {}))
                     destination = control / Path(path).name
                     destination.write_text(yaml.safe_dump(data, sort_keys=False))
-                    workflow_secrets[destination.name] = set(
-                        re.findall(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)", yaml.safe_dump(data))
+                    names, dynamic = secret_references(data)
+                    # Enabling host GitHub login is the operator's opt-in for every selected
+                    # workflow: actions default their token input to github.token without
+                    # naming it, so withholding it from "non-referencing" workflows breaks them.
+                    if "GITHUB_TOKEN" in secrets or github_token_referenced(data):
+                        names.add("GITHUB_TOKEN")
+                    workflow_secrets[destination.name] = (
+                        set(secrets) if dynamic else {n.upper() for n in names}
                     )
                     prepared.append(destination.name)
                     await asyncio.to_thread(self.log, "\n".join(notes) + "\n")
@@ -396,20 +566,20 @@ class Runner:
             (control / "vars").write_text(
                 "\n".join(f"{k}={v}" for k, v in config.get("variables", {}).items())
             )
-            # Transfer only values referenced by each selected workflow, never via argv/logs.
-            # Privileged CI remains host-root-equivalent; this is least exposure, not a sandbox boundary.
-            for filename in prepared:
-                names = workflow_secrets[filename]
-                values = {
+            # Values referenced by each workflow; written and copied into the worker only
+            # for the duration of that workflow's act invocation (see ci_phase), never
+            # via argv/logs. The GitHub token is included only where referenced.
+            # Privileged CI remains host-root-equivalent and jobs of the SAME workflow
+            # share its secrets and worker: this is least exposure, not a sandbox boundary.
+            workflow_values = {
+                filename: {
                     k: v
                     for k, v in secrets.items()
-                    if k in names or (config.get("github_auth") == "gh" and k in {"GITHUB_TOKEN", "GH_TOKEN"})
+                    if k in workflow_secrets[filename] or k.upper() in workflow_secrets[filename]
                 }
-                secret_file = control / f"{filename}.secrets"
-                secret_file.write_text(
-                    "\n".join(f"{k}={json.dumps(v)}" for k, v in {"GITHUB_TOKEN": "", **values}.items())
-                )
-                secret_file.chmod(0o600)
+                for filename in prepared
+            }
+            ci_secret_dir = work / "ci-secrets"
             if not prepared and (not run_review or not review_secrets):
                 if run_review and not review_secrets:
                     await asyncio.to_thread(
@@ -433,6 +603,39 @@ class Runner:
                 await asyncio.to_thread(self.step, filename, "queued")
             if run_review:
                 await asyncio.to_thread(self.step, "mergeCraft", "queued")
+            # A user-defined bridge per run: concurrent runs cannot reach each other's
+            # artifact server or job service ports over Docker's shared default bridge.
+            # Named after the worker container so cleanup(name) also removes it.
+            await self.command("docker", "network", "rm", network, check=False, capture=True)
+            await self.command(
+                "docker",
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--label",
+                "localci.worker=true",
+                network,
+            )
+
+            async def remove_worker_secrets(filename: str) -> bool:
+                (ci_secret_dir / f"{filename}.secrets").unlink(missing_ok=True)
+                try:
+                    code, _ = await self.command(
+                        "docker",
+                        "exec",
+                        name,
+                        "rm",
+                        "-f",
+                        f"/control/{filename}.secrets",
+                        check=False,
+                        capture=True,
+                        max_seconds=60,
+                        honor_cancel=False,
+                    )
+                except Exception:
+                    return False
+                return code == 0
 
             async def ci_phase():
                 nonlocal executed, final_state, message
@@ -445,6 +648,8 @@ class Runner:
                         name,
                         "--label",
                         "localci.worker=true",
+                        "--network",
+                        network,
                         "--privileged",
                         f"--memory={ci_memory}g",
                         f"--cpus={ci_cpus}",
@@ -534,7 +739,29 @@ class Runner:
                             args += ["-P", f"{label}=localci-jobs:1"]
                         for version in ("22.04", "20.04"):
                             args += ["-P", f"ubuntu-{version}=ghcr.io/catthehacker/ubuntu:act-{version}"]
-                        code, _ = await self.command(*args, check=False)
+                        # Only this workflow's secrets are present in the worker, and only
+                        # while its act invocation runs; removed before the next starts.
+                        ci_secret_dir.mkdir(mode=0o700, exist_ok=True)
+                        secret_file = ci_secret_dir / f"{filename}.secrets"
+                        secret_file.touch(mode=0o600)
+                        secret_file.write_text(
+                            "\n".join(
+                                f"{k}={json.dumps(v)}"
+                                for k, v in {"GITHUB_TOKEN": "", **workflow_values[filename]}.items()
+                            )
+                        )
+                        removed = False
+                        try:
+                            await self.command(
+                                "docker", "cp", str(secret_file), f"{name}:/control/{filename}.secrets"
+                            )
+                            code, _ = await self.command(*args, check=False)
+                        finally:
+                            removed = await remove_worker_secrets(filename)
+                        if not removed:
+                            raise RuntimeError(
+                                f"Could not remove {filename} secrets from the CI worker; stopping CI"
+                            )
                         executed += self.completed_jobs
                         state = "failure" if code else ("success" if self.completed_jobs else "skipped")
                         await asyncio.to_thread(
@@ -562,23 +789,13 @@ class Runner:
                         review_dir = work / "review-export"
                         await self.command("git", "clone", "--no-local", str(checkout), str(review_dir))
                         await self.command("git", "checkout", "--detach", run["head"], cwd=review_dir)
-                        # Remove PR-authored agent configuration and nested prompt instructions.
-                        for relative in (
-                            ".mergecraft",
-                            ".opencode",
-                            "opencode.json",
-                            "opencode.jsonc",
-                            ".mcp.json",
-                        ):
-                            target = review_dir / relative
-                            if target.is_dir() and not target.is_symlink():
-                                shutil.rmtree(target)
-                            elif target.exists() or target.is_symlink():
-                                target.unlink()
-                        for filename in ("AGENTS.md", "CLAUDE.md"):
-                            for target in review_dir.rglob(filename):
-                                if target.is_symlink() or target.is_file():
-                                    target.unlink()
+                        # Remove PR-authored agent configuration and prompt instructions at any depth.
+                        removed = await asyncio.to_thread(remove_agent_configuration, review_dir)
+                        if removed:
+                            await asyncio.to_thread(
+                                self.log,
+                                f"Removed {len(removed)} PR-authored agent configuration entries from the review tree.\n",
+                            )
                         code, base_config = await self.command(
                             "git",
                             "show",
@@ -632,6 +849,8 @@ class Runner:
                             review_name,
                             "--label",
                             "localci.worker=true",
+                            "--network",
+                            network,
                             f"--memory={review_memory}g",
                             f"--cpus={review_cpus}",
                             "--pids-limit=1024",
@@ -696,11 +915,18 @@ class Runner:
                                 self.log,
                                 f"mergeCraft exited {code} without a JSON report; see its diagnostic output above.\n",
                             )
+
+                        def export(path: Path, limit: int) -> bytes | None:
+                            # Container-controlled output: regular file only, no links/FIFOs, bounded.
+                            data = read_export(path, limit)
+                            if data is None:
+                                return None
+                            data = redact(data.decode(errors="replace"), self.sensitive).encode()
+                            path.write_bytes(data)
+                            return data
+
                         result_file = artifact_dir / "mergecraft.json"
-                        if result_file.is_file() and not result_file.is_symlink():
-                            result_file.write_text(
-                                redact(result_file.read_text(errors="replace"), self.sensitive)
-                            )
+                        result_data = await asyncio.to_thread(export, result_file, 2_000_000)
                         evidence_file = artifact_dir / "mergecraft-evidence.json"
                         await self.command(
                             "docker",
@@ -710,15 +936,12 @@ class Runner:
                             check=False,
                             capture=True,
                         )
-                        if evidence_file.is_file() and not evidence_file.is_symlink():
-                            evidence_file.write_text(
-                                redact(evidence_file.read_text(errors="replace"), self.sensitive)
-                            )
-                        for filename in (
-                            "mergecraft-review.md",
-                            "mergecraft-metrics.json",
-                            "mergecraft-profile.jsonl",
-                            "mergecraft-usage.json",
+                        evidence_data = await asyncio.to_thread(export, evidence_file, 10_000_000)
+                        for filename, limit in (
+                            ("mergecraft-review.md", 1_000_000),
+                            ("mergecraft-metrics.json", 100_000),
+                            ("mergecraft-profile.jsonl", 6_000_000),
+                            ("mergecraft-usage.json", 100_000),
                         ):
                             exported = artifact_dir / filename
                             await self.command(
@@ -729,20 +952,11 @@ class Runner:
                                 check=False,
                                 capture=True,
                             )
-                            if exported.is_file() and not exported.is_symlink():
-                                exported.write_text(
-                                    redact(exported.read_text(errors="replace"), self.sensitive)
-                                )
+                            await asyncio.to_thread(export, exported, limit)
                         runtime_path = artifact_dir / "mergecraft-runtime.json"
                         runtime = json.loads(runtime_path.read_text())
-                        if (
-                            evidence_file.is_file()
-                            and not evidence_file.is_symlink()
-                            and evidence_file.stat().st_size <= 10_000_000
-                        ):
-                            runtime["evidence_sha256"] = hashlib.sha256(
-                                evidence_file.read_bytes()
-                            ).hexdigest()
+                        if evidence_data is not None:
+                            runtime["evidence_sha256"] = hashlib.sha256(evidence_data).hexdigest()
                         runtime_path.write_text(json.dumps(runtime))
                         findings = None
                         try:
@@ -761,9 +975,9 @@ class Runner:
                                 self.sensitive,
                             ),
                         )
-                        if result_file.exists():
+                        if result_data is not None:
                             try:
-                                findings = json.loads(result_file.read_text()).get("findings", [])
+                                findings = json.loads(result_data).get("findings", [])
                                 if isinstance(findings, list):
                                     for finding in findings[:100]:
                                         if isinstance(finding, dict):
@@ -771,8 +985,11 @@ class Runner:
                                                 self.log,
                                                 f"mergeCraft {finding.get('severity', '')}: "
                                                 f"{finding.get('path', '')}:{finding.get('start_line', '')} — "
-                                                f"{str(finding.get('message', ''))[:3000]}\n"
-                                                f"Suggested fix: {str(finding.get('remediation', ''))[:3000]}\n",
+                                                # Redact before truncating: a cut must not
+                                                # leave an unredactable secret prefix.
+                                                f"{sanitize(str(finding.get('message', '')), self.sensitive)[:3000]}\n"
+                                                f"Suggested fix: "
+                                                f"{sanitize(str(finding.get('remediation', '')), self.sensitive)[:3000]}\n",
                                             )
                                     if findings:
                                         detail += f"; {len(findings)} findings — see review details"
@@ -835,20 +1052,59 @@ class Runner:
                 )
             await asyncio.to_thread(self.cancelled)
         except asyncio.CancelledError:
+            # Graceful worker stop: the store may automatically re-queue this run.
             final_state, message = "error", "Controller stopped during execution; retry this run"
+            end_reason = "worker_interrupted"
         except Cancelled as exc:
+            # Operator/superseded cancellation: the store recorded its reason at request time.
             final_state, message = "cancelled", str(exc)
         except Blocked as exc:
             final_state, message = "blocked", str(exc)
         except Exception as exc:
             final_state, message = "error", redact(str(exc), self.sensitive)
         finally:
-            await asyncio.to_thread(self.log, f"\n{final_state.upper()}: {message}\n")
-            await self.cleanup(name)
-            await self.cleanup(review_name)
+            await self._finalize(
+                run["id"], work, (review_name, name), metrics, final_state, message, end_reason
+            )
+
+    async def _finalize(self, rid, work, containers, metrics, state, message, reason):
+        """Each step runs even if an earlier one fails; credential removal and
+        run finalisation always complete, and a cancellation arriving meanwhile is
+        re-raised afterwards instead of being swallowed."""
+        interrupted: asyncio.CancelledError | None = None
+
+        async def attempt(action, *args):
+            nonlocal interrupted
+            try:
+                await action(*args)
+            except asyncio.CancelledError as exc:
+                interrupted = interrupted or exc
+            except Exception:  # noqa: BLE001 - best effort; must not skip later steps
+                pass
+
+        async def complete(function, *args, **kwargs):
+            # Shielded: a cancellation cannot abandon this step midway.
+            nonlocal interrupted
+            task = asyncio.ensure_future(asyncio.to_thread(function, *args, **kwargs))
+            while True:
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    interrupted = interrupted or exc
+
+        async def stop_metrics():
             if metrics is not None:
                 metrics.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await metrics
-            await asyncio.to_thread(shutil.rmtree, work, ignore_errors=True)
-            await asyncio.to_thread(self.store.finish, run["id"], final_state, message)
+                await asyncio.gather(metrics, return_exceptions=True)
+
+        await attempt(asyncio.to_thread, self.log, f"\n{state.upper()}: {message}\n")
+        # Review container first: the run network is removable once both are gone.
+        for container in containers:
+            await attempt(self.cleanup, container)
+        await attempt(stop_metrics)
+        await complete(shutil.rmtree, work, ignore_errors=True)
+        try:
+            await complete(self.store.finish, rid, state, message, reason=reason)
+        finally:
+            if interrupted is not None:
+                raise interrupted

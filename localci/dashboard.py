@@ -110,6 +110,7 @@ def register_dashboard(app, controller, repo_name, get_run):
                         prs = await controller.github.pages(
                             f"repos/{name}/pulls?state=closed&sort=updated&direction=desc",
                             max_pages=2,
+                            truncate=True,  # Display only: the 200 most recently updated.
                         )
                     except (RuntimeError, httpx.HTTPError) as exc:
                         cached = (time.time(), cached[1] if cached else [], str(exc))

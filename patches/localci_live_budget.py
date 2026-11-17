@@ -12,6 +12,17 @@ from mergecraft.utils.run_bounds import BudgetExhausted
 _current = ContextVar("localci_live_budget", default=None)
 
 
+def _counter(value):
+    """Return a non-negative integral token counter; absent or null is zero."""
+    if value is None:
+        return 0
+    if type(value) is float and value.is_integer():
+        value = int(value)
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
 class LiveBudget:
     def __init__(self, tracker):
         self.tracker = tracker
@@ -26,15 +37,21 @@ class LiveBudget:
         if value.get("type") != "step_finish":
             return True
         part = value.get("part") or {}
-        # Live and reconciliation events can have different part IDs for the
-        # same assistant step. Message identity is stable across both paths.
-        identity = (part.get("sessionID") or value.get("sessionID"), part.get("messageID"))
-        if all(identity):
-            if identity in self.seen:
-                self.duplicates += 1
-                self.save()
-                return False
-            self.seen.add(identity)
+        # One assistant message can contain several step_finish parts, each
+        # billed separately, so the part ID identifies a step. Replayed events
+        # keep their part ID; message identity is only a fallback without one.
+        session = part.get("sessionID") or value.get("sessionID")
+        if part.get("id"):
+            identity = ("part", session, part["id"])
+        elif session and part.get("messageID"):
+            identity = ("message", session, part["messageID"])
+        else:
+            return True
+        if identity in self.seen:
+            self.duplicates += 1
+            self.save()
+            return False
+        self.seen.add(identity)
         return True
 
     def charge(self, value, usage, previous):
@@ -44,9 +61,9 @@ class LiveBudget:
             return
         tokens = value["part"]["tokens"]
         cache = tokens.get("cache") or {}
-        fields = {k: tokens.get(k, 0) for k in ("input", "output", "reasoning")}
-        fields.update(cache_read=cache.get("read", 0), cache_write=cache.get("write", 0))
-        if any(type(v) is not int or v < 0 for v in fields.values()):
+        fields = {k: _counter(tokens.get(k)) for k in ("input", "output", "reasoning")}
+        fields.update(cache_read=_counter(cache.get("read")), cache_write=_counter(cache.get("write")))
+        if any(v is None for v in fields.values()):
             self.error = BudgetExhausted("token", "Invalid provider token counters; review stopped")
             self.tracker.last_exhausted = self.error
             self.save()

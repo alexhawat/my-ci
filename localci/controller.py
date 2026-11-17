@@ -4,12 +4,13 @@ import json
 import os
 import shutil
 import time
+from functools import partial
 from pathlib import Path
 
 from cryptography.fernet import Fernet
 
 from localci.github import GitHub
-from localci.policy import eligible
+from localci.policy import BOT_HOLD, bot_pr, eligible
 from localci.reporting import comment_body, reports
 from localci.review_reconcile import reconcile_legacy_reviews
 from localci.runner import Runner
@@ -32,7 +33,8 @@ class Controller:
         self.github.app_credentials = lambda: self.secrets("__github_app__", "app")
         self.capacity: dict = {}
         self.login = ""
-        self.error = ""
+        # Separate sources so one cannot overwrite or prematurely clear another.
+        self.poll_error = self.run_error = self.capacity_error = ""
         self.last_poll = 0.0
         self.last_discovery = 0.0
         self.lock = asyncio.Lock()
@@ -41,6 +43,10 @@ class Controller:
         self.wake = asyncio.Event()
         self.base_url = os.environ.get("LOCALCI_URL", "http://localhost:8787").rstrip("/")
         self.host_label = os.environ.get("LOCALCI_HOST_LABEL", "local worker")
+
+    @property
+    def error(self) -> str:
+        return "; ".join(e for e in (self.poll_error, self.capacity_error, self.run_error) if e)
 
     def status(self):
         rows = self.store.rows("SELECT value FROM settings WHERE key='worker_status'")
@@ -121,10 +127,13 @@ class Controller:
                     prs = await self.github.pages(f"repos/{repo['name']}/pulls?state=open")
                     await asyncio.to_thread(self.store.cancel_stale, repo["name"], prs)
                     await asyncio.to_thread(self.store.replace_prs, repo["name"], prs)
+                    config = json.loads(repo["config"])
                     for pr in prs:
                         if eligible(pr, repo["name"]):
+                            # Bot PRs run privileged CI only after an operator starts them.
+                            hold = BOT_HOLD if bot_pr(pr) and not config.get("run_bot_prs") else None
                             await asyncio.to_thread(
-                                self.store.enqueue, repo["name"], pr, json.loads(repo["config"])
+                                partial(self.store.enqueue, repo["name"], pr, config, hold=hold)
                             )
                     await asyncio.to_thread(
                         self.store.execute, "UPDATE repos SET error='' WHERE name=?", (repo["name"],)
@@ -134,10 +143,12 @@ class Controller:
                         self.store.execute, "UPDATE repos SET error=? WHERE name=?", (str(exc), repo["name"])
                     )
             self.last_poll = time.time()
-            self.error = ""
+            self.poll_error = ""
             await self.publish()
 
     def reports(self, run):
+        if run["end_reason"] == "awaiting_approval":
+            return {}  # Nothing ran; the commit status alone explains the hold.
         values = [*self.secrets(run["repo"], "ci").values(), *self.secrets(run["repo"], "review").values()]
         if self.github.token_path.is_file():
             values.append(self.github.token())
@@ -218,7 +229,7 @@ class Controller:
                 await self.poll()
                 await asyncio.to_thread(self.prune)
             except Exception as exc:
-                self.error = str(exc)
+                self.poll_error = str(exc)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self.wake.wait(), 60)
 
@@ -249,11 +260,18 @@ class Controller:
         output, _ = await proc.communicate()
         for name in output.decode().split():
             await runner.cleanup(name)
+        await runner.cleanup_networks()  # Per-run networks whose containers are already gone.
         # A crash cannot leave decrypted CI/provider credentials in the data volume.
         await asyncio.to_thread(shutil.rmtree, self.root / "work", ignore_errors=True)
         for row in await asyncio.to_thread(self.store.rows, "SELECT id FROM runs WHERE state='running'"):
             await asyncio.to_thread(
-                self.store.finish, row["id"], "error", "Execution worker restarted; retry this run"
+                partial(
+                    self.store.finish,
+                    row["id"],
+                    "error",
+                    "Execution worker restarted before this run completed",
+                    reason="worker_interrupted",
+                )
             )
         await self.schedule()
 
@@ -276,9 +294,10 @@ class Controller:
                     try:
                         task.result()
                     except Exception as exc:
-                        self.error = f"Run finalization failed: {exc}"
+                        self.run_error = f"Run finalization failed: {exc}"
                     del active[task]
                 settings = await asyncio.to_thread(self.store.settings, self.capacity)
+                unfit = False
                 # Lowering the limit drains existing runs; it never kills them.
                 while not settings["paused"] and len(active) < settings["max_parallel_runs"]:
                     # In-flight runs retain their old limits after a settings change.
@@ -287,18 +306,24 @@ class Controller:
                     ) or sum(v["memory_gb_per_run"] for v in active.values()) + settings[
                         "memory_gb_per_run"
                     ] > max(2, self.capacity["memory_gb"] - 4):
-                        if await asyncio.to_thread(
-                            self.store.rows, "SELECT id FROM runs WHERE state='queued' LIMIT 1"
-                        ):
-                            self.error = (
-                                "Queued run does not fit configured host capacity; reduce CPU/memory limits "
-                                "or free an active run"
+                        unfit = bool(
+                            await asyncio.to_thread(
+                                self.store.rows,
+                                "SELECT id FROM runs WHERE state='queued' AND cancel=0 LIMIT 1",
                             )
+                        )
                         break
                     run = await asyncio.to_thread(self.store.claim, settings)
                     if not run:
                         break
                     active[asyncio.create_task(self.execute_run(run))] = settings
+                # Recomputed every pass, so it clears as soon as the queued run fits or leaves.
+                self.capacity_error = (
+                    "Queued run does not fit configured host capacity; reduce CPU/memory limits "
+                    "or free an active run"
+                    if unfit
+                    else ""
+                )
                 await asyncio.sleep(1)
         finally:
             for task in active:

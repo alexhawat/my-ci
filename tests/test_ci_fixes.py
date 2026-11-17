@@ -97,7 +97,9 @@ async def test_worker_token_opt_in_file_redaction_and_review_isolation(tmp_path,
                 )
             return 0, "{}"
         if args[:2] == ("docker", "cp") and Path(args[2]).name == "control":
-            secret_file = Path(args[2]) / "ci.yml.secrets"
+            assert not list(Path(args[2]).glob("*.secrets"))  # Secrets arrive per workflow, not up front.
+        if args[:2] == ("docker", "cp") and Path(args[2]).name == "ci.yml.secrets":
+            secret_file = Path(args[2])
             content = secret_file.read_text()
             assert (token.read_text() in content) == enabled
             assert secret_file.stat().st_mode & 0o777 == 0o600

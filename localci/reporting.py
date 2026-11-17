@@ -14,15 +14,14 @@ from localci.review_evidence import (
     recover_findings,
 )
 from localci.review_profile import summarize as summarize_profile
-from localci.runner import redact
+from localci.runner import sanitize
 
 TERMINAL = {"success", "failure", "error", "blocked", "cancelled", "skipped"}
 
 
 def clean(value, secrets: list[str], limit=3000) -> str:
-    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str("" if value is None else value))
-    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)
-    return redact(text, secrets)[:limit]
+    # Redact, strip control characters, redact again; truncate only afterwards.
+    return sanitize(str("" if value is None else value), secrets)[:limit]
 
 
 def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
@@ -37,17 +36,35 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
     expected = {Path(path).name for path in config.get("workflows", [])}
     completed = {s["name"] for s in ci if s["state"] in TERMINAL}
     ci_complete = expected <= completed and all(s["state"] in TERMINAL for s in ci) and bool(ci)
-    if (config.get("workflows") or config.get("review")) and (final or ci_complete):
+    run_level = False
+    # Review-only repositories have no CI workflows and therefore no CI report.
+    if config.get("workflows") and (final or ci_complete):
         states = {s["state"] for s in ci}
         state = next((s for s in ("failure", "error", "blocked", "cancelled") if s in states), "success")
         if not any(s["state"] == "success" and s["name"] != "Checkout" for s in ci) and state == "success":
             state = "skipped"
-        if final and not review and run["state"] in BAD | {"cancelled"}:
-            state = run["state"]
+        # A run-level failure outside every check (e.g. the overall time limit) must
+        # not be reported as CI success. A failed review explains its own run state.
+        review_bad = bool(review and review["state"] in BAD | {"cancelled"})
+        if final and run["state"] in BAD | {"cancelled"}:
+            if not review:
+                state = run["state"]
+            elif not review_bad and state not in BAD | {"cancelled"}:
+                state, run_level = run["state"], True
         result["ci"] = {"state": state, "checks": ci, "findings": [], "diagnostics": []}
     if (review and review["state"] in TERMINAL) or final:
         if review and review["state"] == "skipped":
             result["review"] = {"state": "skipped", "checks": [review], "findings": [], "diagnostics": []}
+        elif config.get("review") and not review:
+            # The run ended (blocked checkout, merge conflict, setup error...) before
+            # the review step was ever registered: not run, which is not a skip.
+            result["review"] = {
+                "state": "not run",
+                "checks": [],
+                "findings": [],
+                "diagnostics": [clean(run.get("message") or run["state"], secrets)],
+                "run_state": run["state"],
+            }
         elif config.get("review"):
             result["review"] = {
                 "state": review["state"] if review else "skipped",
@@ -114,7 +131,7 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
             }
     if "ci" in result:
         result["ci"]["jobs"] = ci_evidence(run, store, lambda value: clean(value, secrets, 1200))
-    if "review" in result and result["review"]["state"] != "skipped":
+    if "review" in result and result["review"]["state"] not in {"skipped", "not run"}:
         add_review_record(result["review"], root / "artifacts" / run["id"], secrets)
     for kind, report in result.items():
         report["checks"] = [
@@ -163,21 +180,39 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
                 report["diagnostics"].extend(
                     clean(f"{e['job'] or e['phase']}: {e['message']}", secrets, 1000) for e in reversed(rows)
                 )
-            if not report["checks"] or (kind == "ci" and not review):
+            if not report["checks"] or (kind == "ci" and (not review or run_level)):
                 report["diagnostics"].append(clean(run.get("message"), secrets))
     return result
 
 
-def literal(value) -> str:
-    """Render untrusted repository/review text as text, not Markdown or mentions."""
+def literal(value, *, block: bool = False) -> str:
+    """Render untrusted repository/review text as text, not Markdown or mentions.
+
+    Every ASCII punctuation character that can start Markdown structure is
+    backslash-escaped (headings, quotes, lists, setext ``=``/``-`` underlines,
+    tables, links, emphasis, math). Inline text (list items, headings, table
+    cells) is collapsed to one line so it cannot end its container; ``block``
+    text keeps its lines, each neutralised the same way.
+    """
     text = str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("@", "@\u200b")
-    return re.sub(r"([\\`*_{}\[\]()#+.!|~>-])", r"\\\1", text)
+    text = re.sub(r"([\\`*_{}\[\]()#+.!|~>=$-])", r"\\\1", text)
+    lines = re.split(r"\r\n|\r|\n", text)
+    if len(lines) == 1:
+        return text
+    if not block:
+        return " ".join(line.strip() for line in lines if line.strip())
+    # Leading indentation would turn lines into code blocks or list continuations.
+    return "\n".join(line.lstrip(" \t") for line in lines)
 
 
 def comment_body(run: dict, kind: str, report: dict, url: str) -> str:
+    footer = f"Commit `{run['head']}` · run `{run['id']}`\n\n[Full run — Tailscale access required]({url})"
+    if kind == "review" and report["state"] == "not run":
+        reason = "; ".join(report["diagnostics"]) or report.get("run_state", "")
+        return f"### mergeCraft: not run\n\nThe run ended before the review started — {literal(reason)}\n\n{footer}"
     if kind == "review" and report["state"] == "skipped":
         reason = "; ".join(c["message"] for c in report["checks"]) or "; ".join(report["diagnostics"])
-        return f"### mergeCraft: skipped\n\n{literal(reason)}\n\nCommit `{run['head']}` · run `{run['id']}`\n\n[Full run — Tailscale access required]({url})"
+        return f"### mergeCraft: skipped\n\n{literal(reason, block=True)}\n\n{footer}"
     if kind == "review":
         return review_body(run, report, url)
     title = "Local CI"
@@ -238,20 +273,6 @@ def comment_body(run: dict, kind: str, report: dict, url: str) -> str:
         lines += [
             "Per-job execution evidence is unavailable for this run; see the workflow result and retained logs."
         ]
-    for finding in report["findings"]:
-        location = f"{finding['path']}:{finding['start_line']}"
-        lines += [
-            "",
-            f"### {literal(finding['severity'])} — {literal(location)}",
-            literal(finding["message"]),
-        ]
-        lines += [f"- Evidence: {literal(e)}" for e in finding["evidence"]]
-        if finding["remediation"]:
-            lines += [f"Suggested fix: {literal(finding['remediation'])}"]
-    if report.get("finding_count", 0) > len(report["findings"]):
-        lines += ["", "Additional findings are in the run artifact."]
-    if kind == "review" and report["state"] == "success" and not report["findings"]:
-        lines += ["", "No blocking findings were reported."]
     body = "\n".join(lines)
     if len(body) > 60000:
         body = body[:59000] + "\n\nReport truncated. Full evidence is available in the private run artifacts."
@@ -395,7 +416,7 @@ def review_body(run: dict, report: dict, url: str) -> str:
         lines += [
             f"#### {literal(f['severity'])} — {literal(f['path'])}:{literal(f['start_line'])}",
             "",
-            literal(f["message"]),
+            literal(f["message"], block=True),
             "",
         ]
         if report.get("findings_source") == "evidence":
@@ -430,7 +451,8 @@ def review_body(run: dict, report: dict, url: str) -> str:
     lines += [
         literal(
             report.get("narrative")
-            or "Agent narrative was not preserved by this run. The findings and deterministic evidence above are the available review record."
+            or "Agent narrative was not preserved by this run. The findings and deterministic evidence above are the available review record.",
+            block=True,
         )
     ]
     if report["diagnostics"]:

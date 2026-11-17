@@ -1,4 +1,5 @@
 import json
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -419,3 +420,112 @@ def test_engine_error_after_composite_failure_is_reported_and_isolated(tmp_path)
     assert "no such file or directory" in body
     assert all(value not in body for value in ("fixture-secret", "@team", "<script>"))
     assert report["state"] == "failure"
+
+
+def finished_run(tmp_path, config, steps, state, message):
+    store = Store(tmp_path / "db")
+    rid = store.enqueue("owner/repo", pr(), config)
+    store.claim()
+    store.execute("UPDATE runs SET steps=? WHERE id=?", (json.dumps(steps), rid))
+    store.finish(rid, state, message)
+    return store, store.rows("SELECT * FROM runs WHERE id=?", (rid,))[0]
+
+
+@pytest.mark.parametrize("workflows", [[], [".github/workflows/ci.yml"]])
+def test_review_that_never_started_is_reported_as_not_run(tmp_path, workflows):
+    message = "PR does not merge cleanly into its base; resolve conflicts first"
+    store, run = finished_run(
+        tmp_path,
+        {"workflows": workflows, "review": True},
+        [{"name": "Checkout", "state": "running", "message": ""}],
+        "blocked",
+        message,
+    )
+    report = reports(run, tmp_path, store, [])["review"]
+    assert report["state"] == "not run"
+    body = comment_body(run, "review", report, "https://private.test")
+    assert body.startswith("### mergeCraft: not run")
+    assert "does not merge cleanly" in body
+    assert "skipped" not in body and "No readable primary" not in body
+
+
+def test_review_only_repository_gets_no_ci_report(tmp_path):
+    store, run = finished_run(
+        tmp_path,
+        {"workflows": [], "review": True},
+        [
+            {"name": "Checkout", "state": "success", "message": "merged"},
+            {"name": "mergeCraft", "state": "success", "message": "Review passed"},
+        ],
+        "success",
+        "All configured checks passed",
+    )
+    assert set(reports(run, tmp_path, store, [])) == {"review"}
+
+
+def test_run_level_error_outside_steps_is_not_reported_as_ci_success(tmp_path):
+    store, run = finished_run(
+        tmp_path,
+        {"workflows": [".github/workflows/ci.yml"], "review": True},
+        [
+            {"name": "Checkout", "state": "success", "message": "merged"},
+            {"name": "ci.yml", "state": "success", "message": "act exited 0; 1 jobs passed"},
+            {"name": "mergeCraft", "state": "success", "message": "Review passed"},
+        ],
+        "error",
+        "Run exceeded its wall-clock limit",
+    )
+    assert run["state"] == "error"
+    report = reports(run, tmp_path, store, [])["ci"]
+    assert report["state"] == "error"
+    body = comment_body(run, "ci", report, "https://private.test")
+    assert (
+        "## Local CI: error" in body and "wall\\-clock limit" in body and "success" not in body.split("\n")[1]
+    )
+
+
+def test_failed_review_does_not_turn_successful_ci_into_a_failure(tmp_path):
+    store, run = completed(tmp_path)
+    steps = [
+        {"name": "ci.yml", "state": "success", "message": "act exited 0; 1 jobs passed"},
+        {"name": "mergeCraft", "state": "failure", "message": "Blocking review findings"},
+    ]
+    run = {**run, "steps": json.dumps(steps)}
+    assert reports(run, tmp_path, store, [])["ci"]["state"] == "success"
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        "line\n===\n",
+        "line\n---",
+        "x\n# Local CI: success",
+        "x\n> quoted",
+        "x\n- **ci.yml: success**",
+        "x\n1. numbered",
+        "x\n\n    indented code",
+        "x\r\n## heading",
+    ],
+)
+def test_untrusted_text_cannot_forge_markdown_structure(tmp_path, forged):
+    from localci.reporting import literal
+
+    _, run = completed(tmp_path)
+    inline = literal(forged)
+    assert "\n" not in inline and "\r" not in inline
+    for line in literal(forged, block=True).splitlines():
+        assert not line.startswith((" ", "\t", "=", "-", "#", ">", "*", "+")), line
+        assert not re.match(r"\d+[.)]", line), line
+    report = {
+        "state": "failure",
+        "checks": [{"name": forged, "state": "failure", "message": forged}],
+        "findings": [],
+        "diagnostics": [],
+        "jobs": [],
+    }
+    body = comment_body(run, "ci", report, "https://private.test")
+    item = next(line for line in body.splitlines() if line.startswith("- **"))
+    assert ": failure**" in item  # the forged text stayed inside its own list item
+    forged_starts = ("===", "---", "# Local", "## heading", "> quoted", "    indented", "1. numbered")
+    assert not any(line.startswith(forged_starts) for line in body.splitlines())
+    assert literal("@team") == "@​team" and literal("[a](b)") == r"\[a\]\(b\)"

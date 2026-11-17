@@ -1,10 +1,11 @@
 # Contributing
 
-Use a feature branch and keep changes focused. Do not commit real infrastructure names, private repository references, deployment paths, credentials, operational logs, customer information, or private project details. Use synthetic fixtures and `example.com` identifiers.
+Use a feature branch and keep changes focused. Do not commit real infrastructure names, private repository references, deployment paths, credentials, operational logs, customer information, or private project details. Use synthetic fixtures; where documentation or tests need a hostname or email address, use `example.com`. The workflow fixture `tests/fixtures/example-ci.yml` must not reference any external endpoint, including `example.com`.
 
 Before submitting a pull request, run:
 
 ```sh
+uv sync --frozen
 uv run pytest -q
 uv run ruff check .
 uv run ruff format --check .

@@ -225,8 +225,9 @@ def test_enable_requires_checks_and_disable_cancels(client):
     assert client.put("/api/repos/owner/repo", json={"enabled": True}).status_code == 400
     assert client.put("/api/repos/owner/repo", json={"enabled": True, "review": True}).status_code == 200
     store = client.app.state.controller.store
-    store.enqueue("owner/repo", pr(), {})
+    rid = store.enqueue("owner/repo", pr(), {})
     assert client.put("/api/repos/owner/repo", json={"enabled": False}).status_code == 200
+    assert store.rows("SELECT state FROM runs WHERE id=?", (rid,))[0]["state"] == "cancelled"
     assert store.claim() is None
 
 
@@ -452,7 +453,7 @@ def test_v3_upgrade_backfills_budget_and_keeps_v2_restore_backup(tmp_path):
         db.execute("DROP TABLE revision_attempts")
         db.execute("PRAGMA user_version=2")
     upgraded = Store(path)
-    assert upgraded.rows("PRAGMA user_version")[0]["user_version"] == 3
+    assert upgraded.rows("PRAGMA user_version")[0]["user_version"] == 4
     with pytest.raises(RetryLimitReached):
         upgraded.enqueue("owner/repo", pr(), {}, retry=True)
     upgraded.close()

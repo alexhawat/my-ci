@@ -11,6 +11,11 @@ from typing import Any
 from localci.results import aggregate
 
 ACTIVE = ("queued", "running")
+# Why a run ended, when the system rather than its checks decided. Only these
+# system-caused endings are re-queued automatically; an operator's cancel is final.
+RECOVERABLE = ("pr_inactive", "repo_disabled", "worker_interrupted")
+MAX_RECOVERIES = 3  # Unbilled automatic re-runs per PR revision; bounds crash loops.
+SCHEMA_VERSION = 4
 
 
 class RetryLimitReached(RuntimeError):
@@ -24,9 +29,9 @@ class Store:
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version > 3:
+            if version > SCHEMA_VERSION:
                 raise RuntimeError("Database is newer than this Local CI release")
-            if version in (1, 2):
+            if 0 < version < SCHEMA_VERSION:
                 backup = path.with_suffix(f".pre-v{version + 1}.sqlite")
                 if not backup.exists():
                     fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -49,16 +54,14 @@ class Store:
                     snapshot TEXT NOT NULL, config TEXT NOT NULL, steps TEXT NOT NULL DEFAULT '[]',
                     message TEXT NOT NULL DEFAULT '', cancel INTEGER NOT NULL DEFAULT 0,
                     publish_error TEXT NOT NULL DEFAULT '', published INTEGER NOT NULL DEFAULT 0,
+                    end_reason TEXT NOT NULL DEFAULT '',
                     UNIQUE(repo, pr, head, base, attempt)
                 );
                 CREATE TABLE IF NOT EXISTS revision_attempts (
                     repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
-                    attempts INTEGER NOT NULL, PRIMARY KEY(repo,pr,head,base)
+                    attempts INTEGER NOT NULL, recoveries INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(repo,pr,head,base)
                 );
-                INSERT INTO revision_attempts(repo,pr,head,base,attempts)
-                    SELECT repo,pr,head,base,MAX(attempt) FROM runs GROUP BY repo,pr,head,base
-                    ON CONFLICT(repo,pr,head,base) DO UPDATE SET
-                        attempts=MAX(revision_attempts.attempts,excluded.attempts);
                 CREATE TABLE IF NOT EXISTS secrets (
                     repo TEXT NOT NULL, name TEXT NOT NULL, ciphertext TEXT NOT NULL,
                     PRIMARY KEY(repo, name)
@@ -87,8 +90,21 @@ class Store:
                 );
                 INSERT OR IGNORE INTO run_usage(run_id,repo,created,duration_seconds,state)
                     SELECT id,repo,created,MAX(0,COALESCE(finished-started,0)),state FROM runs WHERE started IS NOT NULL;
-                PRAGMA user_version=3;
             """)
+            if "end_reason" not in {r[1] for r in db.execute("PRAGMA table_info(runs)")}:
+                db.execute("ALTER TABLE runs ADD COLUMN end_reason TEXT NOT NULL DEFAULT ''")
+            if "recoveries" not in {r[1] for r in db.execute("PRAGMA table_info(revision_attempts)")}:
+                db.execute("ALTER TABLE revision_attempts ADD COLUMN recoveries INTEGER NOT NULL DEFAULT 0")
+            if version in (1, 2):
+                # One-time backfill for databases that predate the budget table. Running it on
+                # every start would bill unbilled automatic recoveries against the retry budget.
+                db.execute(
+                    """INSERT INTO revision_attempts(repo,pr,head,base,attempts)
+                    SELECT repo,pr,head,base,MAX(attempt) FROM runs GROUP BY repo,pr,head,base
+                    ON CONFLICT(repo,pr,head,base) DO UPDATE SET
+                        attempts=MAX(revision_attempts.attempts,excluded.attempts)"""
+                )
+            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         # Keep the WAL open between short-lived request connections. Otherwise SQLite
         # checkpoints and removes it after every log batch, amplifying writes on CoW disks.
         # This connection holds no transaction and is never used for application queries.
@@ -169,37 +185,52 @@ class Store:
             raise KeyError(name)
         return rows[0]
 
-    def enqueue(self, repo: str, pr: dict, config: dict, *, retry: bool = False) -> str | None:
+    def enqueue(
+        self, repo: str, pr: dict, config: dict, *, retry: bool = False, hold: str | None = None
+    ) -> str | None:
+        """Queue a run for the PR's current head/base revision.
+
+        Without ``retry`` this is the automatic path: it creates the first run of a
+        revision, or re-queues one that the system itself ended (RECOVERABLE) without
+        charging the retry budget, at most MAX_RECOVERIES times. ``retry`` is the
+        operator path and is charged against the budget. ``hold`` records the first
+        run as blocked with that message instead of queueing it (operator approval gate).
+        """
         head, base = pr["head"]["sha"], pr["base"]["sha"]
+        key = (repo, pr["number"], head, base)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             previous = db.execute(
-                "SELECT attempt,state,message FROM runs WHERE repo=? AND pr=? AND head=? AND base=? ORDER BY created DESC LIMIT 1",
-                (repo, pr["number"], head, base),
+                "SELECT state,end_reason FROM runs WHERE repo=? AND pr=? AND head=? AND base=? "
+                "ORDER BY created DESC,rowid DESC LIMIT 1",
+                key,
             ).fetchone()
-            budget = db.execute(
-                "SELECT attempts FROM revision_attempts WHERE repo=? AND pr=? AND head=? AND base=?",
-                (repo, pr["number"], head, base),
-            ).fetchone()
-            attempts = budget["attempts"] if budget else 0
-            automatic_recovery = bool(
-                previous
-                and (
-                    previous["state"] == "cancelled"
-                    or previous["message"] == "Execution worker restarted; retry this run"
-                )
-            )
-            if (attempts and not retry and not automatic_recovery) or (
-                previous and previous["state"] in ACTIVE
-            ):
+            if previous and previous["state"] in ACTIVE:
                 return None
-            setting = db.execute("SELECT value FROM settings WHERE key='execution'").fetchone()
-            max_retries = (json.loads(setting[0]) if setting else {}).get("max_retries", 2)
-            if not automatic_recovery and attempts >= max_retries + 1:
-                raise RetryLimitReached(
-                    f"Retry limit reached: {max_retries + 1} attempts per PR head/base revision. "
-                    "Change Maximum retries in Execution settings to allow more."
-                )
+            budget = db.execute(
+                "SELECT attempts,recoveries FROM revision_attempts WHERE repo=? AND pr=? AND head=? AND base=?",
+                key,
+            ).fetchone()
+            attempts, recoveries = (budget["attempts"], budget["recoveries"]) if budget else (0, 0)
+            recovery = bool(
+                not retry
+                and previous
+                and previous["end_reason"] in RECOVERABLE
+                and recoveries < MAX_RECOVERIES
+            )
+            # ``attempts`` outlives pruned run rows, so a completed revision is never re-run
+            # automatically just because its history aged out.
+            if (previous or attempts) and not retry and not recovery:
+                return None
+            hold = None if previous or retry else hold
+            if retry:
+                setting = db.execute("SELECT value FROM settings WHERE key='execution'").fetchone()
+                max_retries = (json.loads(setting[0]) if setting else {}).get("max_retries", 2)
+                if attempts >= max_retries + 1:
+                    raise RetryLimitReached(
+                        f"Retry limit reached: {max_retries + 1} attempts per PR head/base revision. "
+                        "Change Maximum retries in Execution settings to allow more."
+                    )
             config = {
                 **config,
                 "review_failure_threshold": config.get("review_failure_threshold", "major"),
@@ -213,29 +244,41 @@ class Store:
                     if r["path"] in config.get("workflows", [])
                 },
             }
-            attempt = previous["attempt"] + 1 if automatic_recovery and previous else attempts + 1
-            billed_attempts = attempts if automatic_recovery else attempt
-            rid = uuid.uuid4().hex
+            # Run numbers are independent of the billed budget: recoveries and held runs
+            # take a number without being charged.
+            highest = db.execute(
+                "SELECT COALESCE(MAX(attempt),0) FROM runs WHERE repo=? AND pr=? AND head=? AND base=?", key
+            ).fetchone()[0]
+            attempt = max(highest, attempts + recoveries) + 1  # Stays monotonic after pruning.
+            rid, now = uuid.uuid4().hex, time.time()
             db.execute(
                 "INSERT INTO runs(id,repo,pr,head,base,attempt,state,created,snapshot,config) VALUES(?,?,?,?,?,?,'queued',?,?,?)",
-                (
-                    rid,
-                    repo,
-                    pr["number"],
-                    head,
-                    base,
-                    attempt,
-                    time.time(),
-                    json.dumps(pr),
-                    json.dumps(config),
-                ),
+                (rid, *key, attempt, now, json.dumps(pr), json.dumps(config)),
             )
+            if hold:
+                db.execute(
+                    "UPDATE runs SET state='blocked',message=?,finished=?,end_reason='awaiting_approval' WHERE id=?",
+                    (hold, now, rid),
+                )
+            billed = 0 if recovery or hold else 1
             db.execute(
-                "INSERT INTO revision_attempts VALUES(?,?,?,?,?) "
-                "ON CONFLICT(repo,pr,head,base) DO UPDATE SET attempts=excluded.attempts",
-                (repo, pr["number"], head, base, billed_attempts),
+                "INSERT INTO revision_attempts(repo,pr,head,base,attempts,recoveries) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(repo,pr,head,base) DO UPDATE SET "
+                "attempts=attempts+excluded.attempts,recoveries=recoveries+excluded.recoveries",
+                (*key, billed, int(recovery)),
             )
             return rid
+
+    def request_cancel(self, rid: str, reason: str, message: str) -> None:
+        """Ask an active run to stop and remember why. A queued run is finalized here;
+        a running one is finalized by its worker, which keeps the recorded reason."""
+        self.execute(
+            "UPDATE runs SET cancel=1,end_reason=? WHERE id=? AND state IN ('queued','running')",
+            (reason, rid),
+        )
+        # Claim skips cancel=1 rows, so a run still queued here can no longer start;
+        # expected_state leaves one that was claimed just before to its worker.
+        self.finish(rid, "cancelled", message, expected_state="queued")
 
     def claim(self, execution: dict | None = None) -> dict | None:
         with self.connect() as db:
@@ -262,10 +305,20 @@ class Store:
             )
             return result
 
-    def finish(self, rid: str, state: str, message: str, *, expected_state: str | None = None):
+    def finish(
+        self,
+        rid: str,
+        state: str,
+        message: str,
+        *,
+        expected_state: str | None = None,
+        reason: str | None = None,
+    ):
+        """Finalize an active run. ``reason`` records why it ended (see RECOVERABLE);
+        None keeps a reason already stored with a cancellation request."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT steps,state FROM runs WHERE id=?", (rid,)).fetchone()
+            row = db.execute("SELECT steps,state,end_reason FROM runs WHERE id=?", (rid,)).fetchone()
             if (
                 not row
                 or row["state"] not in ACTIVE
@@ -278,9 +331,18 @@ class Store:
                 if step["state"] in ("queued", "running"):
                     step.update(state=state, message=message, finished=now)
             state, message = aggregate(steps, state, message)
+            requested = row["end_reason"]
+            if requested == "operator" and (state == "cancelled" or reason):
+                end_reason = "operator"  # A worker stop must not resurrect an operator's cancel.
+            elif reason is not None:
+                end_reason = reason
+            else:
+                # A requested cancel only explains a run that actually ended cancelled;
+                # one that completed first keeps its real outcome and is not re-queued.
+                end_reason = requested if state == "cancelled" else ""
             db.execute(
-                "UPDATE runs SET state=?,message=?,steps=?,finished=?,published=0 WHERE id=?",
-                (state, message, json.dumps(steps), now, rid),
+                "UPDATE runs SET state=?,message=?,steps=?,finished=?,published=0,end_reason=? WHERE id=?",
+                (state, message, json.dumps(steps), now, end_reason, rid),
             )
             db.execute(
                 """UPDATE run_usage SET state=?,duration_seconds=COALESCE(
@@ -361,9 +423,7 @@ class Store:
         for run in self.rows("SELECT * FROM runs WHERE repo=? AND state IN ('queued','running')", (repo,)):
             pr = current.get(run["pr"])
             if not pr or pr["draft"] or (pr["head"]["sha"], pr["base"]["sha"]) != (run["head"], run["base"]):
-                self.execute("UPDATE runs SET cancel=1 WHERE id=?", (run["id"],))
-                if run["state"] == "queued":
-                    self.finish(run["id"], "cancelled", "PR changed, closed, or became a draft")
+                self.request_cancel(run["id"], "pr_inactive", "PR changed, closed, or became a draft")
 
     def backup(self, destination: Path):
         with self.connect(write=False) as source, sqlite3.connect(destination) as target:

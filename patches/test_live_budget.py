@@ -23,6 +23,12 @@ def step(identity, **tokens):
     return {"type": "step_finish", "sessionID": "session", "part": {"messageID": identity, "tokens": tokens}}
 
 
+def part_step(part_id, identity, **tokens):
+    value = step(identity, **tokens)
+    value["part"]["id"] = part_id
+    return value
+
+
 def stream(events):
     process = SimpleNamespace(
         stdout=io.StringIO("\n".join(json.dumps(e) for e in events)), stderr=io.StringIO(""), pid=123
@@ -98,6 +104,37 @@ async def main():
         with bind(tracker()) as live:
             await asyncio.to_thread(stream, [first])
             assert live.steps == 1
+        # Several steps of one assistant message are each charged; a replayed part is not.
+        budget = tracker()
+        with bind(budget) as live:
+            await asyncio.to_thread(
+                stream,
+                [
+                    part_step("part-1", "shared", input=100),
+                    part_step("part-2", "shared", input=50),
+                    part_step("part-1", "shared", input=100),
+                ],
+            )
+            assert live.steps == 2 and live.duplicates == 1 and budget.tokens_used == 150
+        # Null counters are zero and integral floats are accepted.
+        budget = tracker()
+        with bind(budget) as live:
+            await asyncio.to_thread(
+                stream,
+                [part_step("float", "float", input=12.0, output=3, reasoning=None, cache={"read": None})],
+            )
+            assert live.steps == 1 and live.error is None and live.totals["input"] == 12
+            assert budget.tokens_used == 15
+        # Negative, fractional and non-numeric counters still stop the review.
+        for invalid in (-1, 1.5, "7", True):
+            with bind(tracker()) as live:
+                try:
+                    await asyncio.to_thread(stream, [part_step("bad", "bad", input=invalid)])
+                except BudgetExhausted as exc:
+                    assert "Invalid provider token counters" in str(exc)
+                else:
+                    raise AssertionError(f"Invalid counter accepted: {invalid!r}")
+                assert live.steps == 0
         # Meter I/O failure cannot be swallowed by the stream's generic handler.
         with bind(tracker()) as live, patch.object(live, "save", side_effect=OSError("fixture")):
             try:
@@ -145,7 +182,7 @@ async def main():
                 child.kill()
                 await asyncio.to_thread(child.wait)
     print(
-        "PASS: disjoint accounting, duplicate/replayed events, resumed-turn ceiling, fail-closed stream stop and durable usage"
+        "PASS: disjoint accounting, duplicate/replayed events, multi-step messages, counter validation, resumed-turn ceiling, fail-closed stream stop and durable usage"
     )
 
 

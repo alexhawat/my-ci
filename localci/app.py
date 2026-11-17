@@ -31,6 +31,8 @@ class RepoConfig(BaseModel):
     variables: dict[str, str] = Field(default_factory=dict)
     timeout: int = Field(default=7200, ge=60, le=14400)
     review_timeout: int = Field(default=3000, ge=60, le=3000)
+    # Bot-authored PRs carry third-party content; they wait for an operator unless enabled.
+    run_bot_prs: bool = False
 
     @field_validator("workflows")
     @classmethod
@@ -235,11 +237,10 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
             (int(config.enabled), config.model_dump_json(), name),
         )
         if not config.enabled:
-            controller.store.execute(
-                "UPDATE runs SET cancel=1 WHERE repo=? AND state IN ('queued','running')", (name,)
-            )
-            for row in controller.store.rows("SELECT id FROM runs WHERE repo=? AND state='queued'", (name,)):
-                controller.store.finish(row["id"], "cancelled", "Repository disabled")
+            for row in controller.store.rows(
+                "SELECT id FROM runs WHERE repo=? AND state IN ('queued','running')", (name,)
+            ):
+                controller.store.request_cancel(row["id"], "repo_disabled", "Repository disabled")
         controller.notify()
         return {"ok": True}
 
@@ -323,10 +324,9 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
 
     @app.post("/api/runs/{rid}/cancel")
     def cancel(rid: str):
-        run = get_run(rid)
-        controller.store.execute("UPDATE runs SET cancel=1 WHERE id=?", (rid,))
-        if run["state"] == "queued":
-            controller.store.finish(rid, "cancelled", "Cancelled by operator", expected_state="queued")
+        get_run(rid)
+        # An operator's cancel is final for this revision until the operator retries it.
+        controller.store.request_cancel(rid, "operator", "Cancelled by operator")
         controller.notify()
         return {"ok": True}
 

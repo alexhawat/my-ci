@@ -34,6 +34,60 @@ def is_pr_workflow(data: dict) -> bool:
     return events == "pull_request" if isinstance(events, str) else "pull_request" in events
 
 
+_SECRET_NAME = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)", re.I)
+_SECRET_INDEX = re.compile(r"\bsecrets\s*\[\s*(?:'([^'\]]+)'|\"([^\"\]]+)\")\s*\]", re.I)
+# Access that cannot be resolved statically: toJSON(secrets), secrets.*, secrets[<expr>].
+_SECRET_DYNAMIC = re.compile(
+    r"toJSON\s*\(\s*secrets\s*\)|\bsecrets\s*\.\s*\*|\bsecrets\s*\[(?!\s*(?:'[^'\]]+'|\"[^\"\]]+\")\s*\])",
+    re.I,
+)
+_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+_BARE_SECRETS = re.compile(r"\bsecrets\b(?!\s*[.\[])", re.I)
+_GITHUB_TOKEN = re.compile(r"\bgithub\s*(?:\.\s*token\b|\[\s*['\"]token['\"]\s*\])", re.I)
+
+
+def _strings(document):
+    """Every scalar string and mapping key in a parsed YAML document (no re-serialisation)."""
+    if isinstance(document, str):
+        yield document
+    elif isinstance(document, dict):
+        for key, value in document.items():
+            yield from _strings(key)
+            yield from _strings(value)
+    elif isinstance(document, (list, tuple)):
+        for value in document:
+            yield from _strings(value)
+
+
+def secret_references(document) -> tuple[set[str], bool]:
+    """Secret names a workflow fragment references, and whether any access is dynamic.
+
+    Supports ``secrets.NAME`` and ``secrets['NAME']``/``secrets["NAME"]``. Dynamic
+    access (``toJSON(secrets)``, ``secrets.*``, ``secrets[<expression>]`` or a bare
+    ``secrets`` inside ``${{ }}``) means "may read every configured secret".
+    """
+    names: set[str] = set()
+    dynamic = False
+    for text in _strings(document):
+        names.update(_SECRET_NAME.findall(text))
+        names.update(a or b for a, b in _SECRET_INDEX.findall(text))
+        if _SECRET_DYNAMIC.search(text) or any(
+            _BARE_SECRETS.search(expression) for expression in _EXPRESSION.findall(text)
+        ):
+            dynamic = True
+    return names, dynamic
+
+
+def github_token_referenced(document) -> bool:
+    """``github.token`` (act derives it from the GITHUB_TOKEN secret) or the secret itself."""
+    names, dynamic = secret_references(document)
+    return (
+        dynamic
+        or bool({n.upper() for n in names} & {"GITHUB_TOKEN", "GH_TOKEN"})
+        or any(_GITHUB_TOKEN.search(text) for text in _strings(document))
+    )
+
+
 def plan(text: str, available_secrets: set[str], variables: dict[str, str]) -> tuple[dict, list[str]]:
     """Reject unsupported execution instead of silently dropping mandatory checks."""
     data = workflow(text)
@@ -90,16 +144,15 @@ def plan(text: str, available_secrets: set[str], variables: dict[str, str]) -> t
                     }
                 )
                 notes.append(f"{jid}: Gitleaks v{version} scans full history locally; no GitHub API token")
-        required = set(
-            re.findall(
-                r"secrets\.([A-Za-z_][A-Za-z0-9_]*)",
-                yaml.safe_dump({"workflow_env": data.get("env"), "job": job}),
-            )
-        )
-        missing = required - available_secrets
+        scope = {"workflow_env": data.get("env"), "job": job}
+        # Dynamic access (toJSON(secrets), secrets[expr]) adds no statically known
+        # requirement; explicitly named secrets are still required.
+        required, _ = secret_references(scope)
+        configured = {name.upper() for name in available_secrets}
+        missing = {name for name in required if name.upper() not in configured}
         if missing:
             raise Blocked(f"{jid}: local secrets required: {', '.join(sorted(missing))}")
-        if re.search(r"github\.token", yaml.safe_dump(job)) and "GITHUB_TOKEN" not in available_secrets:
+        if any(_GITHUB_TOKEN.search(value) for value in _strings(scope)) and "GITHUB_TOKEN" not in configured:
             raise Blocked(f"{jid}: enable GitHub authentication in repository settings for github.token")
         if job.get("runs-on") in {"ubuntu-latest", "ubuntu-24.04"} and not job.get("container"):
             setup = {
@@ -132,6 +185,15 @@ def review_state(code: int) -> tuple[str, str]:
         40: ("error", "Review provider/infrastructure failure"),
         50: ("error", "Review timed out"),
     }.get(code, ("error", f"Review exited {code}"))
+
+
+def bot_pr(pr: dict) -> bool:
+    """Bot-authored PRs (dependency updaters and similar) carry third-party content."""
+    user = pr.get("user") or {}
+    return user.get("type") == "Bot" or user.get("login", "").casefold().endswith("[bot]")
+
+
+BOT_HOLD = "Bot-authored PR awaiting operator approval; review the change, then run it from the dashboard"
 
 
 def dependabot_pr(pr: dict) -> bool:

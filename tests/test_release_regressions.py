@@ -40,12 +40,13 @@ async def test_oversized_output_line_discards_secret_suffix(tmp_path):
     code, _ = await runner.command(
         "python",
         "-c",
-        "import sys; sys.stdout.write('x' * 131000 + 'SECRETVALUE123\\n')",
+        "import sys; sys.stdout.write('x' * 131000 + 'SECRETVALUE123\\nnext line\\n')",
     )
     assert code == 0
     log = runner.log_path.read_text()
     assert "[oversized output line omitted]" in log
     assert "SECRETVALUE123" not in log and "TVALUE123" not in log
+    assert log.splitlines()[-1].endswith(" next line")  # the following line survives
 
 
 def test_workflow_level_secret_references_are_required():
@@ -67,17 +68,6 @@ def test_dependabot_branch_name_does_not_bypass_review():
     snapshot["user"]["login"] = "maintainer"
     snapshot["head"]["ref"] = "dependabot/not-a-bot"
     assert not dependabot_pr(snapshot)
-
-
-def test_cancelled_and_interrupted_runs_recover_without_retry_budget(tmp_path):
-    store = Store(tmp_path / "db")
-    for message in (None, "Execution worker restarted; retry this run"):
-        rid = store.enqueue("owner/repo", pr(), {})
-        store.finish(rid, "cancelled" if message is None else "error", message or "Draft")
-        replacement = store.enqueue("owner/repo", pr(), {})
-        assert replacement and replacement != rid
-        assert store.rows("SELECT attempts FROM revision_attempts")[0]["attempts"] == 1
-        store.finish(replacement, "cancelled", "Draft")
 
 
 def test_capacity_defaults_fit_small_hosts(tmp_path):
@@ -114,10 +104,17 @@ async def test_each_workflow_receives_only_referenced_secret_values(tmp_path):
         lambda *_: {"USED_TOKEN": "selected-value", "UNUSED_TOKEN": "unselected-value"},
     )
     secret_files = []
+    worker = {}  # files present in the worker's /control
 
     async def command(*args, **kwargs):
         if args[:2] == ("git", "clone"):
             Path(args[-1]).mkdir(parents=True)
+        if args[:2] == ("docker", "cp") and args[3].endswith(":/control"):
+            worker.update({p.name: p.read_text() for p in Path(args[2]).iterdir()})
+        elif args[:2] == ("docker", "cp") and ":/control/" in args[3]:
+            worker[args[3].rsplit("/", 1)[1]] = Path(args[2]).read_text()
+        if args[:2] == ("docker", "exec") and "rm" in args:
+            worker.pop(args[-1].rsplit("/", 1)[1], None)
         if args[:2] == ("git", "show"):
             return (
                 0,
@@ -132,8 +129,7 @@ jobs:
             )
         if "act" in args:
             name = Path(args[args.index("--secret-file") + 1]).name
-            path = runner.root / "work" / rid / "control" / name
-            secret_files.append(path.read_text())
+            secret_files.append(worker[name])
             runner.completed_jobs = 1
         return 0, ""
 
@@ -146,6 +142,7 @@ jobs:
     assert len(secret_files) == 1
     assert "selected-value" in secret_files[0]
     assert "unselected-value" not in secret_files[0]
+    assert not any(name.endswith(".secrets") for name in worker)  # removed after act
 
 
 def test_container_inputs_are_pinned_and_nested_secrets_are_ignored():
@@ -154,5 +151,14 @@ def test_container_inputs_are_pinned_and_nested_secrets_are_ignored():
         for line in (root / name).read_text().splitlines():
             if line.startswith("FROM ") and "${BASE_IMAGE}" not in line:
                 assert "@sha256:" in line
+    jobs = (root / "Dockerfile.jobs").read_text()
+    # Chrome comes from the signed apt repository, never a moving direct download.
+    assert "_current_" not in jobs and "/linux/direct/" not in jobs
+    assert "deb [arch=amd64 signed-by=$keyring] https://dl.google.com/linux/chrome/deb/ stable main" in jobs
+    fingerprint = [line for line in jobs.splitlines() if line.startswith("ARG CHROME_KEY_FINGERPRINT=")]
+    assert len(fingerprint) == 1
+    value = fingerprint[0].split("=", 1)[1]
+    assert len(value) == 40 and all(c in "0123456789ABCDEF" for c in value)
+    assert 'grep -qx "${CHROME_KEY_FINGERPRINT}"' in jobs
     ignored = (root / ".dockerignore").read_text()
     assert "**/*.key" in ignored and "**/*.pem" in ignored and "**/__pycache__" in ignored

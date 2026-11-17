@@ -355,7 +355,7 @@ def test_closed_prs_are_display_only_cached_and_limited_to_enabled_repos(client)
     assert result["prs"][0]["merged"] and not result["prs"][1]["merged"]
     assert http.get("/api/prs?state=closed").json()["prs"] == result["prs"]
     c.github.pages.assert_awaited_once_with(
-        "repos/o/r/pulls?state=closed&sort=updated&direction=desc", max_pages=2
+        "repos/o/r/pulls?state=closed&sort=updated&direction=desc", max_pages=2, truncate=True
     )
     assert [p["number"] for p in http.get("/api/prs").json()["prs"]] == [124]
     assert c.store.rows("SELECT * FROM runs") == []
