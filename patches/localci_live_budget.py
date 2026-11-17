@@ -35,8 +35,8 @@ class LiveBudget:
 
     @staticmethod
     def _fields(tokens):
-        cache = tokens.get("cache") or {}
-        cache = cache if isinstance(cache, dict) else {"read": cache}
+        cache = tokens.get("cache")
+        cache = cache if isinstance(cache, dict) else {}  # As upstream: only a mapping counts.
         fields = {k: _counter(tokens.get(k)) for k in ("input", "output", "reasoning")}
         fields.update(cache_read=_counter(cache.get("read")), cache_write=_counter(cache.get("write")))
         return fields

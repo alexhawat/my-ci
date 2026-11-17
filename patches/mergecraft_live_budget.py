@@ -40,8 +40,19 @@ def apply(root):
         """        if live_budget is not None:
             if live_budget.error:
                 return
-            if not live_budget.accept(event):
-                # A rejected event (invalid counters) stops the agent like a failed charge.
+            try:
+                accepted = live_budget.accept(event)
+            except Exception as exc:
+                # The generic stream handler would swallow this and leave the agent
+                # running with metering already stopped.
+                from mergecraft.utils.run_bounds import BudgetExhausted
+                live_budget.error = live_budget.error or BudgetExhausted(
+                    "token", "Live usage meter failed; review stopped: " + type(exc).__name__
+                )
+                live_budget.tracker.last_exhausted = live_budget.error
+                accepted = False
+            if not accepted:
+                # A rejected event (invalid counters, failed meter) stops the agent.
                 if live_budget.error:
                     kill_process_group(getattr(process, "pid", None))
                 return

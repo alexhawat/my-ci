@@ -9,9 +9,7 @@ RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go
 ENV PATH=/usr/local/go/bin:${PATH}
 # Chrome comes from Google's apt repository: apt verifies its signature with only the
 # key whose primary fingerprint is pinned here. Set CHROME_VERSION to pin a version
-# (it builds only while Google's repository still serves that version). After install
-# the step waits briefly because the package's post-install can still be adding its
-# own apt source and key, which are then removed.
+# (it builds only while Google's repository still serves that version).
 ARG CHROME_KEY_FINGERPRINT=EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796
 ARG CHROME_VERSION=
 RUN set -eux; \
@@ -43,11 +41,24 @@ RUN set -eux; \
     if [ -n "${CHROME_VERSION}" ]; then chrome="google-chrome-stable=${CHROME_VERSION}"; fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends "$chrome" xvfb xauth; \
-    wait 2>/dev/null || true; sleep 2; \
-    drop_other_chrome_sources; \
-    rm -f /etc/apt/trusted.gpg.d/google-chrome.gpg; \
     rm -rf /var/lib/apt/lists/*; \
     google-chrome --version
+# The package's post-install can add its own apt source and trusted key in the
+# background. A separate step runs only after every process of the install step has
+# ended, removes them, and fails the build if any other Chrome source or key remains.
+RUN set -eu; \
+    list=/etc/apt/sources.list.d/localci-google-chrome.list; \
+    for source in /etc/apt/sources.list.d/*; do \
+        if [ "$source" != "$list" ] && grep -qs 'dl\.google\.com/linux/chrome' "$source"; then rm -f "$source"; fi; \
+    done; \
+    rm -f /etc/apt/trusted.gpg.d/google-chrome.gpg /etc/apt/trusted.gpg.d/google-chrome.asc; \
+    test -s "$list"; \
+    if grep -rlsF 'dl.google.com/linux/chrome' /etc/apt/sources.list /etc/apt/sources.list.d | grep -vxF "$list"; then \
+        echo 'unexpected Chrome apt source' >&2; exit 1; \
+    fi; \
+    if ls /etc/apt/trusted.gpg.d 2>/dev/null | grep -qi 'google-chrome'; then \
+        echo 'unexpected Chrome apt key' >&2; exit 1; \
+    fi
 RUN useradd -m -u 1001 -s /bin/bash runner \
     && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
     && chmod 440 /etc/sudoers.d/runner

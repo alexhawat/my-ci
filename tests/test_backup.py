@@ -98,3 +98,15 @@ def test_stale_partial_holding_the_key_is_removed_but_a_recent_one_is_left(tmp_p
     os.utime(stale, (1, 1))
     backup.create_backup(root)
     assert not stale.exists() and recent.exists()  # A recent one may be a concurrent backup.
+
+
+def test_volume_without_hard_links_fails_clearly_and_leaves_nothing(tmp_path, monkeypatch):
+    root = data_root(tmp_path)
+
+    def unsupported(*_):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(backup.os, "link", unsupported)
+    with pytest.raises(RuntimeError, match="hard links"):
+        backup.create_backup(root)
+    assert not list((root / "backups").iterdir())

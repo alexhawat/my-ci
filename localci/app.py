@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import Literal
 
@@ -352,11 +353,15 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
                 "This bot-authored PR changed after this run; review the new revision and retry its own run",
             )
         try:
+            # The enabled check is repeated inside the enqueue transaction: the repository
+            # may have been disabled while this request waited on GitHub.
             new_id = await asyncio.to_thread(
-                controller.store.enqueue, run["repo"], pr, json.loads(repo["config"]), retry=True
+                partial(controller.store.enqueue, run["repo"], pr, config, retry=True, require_enabled=True)
             )
         except RetryLimitReached as exc:
             raise HTTPException(409, str(exc)) from None
+        if new_id is None and not controller.store.repo(run["repo"])["enabled"]:
+            raise HTTPException(400, "Enable the repository before retrying")
         controller.notify()
         return {"id": new_id}
 

@@ -14,7 +14,7 @@ node --check localci/static/app.js
 node --test tests/test_history.mjs tests/test_selection.mjs
 ```
 
-Privacy release tests reject personal paths, non-public commit identities, common credential formats, private-network addresses and Tailscale hostnames, the former private registry namespace, non-placeholder email addresses, and non-synthetic workflow fixtures without embedding a denylist of private names. They also verify generic deployment defaults and configurable host labels.
+Privacy release tests reject personal paths, non-public commit identities, common credential formats, private IPv4/IPv6 and Tailscale addresses and hostnames, the former private registry namespace, non-placeholder email addresses in files, and non-synthetic workflow fixtures without embedding a denylist of private names. They also verify generic deployment defaults and configurable host labels.
 
 ## Docker validation
 

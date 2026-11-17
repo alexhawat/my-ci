@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+import sqlite3
 import sys
 import tarfile
 import tempfile
@@ -48,6 +49,11 @@ def create_backup(root: Path) -> Path:
                 os.link(partial, path)
             except FileExistsError:
                 raise RuntimeError(f"{path} already exists; no backup was created") from None
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot publish {path}: the backup directory must support hard links "
+                    f"({exc.strerror or exc}); no backup was created"
+                ) from None
         finally:
             partial.unlink(missing_ok=True)
     directory = os.open(destination, os.O_RDONLY)
@@ -61,7 +67,7 @@ def create_backup(root: Path) -> Path:
 def main() -> int:
     try:
         path = create_backup(Path(os.environ.get("LOCALCI_DATA", "/data")))
-    except (RuntimeError, OSError) as exc:
+    except (RuntimeError, OSError, sqlite3.Error) as exc:
         print(exc, file=sys.stderr)
         return 1
     print(path)

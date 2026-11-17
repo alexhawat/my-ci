@@ -41,22 +41,50 @@ _SECRET_DYNAMIC = re.compile(
     r"toJSON\s*\(\s*secrets\s*\)|\bsecrets\s*\.\s*\*|\bsecrets\s*\[(?!\s*(?:'[^'\]]+'|\"[^\"\]]+\")\s*\])",
     re.I,
 )
-_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+_INDEX_BEFORE = re.compile(r"\bsecrets\s*\[\s*$", re.I)
+_INDEX_AFTER = re.compile(r"\s*\]")
+
+
+def _embedded_expressions(text: str) -> list[str]:
+    """The inside of every ``${{ }}`` in ``text``.
+
+    The closing braces are searched outside single-quoted string literals:
+    ``format('{{ {0} }}', secrets.X)`` contains ``}}`` without ending there.
+    An unterminated expression extends to the end of the text.
+    """
+    found, position = [], 0
+    while (start := text.find("${{", position)) >= 0:
+        index = start + 3
+        while index < len(text):
+            if text[index] == "'":
+                literal = _STRING_LITERAL.match(text, index)
+                index = literal.end() if literal else len(text)
+            elif text.startswith("}}", index):
+                break
+            else:
+                index += 1
+        found.append(text[start + 3 : index])
+        position = index + 2
+    return found
+
+
+def _code(expression: str) -> str:
+    """The expression with string literals emptied, so words inside text such as
+    ``'rotate secrets'`` are not read as references. A literal used as an index of
+    ``secrets[...]`` is kept: it names the secret."""
+
+    def replace(match: re.Match) -> str:
+        indexed = _INDEX_BEFORE.search(expression, 0, match.start()) and _INDEX_AFTER.match(
+            expression, match.end()
+        )
+        return match.group() if indexed else "''"
+
+    return _STRING_LITERAL.sub(replace, expression)
+
+
 _BARE_SECRETS = re.compile(r"\bsecrets\b(?!\s*[.\[])", re.I)
 _GITHUB_TOKEN = re.compile(r"\bgithub\s*(?:\.\s*token\b|\[\s*['\"]token['\"]\s*\])", re.I)
-
-
-def _strings(document):
-    """Every scalar string and mapping key in a parsed YAML document (no re-serialisation)."""
-    if isinstance(document, str):
-        yield document
-    elif isinstance(document, dict):
-        for key, value in document.items():
-            yield from _strings(key)
-            yield from _strings(value)
-    elif isinstance(document, (list, tuple)):
-        for value in document:
-            yield from _strings(value)
 
 
 def _expressions(document, conditional: bool = False):
@@ -67,9 +95,9 @@ def _expressions(document, conditional: bool = False):
     in a script is the program's own variable, not a workflow secret.
     """
     if isinstance(document, str):
-        yield from _EXPRESSION.findall(document)
+        yield from map(_code, _embedded_expressions(document))
         if conditional and "${{" not in document:
-            yield document
+            yield _code(document)
     elif isinstance(document, dict):
         for key, value in document.items():
             yield from _expressions(key)
@@ -170,7 +198,10 @@ def plan(text: str, available_secrets: set[str], variables: dict[str, str]) -> t
         missing = {name for name in required if name.upper() not in configured}
         if missing:
             raise Blocked(f"{jid}: local secrets required: {', '.join(sorted(missing))}")
-        if any(_GITHUB_TOKEN.search(value) for value in _strings(scope)) and "GITHUB_TOKEN" not in configured:
+        if (
+            any(_GITHUB_TOKEN.search(expression) for expression in _expressions(scope))
+            and "GITHUB_TOKEN" not in configured
+        ):
             raise Blocked(f"{jid}: enable GitHub authentication in repository settings for github.token")
         if job.get("runs-on") in {"ubuntu-latest", "ubuntu-24.04"} and not job.get("container"):
             setup = {

@@ -443,6 +443,7 @@ async def test_cleanup_removes_container_and_network_and_tolerates_missing_docke
     assert seen == [
         ("docker", "rm", "-fv", "localci-run-fixture"),
         ("docker", "network", "rm", "localci-run-fixture"),
+        ("docker", "network", "ls", "--filter", "name=localci-run-fixture", "--format", "{{.Name}}"),
         ("docker", "network", "ls", "-q", "--filter", "label=localci.worker=true"),
         ("docker", "network", "rm", "net1"),
         ("docker", "network", "rm", "net2"),
@@ -696,7 +697,11 @@ def test_secret_references_are_read_from_expressions_not_from_program_text():
     "path",
     [
         "CONTEXT.md",
-        "docs/agent.md",
+        "Agent.md",
+        "AGENTS.override.md",
+        ".gemini/settings.json",
+        ".github/agents/reviewer.md",
+        ".vscode/mcp.json",
         ".windsurfrules",
         "pkg/.clinerules",
         ".aider.conf.yml",
@@ -722,5 +727,125 @@ def test_nested_daemon_dns_setting_is_validated(monkeypatch):
     monkeypatch.setenv("LOCALCI_NESTED_DNS", "192.0.2.53, 2001:db8::53")
     assert nested_dns_arguments() == ["--dns=192.0.2.53", "--dns=2001:db8::53"]
     monkeypatch.setenv("LOCALCI_NESTED_DNS", "192.0.2.53 --privileged")
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError, match="LOCALCI_NESTED_DNS"):
         nested_dns_arguments()
+    # dockerd rejects a zoned address and would not start; refuse it with a clear message.
+    monkeypatch.setenv("LOCALCI_NESTED_DNS", "2001:db8::53%eth0")
+    with pytest.raises(RuntimeError, match="without a zone"):
+        nested_dns_arguments()
+
+
+# Fourth-round review fixes -----------------------------------------------------------------------
+
+
+async def test_network_removal_waits_for_a_slow_container_teardown(tmp_path, monkeypatch):
+    runner = log_runner(tmp_path)
+    attached = 2  # The network still has an endpoint for the first two attempts.
+    calls = []
+
+    async def quiet(*args):
+        nonlocal attached
+        calls.append(args[:2])
+        if args[:2] == ("network", "rm"):
+            attached -= 1
+        if args[:2] == ("network", "ls"):
+            return "localci-run-fixture\n" if attached >= 0 else ""
+        return ""
+
+    async def no_sleep(_):
+        return None
+
+    runner._quiet_docker = quiet
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    await REAL_REMOVE_NETWORK(runner, "localci-run-fixture")
+    assert calls.count(("network", "rm")) == 3
+
+
+def wrapped(data: bytes, width: int = 76) -> str:
+    encoded = base64.b64encode(data).decode()
+    return "".join(encoded[i : i + width] + "\n" for i in range(0, len(encoded), width))
+
+
+def recoverable(text: str, secret: bytes) -> bool:
+    remaining = "".join(re.sub(r"^\[[^]]*\]\s*\|\s*", "", line) for line in text.splitlines())
+    remaining = remaining.replace("[redacted]", "")
+    for shift in range(4):
+        chunk = remaining[shift:] + "=" * (-len(remaining[shift:]) % 4)
+        with contextlib.suppress(Exception):
+            if secret[4:20] in base64.b64decode(chunk):
+                return True
+    return False
+
+
+@pytest.mark.parametrize("prefix", ["", "[CI/test]   | "])
+@pytest.mark.parametrize("width", [76, 64])
+def test_base64_wrapped_across_lines_is_redacted(prefix, width):
+    secret = ("fixture_token_" + "Zq9xB3dE" * 7).encode()  # Long enough that base64(1) wraps it.
+    for data in (secret + b"\n", b"x" * 50 + secret + b"y" * 50, b'{"key":"' + secret + b'"}'):
+        output = "".join(prefix + line + "\n" for line in wrapped(data, width).splitlines())
+        assert recoverable(output, secret), "fixture must be recoverable before redaction"
+        cleaned = redact(f"before\n{output}after text\n", [secret.decode()])
+        assert not recoverable(cleaned, secret)
+        assert cleaned.startswith("before\n") and cleaned.endswith("after text\n")
+        assert prefix == "" or cleaned.count(prefix) == output.count(prefix)  # Line prefixes survive.
+
+
+def test_wrapped_base64_scan_leaves_unrelated_output_alone_and_is_linear():
+    secret = "fixture_token_" + "Zq9xB3dE" * 7
+    unrelated = wrapped(os.urandom(600)) + "plain log line\n" + "f" * 64 + "\n" + "a" * 64 + "\n"
+    assert redact(unrelated, [secret]) == unrelated
+    huge = "A" * 400_000 + " tail\n" + "B" * 400_000 + "\n"
+    started = time.monotonic()
+    assert redact(huge, [secret]) == huge
+    assert time.monotonic() - started < 2  # A regex retried per position took minutes here.
+
+
+def test_urlsafe_base64_of_a_secret_is_redacted():
+    secret = "a>>>???b>>>???c>>>???"  # Encodes to "+" and "/" after the 5-byte "user:" prefix.
+    standard = base64.b64encode(b"user:" + secret.encode()).decode()
+    urlsafe = base64.urlsafe_b64encode(b"user:" + secret.encode()).decode()
+    assert urlsafe != standard and ("-" in urlsafe or "_" in urlsafe)
+    for encoded in (standard, urlsafe, urlsafe.rstrip("=")):
+        assert "[redacted]" in redact(f"Authorization: Basic {encoded}", [secret])
+
+
+def test_short_credential_line_of_a_multiline_secret_is_redacted_alone():
+    assert redact("password is S3cr3tPw!x\n", ["deploy\nS3cr3tPw!x"]) == "password is [redacted]\n"
+    # Short ordinary words of a structured secret are still not patterns.
+    assert redact("deploy finished\n", ["deploy\nS3cr3tPw!x"]) == "deploy finished\n"
+
+
+def test_generic_agent_file_names_are_removed_only_at_the_repository_root(tmp_path):
+    for path in ("agent.md", "Context.md", "docs/agent.md", "docs/CONTEXT.md", "pkg/AGENTS.md"):
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("text")
+    remove_agent_configuration(tmp_path)
+    remaining = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file())
+    assert remaining == ["docs/CONTEXT.md", "docs/agent.md"]  # Ordinary documentation stays readable.
+
+
+def test_expressions_with_braces_or_the_word_secrets_inside_string_literals():
+    # "}}" inside a literal does not end the expression; the reference after it counts.
+    assert secret_references({"env": {"A": "${{ format('{{ {0} }}', secrets.X) }}"}}) == ({"X"}, False)
+    # Words inside literals are text, not references or dynamic access.
+    for condition in (
+        "github.actor != 'secrets-bot'",
+        "contains(github.event.pull_request.title, 'rotate secrets')",
+        "${{ github.actor != 'secrets.FAKE' && 'it''s secrets[x]' != '' }}",
+    ):
+        assert secret_references({"if": condition}) == (set(), False), condition
+    # A literal used as the index of secrets[...] names the secret; a computed index is dynamic.
+    assert secret_references({"env": {"A": "${{ secrets['B_KEY'] }}"}}) == ({"B_KEY"}, False)
+    assert secret_references({"env": {"A": "${{ secrets[format('{0}', 'x')] }}"}}) == (set(), True)
+    # An unterminated expression is still read, so its reference is not lost.
+    assert secret_references({"run": "echo ${{ secrets.OPEN"}) == ({"OPEN"}, False)
+
+
+def test_plan_reads_github_token_only_from_expressions():
+    template = "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {}\n"
+    plan(template.format("jq -r '.github.token' config.json"), set(), {})
+    with pytest.raises(Blocked, match="GitHub authentication"):
+        plan(template.format("echo ${{ github.token }}"), set(), {})
+    with pytest.raises(Blocked, match="MISSING"):
+        plan(template.format("echo ${{ format('{{ {0} }}', secrets.MISSING) }}"), set(), {})

@@ -106,9 +106,11 @@ class Store:
                         "UPDATE runs SET end_reason=? WHERE state='cancelled' AND message=? AND end_reason=''",
                         (reason, message),
                     )
+                # Crash recovery, and the graceful stop that an upgrade itself performs.
                 db.execute(
                     "UPDATE runs SET end_reason='worker_interrupted' WHERE state IN ('error','failure') "
-                    "AND end_reason='' AND message LIKE '%Execution worker restarted; retry this run%'"
+                    "AND end_reason='' AND (message LIKE '%Execution worker restarted; retry this run%' "
+                    "OR message LIKE '%Controller stopped during execution; retry this run%')"
                 )
             if version in (1, 2):
                 # One-time backfill for databases that predate the budget table. Running it on
@@ -208,6 +210,7 @@ class Store:
         *,
         retry: bool = False,
         hold: str | None = None,
+        bot_hold: str | None = None,
         require_enabled: bool = False,
     ) -> str | None:
         """Queue a run for the PR's current head/base revision.
@@ -217,6 +220,8 @@ class Store:
         charging the retry budget, at most MAX_RECOVERIES times. ``retry`` is the
         operator path and is charged against the budget. ``hold`` records the first
         run as blocked with that message instead of queueing it (operator approval gate).
+        ``bot_hold`` is such a message for a bot-authored PR; it applies unless the
+        repository's stored configuration allows automatic bot runs at this moment.
         ``require_enabled`` makes the repository's enabled flag part of the transaction.
         """
         head, base = pr["head"]["sha"], pr["base"]["sha"]
@@ -232,10 +237,14 @@ class Store:
                 return None
             # Checked inside the transaction: a poll that listed the repository before it
             # was disabled must not re-queue the run that disabling just cancelled.
-            if require_enabled:
-                watched = db.execute("SELECT enabled FROM repos WHERE name=?", (repo,)).fetchone()
-                if not watched or not watched["enabled"]:
-                    return None
+            watched = db.execute("SELECT enabled,config FROM repos WHERE name=?", (repo,)).fetchone()
+            if require_enabled and (not watched or not watched["enabled"]):
+                return None
+            if bot_hold and not retry:
+                # Read here, not by the caller before its slow GitHub request: an operator
+                # who just switched automatic bot runs off must not be overtaken by a poll.
+                allowed = bool(watched and json.loads(watched["config"]).get("run_bot_prs"))
+                hold = None if allowed else bot_hold
             budget = db.execute(
                 "SELECT attempts,recoveries FROM revision_attempts WHERE repo=? AND pr=? AND head=? AND base=?",
                 key,

@@ -34,7 +34,9 @@ class Controller:
         self.capacity: dict = {}
         self.login = ""
         # Separate sources so one cannot overwrite or prematurely clear another.
-        self.poll_error = self.run_error = self.capacity_error = ""
+        self.poll_error = self.capacity_error = ""
+        # Finalization failures by run id, with the time they happened.
+        self.run_errors: dict[str, tuple[str, float]] = {}
         self.last_poll = 0.0
         self.last_discovery = 0.0
         self.lock = asyncio.Lock()
@@ -46,7 +48,16 @@ class Controller:
 
     @property
     def error(self) -> str:
-        return "; ".join(e for e in (self.poll_error, self.capacity_error, self.run_error) if e)
+        failures = [message for message, _ in self.run_errors.values()]
+        return "; ".join(e for e in (self.poll_error, self.capacity_error, *failures) if e)
+
+    def expire_run_errors(self):
+        """Keep a finalization failure visible while its run is still marked active
+        (stuck until the worker restarts), and for a few minutes after it is not."""
+        for rid, (_, since) in list(self.run_errors.items()):
+            stuck = self.store.rows("SELECT 1 FROM runs WHERE id=? AND state IN ('queued','running')", (rid,))
+            if not stuck and time.time() - since > 300:
+                del self.run_errors[rid]
 
     def status(self):
         rows = self.store.rows("SELECT value FROM settings WHERE key='worker_status'")
@@ -130,15 +141,15 @@ class Controller:
                     config = json.loads(repo["config"])
                     for pr in prs:
                         if eligible(pr, repo["name"]):
-                            # Bot PRs run privileged CI only after an operator starts them.
-                            hold = BOT_HOLD if bot_pr(pr) and not config.get("run_bot_prs") else None
+                            # Bot PRs run privileged CI only after an operator starts them,
+                            # unless the repository allows it when the run is enqueued.
                             await asyncio.to_thread(
                                 partial(
                                     self.store.enqueue,
                                     repo["name"],
                                     pr,
                                     config,
-                                    hold=hold,
+                                    bot_hold=BOT_HOLD if bot_pr(pr) else None,
                                     require_enabled=True,
                                 )
                             )
@@ -294,6 +305,7 @@ class Controller:
 
     async def schedule(self):
         active = {}
+        swept = time.monotonic()
         try:
             while True:
                 done = {t for t in active if t.done()}
@@ -301,10 +313,14 @@ class Controller:
                     try:
                         task.result()
                     except Exception as exc:
-                        self.run_error = f"Run finalization failed: {exc}"
-                    else:
-                        self.run_error = ""  # A later clean run shows the worker has recovered.
+                        rid = active[task]["run_id"]
+                        self.run_errors[rid] = (f"Run {rid[:8]} finalization failed: {exc}", time.time())
                     del active[task]
+                await asyncio.to_thread(self.expire_run_errors)
+                if not active and time.monotonic() - swept > 600:
+                    # Networks whose removal lost a race with a slow container teardown.
+                    swept = time.monotonic()
+                    await Runner(self.store, self.github, self.root, self.secrets).cleanup_networks()
                 settings = await asyncio.to_thread(self.store.settings, self.capacity)
                 unfit = False
                 # Lowering the limit drains existing runs; it never kills them.
@@ -325,7 +341,7 @@ class Controller:
                     run = await asyncio.to_thread(self.store.claim, settings)
                     if not run:
                         break
-                    active[asyncio.create_task(self.execute_run(run))] = settings
+                    active[asyncio.create_task(self.execute_run(run))] = {**settings, "run_id": run["id"]}
                 # Recomputed every pass, so it clears as soon as the queued run fits or leaves.
                 self.capacity_error = (
                     "Queued run does not fit configured host capacity; reduce CPU/memory limits "

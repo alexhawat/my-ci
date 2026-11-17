@@ -155,7 +155,11 @@ def test_disable_cancels_runs_and_reenable_recovers_them(client):  # noqa: F811
         "repo_disabled",
         "Repository disabled",
     )
-    assert store.enqueue(REPO, pr(), {})
+    # While disabled, the poll's path refuses; re-enabling is what recovers the run.
+    assert store.enqueue(REPO, pr(), {}, require_enabled=True) is None
+    assert client.put("/api/repos/owner/repo", json={"enabled": True, "review": True}).status_code == 200
+    recovered = store.enqueue(REPO, pr(), {}, require_enabled=True)
+    assert recovered and store.claim()["id"] == recovered
 
 
 def test_cancel_endpoint_is_final_and_retry_endpoint_still_works(client):  # noqa: F811
@@ -317,6 +321,11 @@ def test_version_3_database_migrates_without_rebilling_and_keeps_recovery(tmp_pa
         "pr_inactive": ("cancelled", "PR changed, closed, or became a draft"),
         "repo_disabled": ("cancelled", "Repository disabled"),
         "worker_interrupted": ("error", "ci.yml: error (Execution worker restarted; retry this run)"),
+        # What stopping the old worker for the upgrade itself leaves behind.
+        "worker_interrupted ": (
+            "error",
+            "ci.yml: error (Controller stopped during execution; retry this run)",
+        ),
         "": ("failure", "ci.yml: failure (1 job failed)"),
     }
     with sqlite3.connect(path) as db:
@@ -348,7 +357,7 @@ def test_version_3_database_migrates_without_rebilling_and_keeps_recovery(tmp_pa
     assert migrated.rows("PRAGMA user_version")[0]["user_version"] == SCHEMA_VERSION
     assert path.with_suffix(".pre-v4.sqlite").exists()
     reasons = [r["end_reason"] for r in migrated.rows("SELECT end_reason FROM runs ORDER BY pr")]
-    assert reasons == list(revisions)
+    assert reasons == [reason.strip() for reason in revisions]
     # Opening again must neither re-bill the unbilled run numbers nor alter reasons.
     migrated.close()
     migrated = Store(path)
@@ -447,35 +456,84 @@ def test_enabling_automatic_bot_runs_releases_held_prs_once(tmp_path):
     assert store.enqueue(REPO, bot(), {}) is None  # Released once, not re-run after failing.
 
 
-async def test_finalization_error_clears_after_a_later_clean_run(tmp_path, monkeypatch):
+async def test_finalization_error_stays_while_its_run_is_stuck(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALCI_TOKEN_FILE", str(tmp_path / "token"))
     controller = Controller(tmp_path / "data")
     store = controller.store
     controller.capacity = {"cpus": 8, "memory_gb": 16}
-    outcomes = [RuntimeError("database is locked"), None]
-    finished = asyncio.Event()
+    clean_run_done = asyncio.Event()
 
     async def execute(claimed):
-        outcome = outcomes.pop(0)
+        if claimed["head"] == "a" * 40:
+            raise RuntimeError("database is locked")  # Left 'running' with no worker task.
         store.finish(claimed["id"], "success", "All configured checks passed")
-        if not outcomes:
-            finished.set()
-        if outcome:
-            raise outcome
+        clean_run_done.set()
+
+    async def until(predicate):
+        async with asyncio.timeout(5):
+            while not predicate():  # noqa: ASYNC110
+                await asyncio.sleep(0.05)
 
     controller.execute_run = execute
-    store.enqueue(REPO, pr(), {})
+    stuck = store.enqueue(REPO, pr(), {})
     task = asyncio.create_task(controller.schedule())
     try:
-        async with asyncio.timeout(5):
-            while "Run finalization failed" not in controller.error:  # noqa: ASYNC110
-                await asyncio.sleep(0.05)
-        store.enqueue(REPO, pr(head="c" * 40), {})
-        await asyncio.wait_for(finished.wait(), 5)
-        async with asyncio.timeout(5):
-            while controller.error:  # noqa: ASYNC110
-                await asyncio.sleep(0.05)
+        await until(lambda: "finalization failed" in controller.error)
+        store.enqueue(REPO, {**pr(head="c" * 40), "number": 5}, {})
+        await asyncio.wait_for(clean_run_done.wait(), 5)
+        await asyncio.sleep(1.2)  # At least one further scheduler pass.
+        # A later clean run must not hide that the first is still stuck.
+        assert stuck[:8] in controller.error and run(store, stuck)["state"] == "running"
+        # Once the run is no longer active and some time has passed, the message goes.
+        store.finish(stuck, "error", "Execution worker restarted before this run completed")
+        message, _ = controller.run_errors[stuck]
+        controller.run_errors[stuck] = (message, 0.0)
+        await until(lambda: controller.error == "")
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         store.close()
+
+
+def test_retry_cannot_queue_into_a_repository_disabled_during_the_request(client):  # noqa: F811
+    controller = client.app.state.controller
+    store = controller.store
+    assert client.put("/api/repos/owner/repo", json={"enabled": True, "review": True}).status_code == 200
+    rid = store.enqueue(REPO, pr(), {})
+    store.finish(rid, "failure", "Checks failed")
+
+    async def fetch_while_operator_disables(*_):
+        # The retry already saw the repository enabled and is waiting on GitHub.
+        store.execute("UPDATE repos SET enabled=0 WHERE name=?", (REPO,))
+        return pr()
+
+    controller.github.request = fetch_while_operator_disables
+    response = client.post(f"/api/runs/{rid}/retry")
+    assert response.status_code == 400 and "Enable the repository" in response.json()["detail"]
+    assert store.claim() is None
+    assert [r["state"] for r in store.rows("SELECT state FROM runs")] == ["failure"]
+
+
+async def test_poll_with_stale_configuration_cannot_release_or_run_bot_prs(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_TOKEN_FILE", str(tmp_path / "token"))
+    controller = Controller(tmp_path / "data")
+    store = controller.store
+    store.discover([repo()])
+    store.execute("UPDATE repos SET enabled=1,config=?", (json.dumps({"run_bot_prs": True}),))
+    held = store.enqueue(REPO, bot(), {}, hold=BOT_HOLD)
+    controller.last_discovery = float("inf")
+    controller.publish = AsyncMock()
+
+    async def pages_while_operator_switches_bot_runs_off(path):
+        # The poll read run_bot_prs=True when it listed the repository.
+        store.execute("UPDATE repos SET config=?", (json.dumps({"run_bot_prs": False}),))
+        return [bot(), {**bot(head="c" * 40), "number": 9}]
+
+    controller.github.pages = pages_while_operator_switches_bot_runs_off
+    await controller.poll()
+    states = {r["pr"]: r["state"] for r in store.rows("SELECT pr,state FROM runs ORDER BY created")}
+    assert states == {4: "blocked", 9: "blocked"} and store.claim() is None
+    assert (
+        store.rows("SELECT COUNT(*) AS n FROM runs")[0]["n"] == 2 and run(store, held)["state"] == "blocked"
+    )
+    store.close()

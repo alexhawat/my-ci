@@ -51,13 +51,16 @@ def strip_controls(text: str) -> str:
     return _CONTROL.sub("", _ANSI.sub("", text))
 
 
+_URLSAFE = str.maketrans("+/", "-_")
+
+
 def _base64_forms(secret: bytes) -> set[str]:
     """Base64 of the secret on its own and embedded in a longer value.
 
     ``user:SECRET`` or ``SECRET\n`` encode the secret at a different byte offset
     and with different padding. Encoding it at each of the three alignments and
     keeping only the characters that depend on the secret alone gives a core that
-    appears in every such encoding.
+    appears in every such encoding. Both the standard and URL-safe alphabets.
     """
     forms = {base64.b64encode(secret).decode()}
     for offset in range(3):
@@ -65,7 +68,83 @@ def _base64_forms(secret: bytes) -> set[str]:
         start = -(-offset * 8 // 6)  # First character made only of secret bits.
         end = (offset + len(secret)) * 8 // 6  # Characters complete without later bytes.
         forms.add(encoded[start:end])
+    forms |= {form.translate(_URLSAFE) for form in forms}
     return {form for form in forms if len(form) >= MIN_SECRET_FRAGMENT}
+
+
+@functools.lru_cache(maxsize=16)
+def _base64_cores(secrets: tuple[str, ...]) -> tuple[str, ...]:
+    cores: set[str] = set()
+    for secret in secrets:
+        if secret.strip():
+            cores |= {form.rstrip("=") for form in _base64_forms(secret.encode())}
+    return tuple(core for core in cores if len(core) >= MIN_SECRET_FRAGMENT)
+
+
+_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_-"
+BASE64_WRAP_WIDTH = 60  # base64(1) and MIME wrap at 76 columns, PEM at 64.
+
+
+def _base64_tail(line: str) -> tuple[int, int] | None:
+    """Span of the base64 token (padding excluded) that ends ``line``, if any.
+
+    Plain string scans from the end: linear even for a very long line, which a
+    regular expression retried from every start position would not be.
+    """
+    end = len(line.rstrip(" \t\r").rstrip("="))
+    start = len(line[:end].rstrip(_BASE64_ALPHABET))
+    return (start, end) if end - start >= 4 else None
+
+
+def _redact_wrapped_base64(text: str, cores: tuple[str, ...]) -> str:
+    """Redact encoded secrets that a tool wrapped across consecutive output lines.
+
+    ``base64`` breaks long output into lines, so the encoded secret straddles a
+    newline and no single line contains it. Consecutive lines that end in a
+    base64 token are joined; wherever a secret's encoding appears in the joined
+    text, the tokens it touches are redacted. A line prefix (act's ``[job] | ``)
+    is kept.
+    """
+    if not cores or "\n" not in text:
+        return text
+    lines = text.split("\n")
+    run: list[tuple[int, int, int]] = []  # line index, token start, token end
+
+    def flush():
+        if len(run) > 1 and any(end - start >= BASE64_WRAP_WIDTH for _, start, end in run):
+            joined = "".join(lines[index][start:end] for index, start, end in run)
+            spans = []
+            for core in cores:
+                found = joined.find(core)
+                while found >= 0:
+                    spans.append((found, found + len(core)))
+                    found = joined.find(core, found + 1)
+            offset = 0
+            for index, start, end in run if spans else ():
+                after = offset + end - start
+                if any(first < after and last > offset for first, last in spans):
+                    line = lines[index]
+                    lines[index] = line[:start] + "[redacted]" + line[end:].lstrip("=")
+                offset = after
+        run.clear()
+
+    for index, line in enumerate(lines):
+        tail = _base64_tail(line)
+        if tail:
+            run.append((index, *tail))
+        else:
+            flush()
+    flush()
+    return "\n".join(lines)
+
+
+def _distinctive(fragment: str) -> bool:
+    """A short line that looks like a credential, not like ordinary text."""
+    return (
+        not any(c.isspace() for c in fragment)
+        and any(c.isdigit() for c in fragment)
+        and any(c.isalpha() for c in fragment)
+    )
 
 
 @functools.lru_cache(maxsize=16)
@@ -89,15 +168,22 @@ def _secret_forms(secrets: tuple[str, ...]) -> tuple[str, ...]:
             forms.add(normalised)
         for line in re.split(r"\r\n|\r|\n", secret):
             for fragment in (line.strip(), strip_controls(line).strip()):
-                if len(fragment) >= MIN_SECRET_LINE and not _PEM_ARMOR.fullmatch(fragment):
+                if _PEM_ARMOR.fullmatch(fragment):
+                    continue
+                # A password line printed on its own, but not "clusters:" or "name: a".
+                if len(fragment) >= MIN_SECRET_LINE or (
+                    len(fragment) >= MIN_SECRET_FRAGMENT and _distinctive(fragment)
+                ):
                     forms.add(fragment)
     forms.discard("")
     return tuple(sorted(forms, key=len, reverse=True))
 
 
 def redact(text: str, secrets: list[str]) -> str:
-    for form in _secret_forms(tuple(secrets)):
+    key = tuple(secrets)
+    for form in _secret_forms(key):
         text = text.replace(form, "[redacted]")
+    text = _redact_wrapped_base64(text, _base64_cores(key))
     return re.sub(r"(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "[redacted]", text)
 
 
@@ -112,10 +198,9 @@ def sanitize(text: str, secrets: list[str]) -> str:
 
 AGENT_FILES = {
     "agents.md",
-    "agent.md",
+    "agents.override.md",
     "claude.md",
     "claude.local.md",
-    "context.md",
     "gemini.md",
     ".cursorrules",
     ".windsurfrules",
@@ -125,8 +210,27 @@ AGENT_FILES = {
     ".mcp.json",
 }
 AGENT_PREFIXES = (".aider",)
-AGENT_DIRS = {".cursor", ".claude", ".opencode", ".mergecraft", ".agents", ".clinerules", ".windsurf"}
-GITHUB_AGENT_ENTRIES = {"copilot-instructions.md", "instructions", "prompts", "chatmodes"}
+# Generic names that are agent rule files at the top of a repository but ordinary
+# documentation deeper in the tree (docs/agent.md, docs/CONTEXT.md).
+ROOT_AGENT_FILES = {"agent.md", "context.md"}
+AGENT_DIRS = {
+    ".cursor",
+    ".claude",
+    ".opencode",
+    ".mergecraft",
+    ".agents",
+    ".clinerules",
+    ".windsurf",
+    ".gemini",
+    ".roo",
+    ".kiro",
+    ".junie",
+}
+# Entries that are agent configuration only inside a particular directory.
+SCOPED_AGENT_ENTRIES = {
+    ".github": {"copilot-instructions.md", "instructions", "prompts", "chatmodes", "agents"},
+    ".vscode": {"mcp.json"},
+}
 
 
 def nested_dns_arguments() -> list[str]:
@@ -140,7 +244,14 @@ def nested_dns_arguments() -> list[str]:
     """
     servers = [s.strip() for s in os.environ.get("LOCALCI_NESTED_DNS", "").split(",") if s.strip()]
     for server in servers:
-        ipaddress.ip_address(server)  # Fail the run clearly on a malformed setting.
+        try:
+            if "%" in server:  # dockerd rejects zoned addresses and would not start.
+                raise ValueError(server)
+            ipaddress.ip_address(server)
+        except ValueError:
+            raise RuntimeError(
+                f"LOCALCI_NESTED_DNS must be comma-separated IP addresses without a zone; got {server!r}"
+            ) from None
     return [f"--dns={server}" for server in servers]
 
 
@@ -162,7 +273,8 @@ def remove_agent_configuration(root: Path) -> list[str]:
                 lowered in AGENT_FILES
                 or lowered in AGENT_DIRS
                 or lowered.startswith(AGENT_PREFIXES)
-                or (parent.name.casefold() == ".github" and lowered in GITHUB_AGENT_ENTRIES)
+                or (parent == root and lowered in ROOT_AGENT_FILES)
+                or lowered in SCOPED_AGENT_ENTRIES.get(parent.name.casefold(), ())
             )
             target = parent / name
             if not match:
@@ -447,8 +559,19 @@ class Runner:
         await self._quiet_docker("rm", "-fv", name)
 
     async def remove_network(self, name: str):
-        """Remove a per-run network; one that is missing or still in use is left alone."""
-        await self._quiet_docker("network", "rm", name)
+        """Remove a per-run network, waiting briefly for its last container to detach.
+
+        Container removal can outlive its own time limit; a network left behind is
+        removed by the worker's sweep, but each one occupies a Docker address pool.
+        """
+        for delay in (0, 2, 5, 10):
+            await asyncio.sleep(delay)
+            await self._quiet_docker("network", "rm", name)
+            listing = await self._quiet_docker(
+                "network", "ls", "--filter", f"name={name}", "--format", "{{.Name}}"
+            )
+            if name not in listing.split():
+                return
 
     async def cleanup_networks(self):
         """Remove every leftover per-run network (for startup sweeps); in-use ones are kept."""
@@ -653,7 +776,7 @@ class Runner:
                 await asyncio.to_thread(self.step, "mergeCraft", "queued")
             # A user-defined bridge per run: concurrent runs cannot reach each other's
             # artifact server or job service ports over Docker's shared default bridge.
-            # Named after the worker container so cleanup(name) also removes it.
+            # Named after the worker container; removed only by _finalize (remove_network).
             await self.command("docker", "network", "rm", network, check=False, capture=True)
             await self.command(
                 "docker",
@@ -1102,7 +1225,11 @@ class Runner:
             await asyncio.to_thread(self.cancelled)
         except asyncio.CancelledError:
             # Graceful worker stop: the store may automatically re-queue this run.
-            final_state, message = "error", "Controller stopped during execution; retry this run"
+            # Re-queued by the next poll without using the retry budget (see RECOVERABLE).
+            final_state, message = (
+                "error",
+                "Execution worker stopped during this run; it is re-queued automatically",
+            )
             end_reason = "worker_interrupted"
         except Cancelled as exc:
             # Operator/superseded cancellation: the store recorded its reason at request time.

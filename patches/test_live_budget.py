@@ -143,6 +143,16 @@ async def main():
                 assert "meter failed" in str(exc)
             else:
                 raise AssertionError("Meter failure must stop the review")
+        # Nor a failure while rejecting invalid counters: the agent must still be stopped.
+        with bind(tracker()) as live, patch.object(live, "save", side_effect=OSError("fixture")):
+            try:
+                await asyncio.to_thread(
+                    stream, [part_step("bad", "bad", input=-1), part_step("later", "later", input=900)]
+                )
+            except BudgetExhausted:
+                assert live.steps == 0
+            else:
+                raise AssertionError("A failed rejection must stop the review")
         # Prove the real OS process is terminated and reaped, without a provider.
         child = await asyncio.to_thread(
             subprocess.Popen,
