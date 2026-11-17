@@ -69,3 +69,32 @@ def test_failed_write_leaves_no_archive(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="fixture write failure"):
         backup.create_backup(root)
     assert os.listdir(root / "backups") == []
+
+
+def test_same_second_backup_is_refused_without_replacing_the_first(tmp_path, monkeypatch):
+    root = data_root(tmp_path)
+
+    class Frozen(backup.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2030, 1, 2, 3, 4, 5, tzinfo=tz)
+
+    monkeypatch.setattr(backup, "datetime", Frozen)
+    first = backup.create_backup(root)
+    original = first.read_bytes()
+    with pytest.raises(RuntimeError, match="already exists"):
+        backup.create_backup(root)
+    assert first.read_bytes() == original
+    assert not list((root / "backups").glob(".*.partial"))
+
+
+def test_stale_partial_holding_the_key_is_removed_but_a_recent_one_is_left(tmp_path):
+    root = data_root(tmp_path)
+    backups = root / "backups"
+    backups.mkdir(mode=0o700)
+    stale, recent = backups / ".old.tar.gz.partial", backups / ".new.tar.gz.partial"
+    for path in (stale, recent):
+        path.write_bytes(b"partial")
+    os.utime(stale, (1, 1))
+    backup.create_backup(root)
+    assert not stale.exists() and recent.exists()  # A recent one may be a concurrent backup.

@@ -37,8 +37,14 @@ def apply(root):
     replace(
         "agents/opencode.py",
         "        base_handler(acc, event)\n",
-        """        if live_budget is not None and (live_budget.error or not live_budget.accept(event)):
-            return
+        """        if live_budget is not None:
+            if live_budget.error:
+                return
+            if not live_budget.accept(event):
+                # A rejected event (invalid counters) stops the agent like a failed charge.
+                if live_budget.error:
+                    kill_process_group(getattr(process, "pid", None))
+                return
         before = acc.to_usage()
         previous = (before.input_tokens + before.output_tokens, before.cost_usd or 0) if before else (0, 0)
         base_handler(acc, event)

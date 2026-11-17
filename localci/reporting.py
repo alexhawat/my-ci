@@ -55,9 +55,9 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
     if (review and review["state"] in TERMINAL) or final:
         if review and review["state"] == "skipped":
             result["review"] = {"state": "skipped", "checks": [review], "findings": [], "diagnostics": []}
-        elif config.get("review") and not review:
-            # The run ended (blocked checkout, merge conflict, setup error...) before
-            # the review step was ever registered: not run, which is not a skip.
+        elif config.get("review") and (not review or review.get("never_started")):
+            # The run ended (blocked checkout, merge conflict, setup error, cancel...)
+            # before the review began: not run, which is neither a skip nor a review error.
             result["review"] = {
                 "state": "not run",
                 "checks": [],

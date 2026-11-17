@@ -3,6 +3,7 @@ import base64
 import contextlib
 import functools
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -35,9 +36,13 @@ class Cancelled(RuntimeError):
 
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-# Fragments derived from a secret (its stripped form, individual lines) are redacted
-# only when reasonably long, so short pieces cannot wreck unrelated log text.
+# Fragments derived from a secret (its stripped form, individual lines, base64 windows)
+# are redacted only when reasonably long, so short pieces cannot wreck unrelated log text.
 MIN_SECRET_FRAGMENT = 8
+# Single lines of a multi-line secret (a kubeconfig, a JSON key file) are often ordinary
+# text such as "clusters:"; only lines long enough to be distinctive become patterns.
+MIN_SECRET_LINE = 12
+_PEM_ARMOR = re.compile(r"-----(?:BEGIN|END) [A-Z0-9 ]+-----")
 OUTPUT_LINE_LIMIT = 100_000
 OVERSIZED_LINE = "[oversized output line omitted]\n"
 
@@ -46,24 +51,46 @@ def strip_controls(text: str) -> str:
     return _CONTROL.sub("", _ANSI.sub("", text))
 
 
+def _base64_forms(secret: bytes) -> set[str]:
+    """Base64 of the secret on its own and embedded in a longer value.
+
+    ``user:SECRET`` or ``SECRET\n`` encode the secret at a different byte offset
+    and with different padding. Encoding it at each of the three alignments and
+    keeping only the characters that depend on the secret alone gives a core that
+    appears in every such encoding.
+    """
+    forms = {base64.b64encode(secret).decode()}
+    for offset in range(3):
+        encoded = base64.b64encode(b"\0" * offset + secret).decode()
+        start = -(-offset * 8 // 6)  # First character made only of secret bits.
+        end = (offset + len(secret)) * 8 // 6  # Characters complete without later bytes.
+        forms.add(encoded[start:end])
+    return {form for form in forms if len(form) >= MIN_SECRET_FRAGMENT}
+
+
 @functools.lru_cache(maxsize=16)
 def _secret_forms(secrets: tuple[str, ...]) -> tuple[str, ...]:
     forms: set[str] = set()
-    for secret in filter(None, secrets):
-        # Encodings are never shorter than the value itself.
+    for secret in secrets:
+        if not secret.strip():
+            continue  # A blank value would replace every space or newline in the log.
+        forms |= _base64_forms(secret.encode())
+        # These encodings are never shorter than the value itself.
         forms |= {
             secret,
-            base64.b64encode(secret.encode()).decode(),
             json.dumps(secret)[1:-1],
             json.dumps(secret, ensure_ascii=False)[1:-1],
             urllib.parse.quote(secret, safe=""),
         }
         # Logs are line-oriented and stripped of control characters: also cover
         # the normalised value and each line of a multi-line secret.
-        fragments = {strip_controls(secret)}
+        normalised = strip_controls(secret)
+        if len(normalised) >= MIN_SECRET_FRAGMENT:
+            forms.add(normalised)
         for line in re.split(r"\r\n|\r|\n", secret):
-            fragments |= {line, strip_controls(line)}
-        forms |= {f for f in fragments if len(f) >= MIN_SECRET_FRAGMENT}
+            for fragment in (line.strip(), strip_controls(line).strip()):
+                if len(fragment) >= MIN_SECRET_LINE and not _PEM_ARMOR.fullmatch(fragment):
+                    forms.add(fragment)
     forms.discard("")
     return tuple(sorted(forms, key=len, reverse=True))
 
@@ -85,16 +112,36 @@ def sanitize(text: str, secrets: list[str]) -> str:
 
 AGENT_FILES = {
     "agents.md",
+    "agent.md",
     "claude.md",
     "claude.local.md",
+    "context.md",
     "gemini.md",
     ".cursorrules",
+    ".windsurfrules",
+    ".clinerules",
     "opencode.json",
     "opencode.jsonc",
     ".mcp.json",
 }
-AGENT_DIRS = {".cursor", ".claude", ".opencode", ".mergecraft"}
-GITHUB_AGENT_ENTRIES = {"copilot-instructions.md", "instructions"}
+AGENT_PREFIXES = (".aider",)
+AGENT_DIRS = {".cursor", ".claude", ".opencode", ".mergecraft", ".agents", ".clinerules", ".windsurf"}
+GITHUB_AGENT_ENTRIES = {"copilot-instructions.md", "instructions", "prompts", "chatmodes"}
+
+
+def nested_dns_arguments() -> list[str]:
+    """dockerd ``--dns`` options for the nested daemon, from LOCALCI_NESTED_DNS.
+
+    On its per-run network the worker resolves through Docker's embedded DNS at a
+    loopback address, which containers on the nested daemon's own bridge cannot
+    reach; that daemon then falls back to public resolvers. Hosts that need
+    internal names inside ``docker build``/``docker run`` steps list their
+    resolvers here (comma-separated IP addresses).
+    """
+    servers = [s.strip() for s in os.environ.get("LOCALCI_NESTED_DNS", "").split(",") if s.strip()]
+    for server in servers:
+        ipaddress.ip_address(server)  # Fail the run clearly on a malformed setting.
+    return [f"--dns={server}" for server in servers]
 
 
 def remove_agent_configuration(root: Path) -> list[str]:
@@ -114,6 +161,7 @@ def remove_agent_configuration(root: Path) -> list[str]:
             match = (
                 lowered in AGENT_FILES
                 or lowered in AGENT_DIRS
+                or lowered.startswith(AGENT_PREFIXES)
                 or (parent.name.casefold() == ".github" and lowered in GITHUB_AGENT_ENTRIES)
             )
             target = parent / name
@@ -393,13 +441,13 @@ class Runner:
         return output.decode(errors="replace")
 
     async def cleanup(self, name: str):
-        """Remove a run container and the run network of the same name (idempotent).
-
-        The per-run network is named after the run's CI worker container, so the
-        controller's startup sweep of labelled containers also removes leftover
-        networks. Removing a network that is missing or still in use is a no-op.
-        """
+        """Remove a run container (idempotent). Never the run network: both lanes of a
+        run share it, and a lane that finishes first must not remove it before the
+        other lane's container attaches."""
         await self._quiet_docker("rm", "-fv", name)
+
+    async def remove_network(self, name: str):
+        """Remove a per-run network; one that is missing or still in use is left alone."""
         await self._quiet_docker("network", "rm", name)
 
     async def cleanup_networks(self):
@@ -568,7 +616,7 @@ class Runner:
             )
             # Values referenced by each workflow; written and copied into the worker only
             # for the duration of that workflow's act invocation (see ci_phase), never
-            # via argv/logs. The GitHub token is included only where referenced.
+            # via argv/logs. With host GitHub login enabled, every workflow also gets the token.
             # Privileged CI remains host-root-equivalent and jobs of the SAME workflow
             # share its secrets and worker: this is least exposure, not a sandbox boundary.
             workflow_values = {
@@ -658,6 +706,7 @@ class Runner:
                         "DOCKER_TLS_CERTDIR=",
                         os.environ.get("LOCALCI_WORKER_IMAGE", "localci-worker:1"),
                         "--host=unix:///var/run/docker.sock",
+                        *nested_dns_arguments(),
                     )
                     for _ in range(60):
                         code, _ = await self.command(
@@ -1098,9 +1147,11 @@ class Runner:
                 await asyncio.gather(metrics, return_exceptions=True)
 
         await attempt(asyncio.to_thread, self.log, f"\n{state.upper()}: {message}\n")
-        # Review container first: the run network is removable once both are gone.
         for container in containers:
             await attempt(self.cleanup, container)
+        # Only here, once both lanes' containers are gone: the network is named after
+        # the CI worker container, the last entry.
+        await attempt(self.remove_network, containers[-1])
         await attempt(stop_metrics)
         await complete(shutil.rmtree, work, ignore_errors=True)
         try:

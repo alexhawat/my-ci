@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 from localci.controller import Controller
 from localci.dashboard import enrich_run, register_dashboard
 from localci.github import app_jwt
-from localci.policy import eligible, is_pr_workflow, workflow
+from localci.policy import bot_pr, eligible, is_pr_workflow, workflow
 from localci.store import RetryLimitReached
 
 ROOT = Path(os.environ.get("LOCALCI_DATA", "/data"))
@@ -339,6 +339,18 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
         pr = await controller.github.request("GET", f"repos/{run['repo']}/pulls/{run['pr']}")
         if not eligible(pr, run["repo"]):
             raise HTTPException(400, "Only open, non-draft, same-repository PRs can run")
+        config = json.loads(repo["config"])
+        # Starting a held bot PR is the operator's approval of one exact revision. A retry
+        # runs the PR's current head, so refuse when that is not the revision of this run.
+        if (
+            bot_pr(pr)
+            and not config.get("run_bot_prs")
+            and (pr["head"]["sha"], pr["base"]["sha"]) != (run["head"], run["base"])
+        ):
+            raise HTTPException(
+                409,
+                "This bot-authored PR changed after this run; review the new revision and retry its own run",
+            )
         try:
             new_id = await asyncio.to_thread(
                 controller.store.enqueue, run["repo"], pr, json.loads(repo["config"]), retry=True

@@ -8,7 +8,10 @@ RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go
     && rm /tmp/go.tar.gz
 ENV PATH=/usr/local/go/bin:${PATH}
 # Chrome comes from Google's apt repository: apt verifies its signature with only the
-# key whose primary fingerprint is pinned here. Set CHROME_VERSION to pin a version.
+# key whose primary fingerprint is pinned here. Set CHROME_VERSION to pin a version
+# (it builds only while Google's repository still serves that version). After install
+# the step waits briefly because the package's post-install can still be adding its
+# own apt source and key, which are then removed.
 ARG CHROME_KEY_FINGERPRINT=EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796
 ARG CHROME_VERSION=
 RUN set -eux; \
@@ -40,9 +43,9 @@ RUN set -eux; \
     if [ -n "${CHROME_VERSION}" ]; then chrome="google-chrome-stable=${CHROME_VERSION}"; fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends "$chrome" xvfb xauth; \
+    wait 2>/dev/null || true; sleep 2; \
     drop_other_chrome_sources; \
     rm -f /etc/apt/trusted.gpg.d/google-chrome.gpg; \
-    apt-get update; \
     rm -rf /var/lib/apt/lists/*; \
     google-chrome --version
 RUN useradd -m -u 1001 -s /bin/bash runner \

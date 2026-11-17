@@ -1,9 +1,11 @@
 """Create a consistent private backup of settings, queue, and encrypted credentials."""
 
+import contextlib
 import os
 import sys
 import tarfile
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,26 +22,34 @@ def create_backup(root: Path) -> Path:
         raise RuntimeError(f"Encryption key {key} is missing; no backup was created")
     destination = root / "backups"
     destination.mkdir(mode=0o700, exist_ok=True)
+    # An interrupted earlier backup leaves a partial file holding the key; an hour is far
+    # longer than any backup takes, so older ones are not a concurrent run's work.
+    for stale in destination.glob(".*.partial"):
+        with contextlib.suppress(OSError):
+            if time.time() - stale.lstat().st_mtime > 3600:
+                stale.unlink()
     path = destination / f"localci-{datetime.now(UTC):%Y%m%dT%H%M%SZ}.tar.gz"
-    if path.exists():
-        raise RuntimeError(f"{path} already exists; no backup was created")
-    partial = destination / f".{path.name}.partial"
     with tempfile.TemporaryDirectory() as tmp:
         snapshot = Path(tmp) / "localci.db"
         Store(database).backup(snapshot)
-        fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # A unique 0600 temporary name: concurrent backups never share a partial file.
+        fd, name = tempfile.mkstemp(dir=destination, prefix=f".{path.name}.", suffix=".partial")
+        partial = Path(name)
         try:
             with os.fdopen(fd, "wb") as file:
-                with tarfile.open(fileobj=file, mode="w:gz") as archive:
+                with tarfile.open(fileobj=file, mode="w:gz", dereference=True) as archive:
                     archive.add(snapshot, arcname="localci.db")
                     archive.add(key, arcname="encryption.key")
                 file.flush()
                 os.fsync(file.fileno())
-            # Only a complete archive ever appears under its final name.
-            os.replace(partial, path)
-        except BaseException:
+            # Only a complete archive ever appears under its final name, and linking,
+            # unlike renaming, never replaces an archive that is already there.
+            try:
+                os.link(partial, path)
+            except FileExistsError:
+                raise RuntimeError(f"{path} already exists; no backup was created") from None
+        finally:
             partial.unlink(missing_ok=True)
-            raise
     directory = os.open(destination, os.O_RDONLY)
     try:
         os.fsync(directory)
@@ -51,7 +61,7 @@ def create_backup(root: Path) -> Path:
 def main() -> int:
     try:
         path = create_backup(Path(os.environ.get("LOCALCI_DATA", "/data")))
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         print(exc, file=sys.stderr)
         return 1
     print(path)

@@ -126,7 +126,7 @@ async def main():
             assert live.steps == 1 and live.error is None and live.totals["input"] == 12
             assert budget.tokens_used == 15
         # Negative, fractional and non-numeric counters still stop the review.
-        for invalid in (-1, 1.5, "7", True):
+        for invalid in (-1, 1.5, "7", True, float("nan"), float("inf"), -float("inf")):
             with bind(tracker()) as live:
                 try:
                     await asyncio.to_thread(stream, [part_step("bad", "bad", input=invalid)])

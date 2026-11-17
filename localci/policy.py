@@ -59,6 +59,26 @@ def _strings(document):
             yield from _strings(value)
 
 
+def _expressions(document, conditional: bool = False):
+    """Text GitHub Actions evaluates as an expression: the inside of every ``${{ }}``,
+    plus whole ``if:`` values, which are expressions without the braces.
+
+    Shell and program text in ``run:`` is not an expression; ``app.secrets['x']``
+    in a script is the program's own variable, not a workflow secret.
+    """
+    if isinstance(document, str):
+        yield from _EXPRESSION.findall(document)
+        if conditional and "${{" not in document:
+            yield document
+    elif isinstance(document, dict):
+        for key, value in document.items():
+            yield from _expressions(key)
+            yield from _expressions(value, conditional=key == "if")
+    elif isinstance(document, (list, tuple)):
+        for value in document:
+            yield from _expressions(value)
+
+
 def secret_references(document) -> tuple[set[str], bool]:
     """Secret names a workflow fragment references, and whether any access is dynamic.
 
@@ -68,12 +88,10 @@ def secret_references(document) -> tuple[set[str], bool]:
     """
     names: set[str] = set()
     dynamic = False
-    for text in _strings(document):
-        names.update(_SECRET_NAME.findall(text))
-        names.update(a or b for a, b in _SECRET_INDEX.findall(text))
-        if _SECRET_DYNAMIC.search(text) or any(
-            _BARE_SECRETS.search(expression) for expression in _EXPRESSION.findall(text)
-        ):
+    for expression in _expressions(document):
+        names.update(_SECRET_NAME.findall(expression))
+        names.update(a or b for a, b in _SECRET_INDEX.findall(expression))
+        if _SECRET_DYNAMIC.search(expression) or _BARE_SECRETS.search(expression):
             dynamic = True
     return names, dynamic
 
@@ -84,7 +102,7 @@ def github_token_referenced(document) -> bool:
     return (
         dynamic
         or bool({n.upper() for n in names} & {"GITHUB_TOKEN", "GH_TOKEN"})
-        or any(_GITHUB_TOKEN.search(text) for text in _strings(document))
+        or any(_GITHUB_TOKEN.search(expression) for expression in _expressions(document))
     )
 
 

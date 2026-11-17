@@ -34,6 +34,7 @@ services:
       LOCALCI_URL: ${LOCALCI_URL:-http://localhost:8787}
       LOCALCI_HOST_LABEL: ${LOCALCI_HOST_LABEL:-local worker}
       LOCALCI_REVIEW_IMAGE: localci-review:1
+      LOCALCI_NESTED_DNS: ${LOCALCI_NESTED_DNS:-}
     volumes:
       - localci-data:/data
       - /var/run/docker.sock:/var/run/docker.sock

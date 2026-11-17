@@ -133,7 +133,14 @@ class Controller:
                             # Bot PRs run privileged CI only after an operator starts them.
                             hold = BOT_HOLD if bot_pr(pr) and not config.get("run_bot_prs") else None
                             await asyncio.to_thread(
-                                partial(self.store.enqueue, repo["name"], pr, config, hold=hold)
+                                partial(
+                                    self.store.enqueue,
+                                    repo["name"],
+                                    pr,
+                                    config,
+                                    hold=hold,
+                                    require_enabled=True,
+                                )
                             )
                     await asyncio.to_thread(
                         self.store.execute, "UPDATE repos SET error='' WHERE name=?", (repo["name"],)
@@ -295,6 +302,8 @@ class Controller:
                         task.result()
                     except Exception as exc:
                         self.run_error = f"Run finalization failed: {exc}"
+                    else:
+                        self.run_error = ""  # A later clean run shows the worker has recovered.
                     del active[task]
                 settings = await asyncio.to_thread(self.store.settings, self.capacity)
                 unfit = False

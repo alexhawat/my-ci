@@ -95,6 +95,21 @@ class Store:
                 db.execute("ALTER TABLE runs ADD COLUMN end_reason TEXT NOT NULL DEFAULT ''")
             if "recoveries" not in {r[1] for r in db.execute("PRAGMA table_info(revision_attempts)")}:
                 db.execute("ALTER TABLE revision_attempts ADD COLUMN recoveries INTEGER NOT NULL DEFAULT 0")
+            if version == 3:
+                # The previous release re-ran these system-ended runs by matching their
+                # message; keep them recoverable now that the reason is a column.
+                for message, reason in (
+                    ("PR changed, closed, or became a draft", "pr_inactive"),
+                    ("Repository disabled", "repo_disabled"),
+                ):
+                    db.execute(
+                        "UPDATE runs SET end_reason=? WHERE state='cancelled' AND message=? AND end_reason=''",
+                        (reason, message),
+                    )
+                db.execute(
+                    "UPDATE runs SET end_reason='worker_interrupted' WHERE state IN ('error','failure') "
+                    "AND end_reason='' AND message LIKE '%Execution worker restarted; retry this run%'"
+                )
             if version in (1, 2):
                 # One-time backfill for databases that predate the budget table. Running it on
                 # every start would bill unbilled automatic recoveries against the retry budget.
@@ -186,7 +201,14 @@ class Store:
         return rows[0]
 
     def enqueue(
-        self, repo: str, pr: dict, config: dict, *, retry: bool = False, hold: str | None = None
+        self,
+        repo: str,
+        pr: dict,
+        config: dict,
+        *,
+        retry: bool = False,
+        hold: str | None = None,
+        require_enabled: bool = False,
     ) -> str | None:
         """Queue a run for the PR's current head/base revision.
 
@@ -195,6 +217,7 @@ class Store:
         charging the retry budget, at most MAX_RECOVERIES times. ``retry`` is the
         operator path and is charged against the budget. ``hold`` records the first
         run as blocked with that message instead of queueing it (operator approval gate).
+        ``require_enabled`` makes the repository's enabled flag part of the transaction.
         """
         head, base = pr["head"]["sha"], pr["base"]["sha"]
         key = (repo, pr["number"], head, base)
@@ -207,6 +230,12 @@ class Store:
             ).fetchone()
             if previous and previous["state"] in ACTIVE:
                 return None
+            # Checked inside the transaction: a poll that listed the repository before it
+            # was disabled must not re-queue the run that disabling just cancelled.
+            if require_enabled:
+                watched = db.execute("SELECT enabled FROM repos WHERE name=?", (repo,)).fetchone()
+                if not watched or not watched["enabled"]:
+                    return None
             budget = db.execute(
                 "SELECT attempts,recoveries FROM revision_attempts WHERE repo=? AND pr=? AND head=? AND base=?",
                 key,
@@ -220,7 +249,11 @@ class Store:
             )
             # ``attempts`` outlives pruned run rows, so a completed revision is never re-run
             # automatically just because its history aged out.
-            if (previous or attempts) and not retry and not recovery:
+            # A held bot PR starts on its own once the repository opts into automatic bot runs.
+            release = bool(
+                not retry and hold is None and previous and previous["end_reason"] == "awaiting_approval"
+            )
+            if (previous or attempts) and not retry and not recovery and not release:
                 return None
             hold = None if previous or retry else hold
             if retry:
@@ -272,13 +305,19 @@ class Store:
     def request_cancel(self, rid: str, reason: str, message: str) -> None:
         """Ask an active run to stop and remember why. A queued run is finalized here;
         a running one is finalized by its worker, which keeps the recorded reason."""
-        self.execute(
-            "UPDATE runs SET cancel=1,end_reason=? WHERE id=? AND state IN ('queued','running')",
-            (reason, rid),
-        )
-        # Claim skips cancel=1 rows, so a run still queued here can no longer start;
-        # expected_state leaves one that was claimed just before to its worker.
-        self.finish(rid, "cancelled", message, expected_state="queued")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # An operator's cancel is final: a later system cancel of the same still-running
+            # run (repository disabled, PR drafted) must not make it recoverable again.
+            db.execute(
+                "UPDATE runs SET cancel=1,"
+                "end_reason=CASE WHEN end_reason='operator' THEN 'operator' ELSE ? END "
+                "WHERE id=? AND state IN ('queued','running')",
+                (reason, rid),
+            )
+            # Same transaction, so a crash cannot leave a queued row that nothing claims
+            # or finalizes. A run a worker already claimed is left for that worker to end.
+            self._finish(db, rid, "cancelled", message, expected_state="queued")
 
     def claim(self, execution: dict | None = None) -> dict | None:
         with self.connect() as db:
@@ -318,37 +357,44 @@ class Store:
         None keeps a reason already stored with a cancellation request."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT steps,state,end_reason FROM runs WHERE id=?", (rid,)).fetchone()
-            if (
-                not row
-                or row["state"] not in ACTIVE
-                or (expected_state is not None and row["state"] != expected_state)
-            ):
-                return
-            steps = json.loads(row["steps"])
-            now = time.time()
-            for step in steps:
-                if step["state"] in ("queued", "running"):
-                    step.update(state=state, message=message, finished=now)
-            state, message = aggregate(steps, state, message)
-            requested = row["end_reason"]
-            if requested == "operator" and (state == "cancelled" or reason):
-                end_reason = "operator"  # A worker stop must not resurrect an operator's cancel.
-            elif reason is not None:
-                end_reason = reason
-            else:
-                # A requested cancel only explains a run that actually ended cancelled;
-                # one that completed first keeps its real outcome and is not re-queued.
-                end_reason = requested if state == "cancelled" else ""
-            db.execute(
-                "UPDATE runs SET state=?,message=?,steps=?,finished=?,published=0,end_reason=? WHERE id=?",
-                (state, message, json.dumps(steps), now, end_reason, rid),
-            )
-            db.execute(
-                """UPDATE run_usage SET state=?,duration_seconds=COALESCE(
-                (SELECT MAX(0,finished-started) FROM runs WHERE id=?),0) WHERE run_id=?""",
-                (state, rid, rid),
-            )
+            self._finish(db, rid, state, message, expected_state=expected_state, reason=reason)
+
+    @staticmethod
+    def _finish(db, rid, state, message, *, expected_state=None, reason=None):
+        row = db.execute("SELECT steps,state,end_reason FROM runs WHERE id=?", (rid,)).fetchone()
+        if (
+            not row
+            or row["state"] not in ACTIVE
+            or (expected_state is not None and row["state"] != expected_state)
+        ):
+            return
+        steps = json.loads(row["steps"])
+        now = time.time()
+        for step in steps:
+            if step["state"] in ("queued", "running"):
+                # Reports distinguish a check that was cut short from one that never began.
+                if step["state"] == "queued":
+                    step["never_started"] = True
+                step.update(state=state, message=message, finished=now)
+        state, message = aggregate(steps, state, message)
+        requested = row["end_reason"]
+        if requested == "operator" and (state == "cancelled" or reason):
+            end_reason = "operator"  # A worker stop must not resurrect an operator's cancel.
+        elif reason is not None:
+            end_reason = reason
+        else:
+            # A requested cancel only explains a run that actually ended cancelled;
+            # one that completed first keeps its real outcome and is not re-queued.
+            end_reason = requested if state == "cancelled" else ""
+        db.execute(
+            "UPDATE runs SET state=?,message=?,steps=?,finished=?,published=0,end_reason=? WHERE id=?",
+            (state, message, json.dumps(steps), now, end_reason, rid),
+        )
+        db.execute(
+            """UPDATE run_usage SET state=?,duration_seconds=COALESCE(
+            (SELECT MAX(0,finished-started) FROM runs WHERE id=?),0) WHERE run_id=?""",
+            (state, rid, rid),
+        )
 
     def reconcile_results(self):
         # Derived result repair; individual historical check outcomes remain intact.

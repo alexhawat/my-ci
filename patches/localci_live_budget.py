@@ -33,10 +33,30 @@ class LiveBudget:
         self.totals = dict(input=0, output=0, reasoning=0, cache_read=0, cache_write=0)
         self.error = None
 
+    @staticmethod
+    def _fields(tokens):
+        cache = tokens.get("cache") or {}
+        cache = cache if isinstance(cache, dict) else {"read": cache}
+        fields = {k: _counter(tokens.get(k)) for k in ("input", "output", "reasoning")}
+        fields.update(cache_read=_counter(cache.get("read")), cache_write=_counter(cache.get("write")))
+        return fields
+
+    def _reject_counters(self):
+        self.error = BudgetExhausted("token", "Invalid provider token counters; review stopped")
+        self.tracker.last_exhausted = self.error
+        self.save()
+
     def accept(self, value):
         if value.get("type") != "step_finish":
             return True
         part = value.get("part") or {}
+        # Validate before the upstream handler sees the event: it converts counters
+        # itself and its failure (NaN, infinity) would be swallowed, leaving the
+        # step unmetered. A rejected event sets the error and is not processed.
+        tokens = part.get("tokens")
+        if isinstance(tokens, dict) and any(v is None for v in self._fields(tokens).values()):
+            self._reject_counters()
+            return False
         # One assistant message can contain several step_finish parts, each
         # billed separately, so the part ID identifies a step. Replayed events
         # keep their part ID; message identity is only a fallback without one.
@@ -59,14 +79,9 @@ class LiveBudget:
             (value.get("part") or {}).get("tokens"), dict
         ):
             return
-        tokens = value["part"]["tokens"]
-        cache = tokens.get("cache") or {}
-        fields = {k: _counter(tokens.get(k)) for k in ("input", "output", "reasoning")}
-        fields.update(cache_read=_counter(cache.get("read")), cache_write=_counter(cache.get("write")))
+        fields = self._fields(value["part"]["tokens"])
         if any(v is None for v in fields.values()):
-            self.error = BudgetExhausted("token", "Invalid provider token counters; review stopped")
-            self.tracker.last_exhausted = self.error
-            self.save()
+            self._reject_counters()
             return
         self.steps += 1
         for key, number in fields.items():

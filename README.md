@@ -20,11 +20,11 @@ This is not universal GitHub Actions compatibility. Windows and macOS jobs, reus
 
 ## Architecture
 
-The FastAPI dashboard and execution worker share a versioned SQLite database and durable queue. Each run receives fresh outer containers on its own Docker bridge network, so concurrent runs cannot reach each other over the network. CI jobs use a disposable inner Docker daemon; optional review runs in a separate container with separate credentials and artifact namespaces.
+The FastAPI dashboard and execution worker share a versioned SQLite database and durable queue. Each run receives fresh outer containers on its own Docker bridge network, so concurrent runs cannot reach each other over the network; the CI worker and review container of the same run share that network. CI jobs use a disposable inner Docker daemon; optional review runs in a separate container with separate credentials and artifact namespaces.
 
 The dashboard has no Docker socket, but the execution worker has host Docker access and starts `--privileged` Docker-in-Docker workers. Per-run networks do not change this: **PR code is effectively root on the host.** It can access the host data volume and every stored credential, regardless of which values a job references. Enable only repositories and contributors you would trust with host-root access.
 
-Bot-authored PRs (GitHub user type `Bot` or a login ending in `[bot]`, such as Dependabot) do not run automatically. Local CI records a blocked run, "awaiting operator approval"; after reviewing the change, start it from the dashboard with **Retry** or **Run selected as new runs**. The per-repository setting `run_bot_prs` (off by default) restores automatic runs for that repository.
+Bot-authored PRs (GitHub user type `Bot` or a login ending in `[bot]`, such as Dependabot) do not run automatically. Local CI records a blocked run, "awaiting operator approval"; after reviewing the change, start it from the dashboard with **Retry latest PR** or **Run selected as new runs**. The approval applies to the exact revision of that held run: if the bot has pushed since, the retry is refused and the new revision's own held run must be reviewed and started. An approval counts as one attempt in the retry budget. The per-repository setting `run_bot_prs` (off by default) restores automatic runs for that repository and starts PRs that are currently held.
 
 ## Prerequisites
 
@@ -69,7 +69,8 @@ Open the configured dashboard URL, select **Repositories → Configure**, choose
 - `LOCALCI_URL`: exact external dashboard origin, without a trailing slash.
 - `LOCALCI_HOST_LABEL`: generic display name for the worker.
 - `LOCALCI_TAILSCALE_LOGIN`: exact identity allowed by the dashboard.
-These three are read from `.env`. The following are internal container paths and image names fixed by `compose.yaml`; they matter only when running the services outside Compose:
+- `LOCALCI_NESTED_DNS` (optional): comma-separated DNS server IP addresses for containers that CI jobs start with Docker (`docker build`, `docker run`, service containers). Each run's worker sits on its own Docker network, where the nested Docker daemon cannot use the host's resolver and falls back to public DNS. Set this if those containers must resolve internal names or cannot reach public DNS; job steps themselves are not affected.
+These are read from `.env`. The following are internal container paths and image names. `compose.yaml` sets only `LOCALCI_REVIEW_IMAGE`; the others use the defaults built into the code, so they matter only when running the services outside Compose:
 
 - `LOCALCI_DATA`: data directory, default `/data`.
 - `LOCALCI_TOKEN_FILE`: GitHub token file, default `/run/secrets/github-token`.
@@ -87,7 +88,7 @@ The dashboard separates two credential scopes:
 - **CI workflows** supply `secrets.NAME` to workflows that reference it.
 - **Review only** supplies model-provider settings to mergeCraft.
 
-Values are encrypted, write-only, and never imported automatically from GitHub Actions. Each workflow's secrets file contains only the secrets that workflow references (plus the host GitHub token for every selected workflow when host GitHub login is enabled) and is present in the worker only while that workflow runs. This limits exposure; it is not a sandbox boundary. Jobs of the same workflow share those secrets, and host-root-equivalent PR code can still reach every stored credential. Use narrow test credentials.
+Values are encrypted, write-only, and never imported automatically from GitHub Actions. Each workflow's secrets file contains only the secrets that workflow references (plus the host GitHub token for every selected workflow when host GitHub login is enabled) and is present in the worker only while that workflow runs. A workflow that reads secrets dynamically (`toJSON(secrets)`, `secrets.*`, or `secrets[<expression>]`) receives every CI secret. This limits exposure; it is not a sandbox boundary. Jobs of the same workflow share those secrets, and host-root-equivalent PR code can still reach every stored credential. Use narrow test credentials.
 
 The optional host GitHub login grants CI jobs all permissions of that login; workflow YAML `permissions` does not narrow it under `act`. Leaving it disabled keeps the token out of CI jobs, but once `login.sh` has run the token file exists on the host, where PR code can read it regardless of the setting. Use a dedicated low-privilege GitHub account and token.
 
@@ -99,7 +100,7 @@ Repository settings control per-workflow job parallelism and time limits; select
 
 Failed runs are not retried automatically, and manual retries share the configured per-revision budget. An operator's **Cancel** is final for that PR revision until the operator retries it. Runs cancelled by the system are re-queued automatically without consuming the retry budget, at most 3 times per PR revision: the PR became a draft or was closed and later returns, the repository was disabled and re-enabled, or the execution worker stopped, restarted, or crashed mid-run.
 
-A workflow in which no job ran is reported as skipped and named in the run summary rather than counted as passed.
+A workflow in which no job ran is reported as skipped and named in the run summary rather than counted as passed. If no selected workflow ran any job and no review ran, the run ends blocked with "No checks executed".
 
 ### Workflow overrides
 
@@ -107,7 +108,7 @@ A workflow in which no job ran is reported as skipped and named in the run summa
 
 ### Images
 
-Base images are pinned by digest. The job image installs Chrome from Google's signed apt repository, authenticated by a pinned signing-key fingerprint; the Chrome version is not pinned by default (set the `CHROME_VERSION` build argument to pin one). Alpine packages in the Docker-in-Docker worker image are not version-pinned. Runner images for the `ubuntu-22.04` and `ubuntu-20.04` labels are pulled by tag at run time; `ubuntu-latest` and `ubuntu-24.04` use the locally built job image.
+Base images are pinned by digest. The job image installs Chrome from Google's signed apt repository, authenticated by a pinned signing-key fingerprint; the Chrome version is not pinned by default (set the `CHROME_VERSION` build argument to pin one; such a pin builds only while Google's repository still serves that version). Alpine packages in the Docker-in-Docker worker image are not version-pinned. Runner images for the `ubuntu-22.04` and `ubuntu-20.04` labels are pulled by tag at run time; `ubuntu-latest` and `ubuntu-24.04` use the locally built job image.
 
 ## Review behavior
 

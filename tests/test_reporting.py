@@ -449,6 +449,25 @@ def test_review_that_never_started_is_reported_as_not_run(tmp_path, workflows):
     assert "skipped" not in body and "No readable primary" not in body
 
 
+def test_review_queued_but_never_started_is_reported_as_not_run(tmp_path):
+    message = "docker exited 1; could not create the run network"
+    store, run = finished_run(
+        tmp_path,
+        {"workflows": [".github/workflows/ci.yml"], "review": True},
+        [
+            {"name": "Checkout", "state": "success", "message": "merged"},
+            {"name": "ci.yml", "state": "queued", "message": ""},
+            {"name": "mergeCraft", "state": "queued", "message": ""},
+        ],
+        "error",
+        message,
+    )
+    report = reports(run, tmp_path, store, [])["review"]
+    assert report["state"] == "not run"
+    body = comment_body(run, "review", report, "https://private.test")
+    assert body.startswith("### mergeCraft: not run") and "No readable primary" not in body
+
+
 def test_review_only_repository_gets_no_ci_report(tmp_path):
     store, run = finished_run(
         tmp_path,
