@@ -21,3 +21,14 @@ trust:
   # still never posts an APPROVE review; the `mergeCraft review` check is the
   # only thing this unlocks.
   selfReview: 'full'
+
+review:
+  coverage:
+    # mergeCraft ends a run `inconclusive` (a `neutral` check, which the workflow
+    # counts as blocking) when a changed hunk is not recorded as read. In this
+    # setup no read is ever recorded: every run reports 0 hunks covered and 0
+    # files read, although the reviewer is handed the full diff. With the default
+    # the `mergeCraft review` check could therefore never pass. `warn` reports
+    # the gap in the run record without overriding the verdict. A blocking
+    # finding still fails the check.
+    onIncomplete: warn
