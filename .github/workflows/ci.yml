@@ -1,0 +1,181 @@
+# CI for every pull request and for main.
+#
+# Runs on `pull_request`, so a fork PR gets a read-only token and no secrets.
+# Nothing here needs a secret. Each language job detects its own inputs and
+# passes with a notice when they are absent, so the same workflow works before
+# and after the application code lands on main.
+#
+# Job names start with "CI (" on purpose: the mergeCraft review workflow waits
+# for check-runs with that prefix before it reviews (CI_JOB_PREFIX there).
+# "CI gate" is the single context to mark as required in the branch ruleset.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  workflows:
+    name: CI (workflows)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+      - name: actionlint
+        run: uvx --from actionlint-py==1.7.12.25 actionlint
+      - name: zizmor
+        run: uvx zizmor==1.32.0 --offline --config .github/zizmor.yml .github/
+
+  python:
+    name: CI (python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Detect Python project
+        id: detect
+        run: |
+          if [ -f pyproject.toml ] && [ -f uv.lock ]; then
+            echo "present=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::notice title=CI (python)::No pyproject.toml + uv.lock on this ref; nothing to check."
+          fi
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        if: steps.detect.outputs.present == 'true'
+        with:
+          enable-cache: false
+      - name: Install (locked)
+        if: steps.detect.outputs.present == 'true'
+        run: uv sync --frozen
+      - name: Lint
+        if: steps.detect.outputs.present == 'true'
+        run: uv run ruff check .
+      - name: Format
+        if: steps.detect.outputs.present == 'true'
+        run: uv run ruff format --check .
+      - name: Typecheck
+        if: steps.detect.outputs.present == 'true'
+        run: uv run pyright
+      - name: Test
+        if: steps.detect.outputs.present == 'true'
+        run: uv run pytest -q
+
+  javascript:
+    name: CI (javascript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Detect JavaScript sources
+        id: detect
+        run: |
+          shopt -s nullglob
+          scripts=(localci/static/*.js)
+          tests=(tests/*.mjs)
+          if [ "${#scripts[@]}" -gt 0 ] || [ "${#tests[@]}" -gt 0 ]; then
+            echo "present=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::notice title=CI (javascript)::No JavaScript sources on this ref; nothing to check."
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.detect.outputs.present == 'true'
+        with:
+          node-version: 22
+      - name: Syntax check
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          shopt -s nullglob
+          for file in localci/static/*.js; do
+            node --check "${file}"
+          done
+      - name: Test
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          shopt -s nullglob
+          tests=(tests/*.mjs)
+          if [ "${#tests[@]}" -gt 0 ]; then
+            node --test "${tests[@]}"
+          fi
+
+  secrets:
+    name: CI (secret scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: a secret removed in a later commit is still leaked.
+          fetch-depth: 0
+          persist-credentials: false
+      # The release binary, verified by checksum, rather than an action that
+      # would be handed the job token.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/gitleaks"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/gitleaks" gitleaks
+      - name: Scan history for secrets
+        run: |
+          "${RUNNER_TEMP}/gitleaks/gitleaks" git --redact --no-banner --exit-code 1 .
+
+  dependency-review:
+    name: CI (dependency review)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never
+
+  gate:
+    name: CI gate
+    if: always()
+    needs: [workflows, python, javascript, secrets, dependency-review]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: ${RESULTS}"
+          for result in ${RESULTS}; do
+            case "${result}" in
+              success|skipped) ;;
+              *)
+                echo "::error title=CI gate::A CI job ended with '${result}'."
+                exit 1
+                ;;
+            esac
+          done

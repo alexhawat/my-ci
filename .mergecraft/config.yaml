@@ -1,0 +1,23 @@
+# mergeCraft repo config. Under `pull_request_target` this file is read from the
+# default branch, so a pull request cannot change the settings of its own review.
+models:
+- anthropic/claude-sonnet-5-5
+
+# Review-only: the reviewer may not push, run repo commands, approve or merge.
+push: disabled
+shell: disabled
+signedCommits: false
+prApproveEnabled: false
+autoMergeEnabled: false
+
+trust:
+  # Codex sandbox override; unused here (the reviewer is Claude Code).
+  agentSandbox: 'never'
+  # The review runs on `pull_request_target`, where mergeCraft treats every run
+  # as untrusted unless this is `full`; an untrusted run can only conclude
+  # `neutral`, which the workflow's enforce step counts as blocking. `full`
+  # lets a same-repository pull request reach `success`. Fork pull requests
+  # stay untrusted at every level. With prApproveEnabled false the reviewer
+  # still never posts an APPROVE review; the `mergeCraft review` check is the
+  # only thing this unlocks.
+  selfReview: 'full'
