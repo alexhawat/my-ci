@@ -21,8 +21,9 @@ account with access is the owner.
 
 - **`CI`** (`.github/workflows/ci.yml`) runs on `pull_request` with a read-only
   token and no secrets, so it is safe to run on fork pull requests. It lints
-  the workflows (actionlint, zizmor), scans history for secrets (gitleaks),
-  reviews dependency changes, and runs the Python and JavaScript checks from
+  the workflows (actionlint, zizmor), scans for secrets with gitleaks (a pull
+  request's own commits; all of `main`'s history on a push; known false
+  positives are listed in `.gitleaksignore`), reviews dependency changes, and runs the Python and JavaScript checks from
   `TESTING.md` when those sources exist. `CI gate` is the one check to require.
 - **`CodeQL`** (`.github/workflows/codeql.yml`) scans workflows, Python and
   JavaScript, for whichever of them exist on the ref.
@@ -55,6 +56,11 @@ scope, so these properties matter:
 - **Dependabot pull requests are gated by CI only.** GitHub withholds Actions
   secrets from them, so they cannot be reviewed; the review job passes with a
   warning for `dependabot[bot]` and fails for everyone else without a review.
+- **A review that could not finish fails the check.** If the review step
+  crashes, times out, or has its key or model rejected, it produces no verdict
+  and the `mergeCraft review` job fails. Re-run the job once the cause is
+  fixed. If the review cannot be made to run, merging takes a deliberate owner
+  bypass after a manual read.
 
 `trust.selfReview` is `full` in `.mergecraft/config.yaml`. Under
 `pull_request_target` mergeCraft treats every run as untrusted otherwise, and
@@ -82,10 +88,18 @@ These cannot be set from a pull request. Do them once, in this order.
      contributors.
    - Workflow permissions: read repository contents only; leave "Allow GitHub
      Actions to create and approve pull requests" off.
-5. **Advanced Security.** Turn on secret scanning with push protection,
-   Dependabot alerts and private vulnerability reporting.
+5. **Advanced Security.** Turn on the dependency graph, secret scanning with
+   push protection, Dependabot alerts and private vulnerability reporting.
+   `CI (dependency review)` needs the dependency graph: while it is off, the
+   job fails with `403 Forbidden` and `CI gate` fails on every pull request.
 
 ## What this does not cover
+
+- **A merge queue is not supported as is.** Neither workflow runs on
+  `merge_group`. `mergeCraft review` only runs on `pull_request_target`, so it
+  could never report on a merge-group ref and the queue would wait forever.
+  Before turning on a merge queue for `main`, add `merge_group` to `CI` and a
+  pass-through job that reports `mergeCraft review` for merge groups.
 
 - **A required check is matched by name.** A pull request that adds a workflow
   with a job called `CI gate` or `mergeCraft review` can report that name. Only

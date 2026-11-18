@@ -14,8 +14,9 @@ on:
   pull_request:
   push:
     branches: [main]
-  merge_group:
-    types: [checks_requested]
+  # No `merge_group` trigger: the other required check, `mergeCraft review`,
+  # cannot report on a merge-group ref, so a merge queue would wait forever.
+  # See docs/repository-security.md before enabling a merge queue.
 
 permissions:
   contents: read
@@ -140,9 +141,22 @@ jobs:
           echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
           mkdir -p "${RUNNER_TEMP}/gitleaks"
           tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/gitleaks" gitleaks
+      # A pull request is judged on its own commits only, so history on other
+      # branches cannot fail it. A push to main scans all of main's history.
+      # gitleaks scans every fetched ref unless it is given a range.
+      # Known false positives are listed by fingerprint in .gitleaksignore.
       - name: Scan history for secrets
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          "${RUNNER_TEMP}/gitleaks/gitleaks" git --redact --no-banner --exit-code 1 .
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            range="${BASE_SHA}..${HEAD_SHA}"
+          else
+            range="HEAD"
+          fi
+          "${RUNNER_TEMP}/gitleaks/gitleaks" git --redact --no-banner --exit-code 1 --log-opts="${range}" .
 
   dependency-review:
     name: CI (dependency review)

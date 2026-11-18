@@ -2,8 +2,9 @@
 #
 # Adapted from examples/workflows/mergecraft-hardened.yml at mergeCraft v0.1.0a6.
 # Local changes: the Action pin, the reviewer model (Claude Sonnet 5.5 on
-# ANTHROPIC_API_KEY, pinned), CI_JOB_PREFIX, and the Dependabot exemption on
-# SKIPPED_REVIEW. Repository access rules are in docs/repository-security.md.
+# ANTHROPIC_API_KEY, pinned), CI_JOB_PREFIX, the Dependabot exemption on
+# SKIPPED_REVIEW, and a gate that fails closed when a review produced no result.
+# Repository access rules are in docs/repository-security.md.
 #
 # Auto-reviews PRs on open / ready / new commits, posting inline comments plus a
 # summary, and (with `status_checks: enabled`) the `mergecraft` and
@@ -15,9 +16,15 @@
 # credential configured — the job FAILS by default, so a required check can
 # never go green on a PR nobody reviewed. Set `SKIPPED_REVIEW: pass` on the
 # review job to let those PRs through with a warning instead (see the comment
-# there). A review that started but could not finish — provider session limit,
-# no approval posted — still fails open: a required check that can go
-# permanently missing is a permanent merge block, which is worse than no gate.
+# there).
+#
+# A review that started but could not finish — provider outage, rejected key or
+# model id, image pull failure, timeout, no approval posted — FAILS this job
+# too. The upstream template fails open there, because it expects the ruleset to
+# require the `mergecraft-approval` check. This repository requires this job
+# (`mergeCraft review`) instead, so a green job with no review would let the PR
+# merge unreviewed. Re-run the job once the cause is fixed; the owner bypass
+# covers a review that cannot be made to run.
 #
 # ---------------------------------------------------------------------------
 # Trigger choice: pull_request_target vs pull_request
@@ -414,7 +421,7 @@ jobs:
       - name: mergeCraft review incomplete (non-fatal)
         if: env.HAS_AUTH == 'true' && steps.mergecraft.outcome != 'success'
         run: |
-          echo "::notice title=mergeCraft incomplete::Review step did not finish successfully (see its log). Approval enforcement skipped."
+          echo "::notice title=mergeCraft incomplete::Review step did not finish successfully (see its log). On a pull request the next step fails this job unless the review still produced an approving result."
 
       # Gate on this run's own review verdict rather than on the review step's
       # exit code, so agent infrastructure failures do not read as "changes
@@ -436,10 +443,11 @@ jobs:
       # ignored by the review ignore paths passes with a notice: there was
       # nothing to review, and approval is left to a human.
       #
-      # Fail closed on an empty verdict, an unattributable check, or a
-      # disagreement. Fail open only when there is neither a verdict nor a
-      # mergecraft-approval check at all: the required-check pattern relies on a
-      # posted check, so the branch-protection rule itself blocks that merge.
+      # Fail closed on an empty verdict, an unattributable check, a
+      # disagreement, or a check-runs query that keeps failing. That includes
+      # the case with neither a verdict nor a mergecraft-approval check at all
+      # (upstream fails open there): this job is the required check in this
+      # repository, so nothing else would block that merge.
       - name: Fail when mergeCraft would not approve
         if: github.event_name == 'pull_request_target' && env.HAS_AUTH == 'true'
         env:
@@ -476,8 +484,8 @@ jobs:
             sleep 5
           done
           if [ -z "${queried}" ]; then
-            echo "::warning title=mergeCraft approval unknown::Could not query check-runs for ${HEAD_SHA} after retries. Failing open."
-            exit 0
+            echo "::error title=mergeCraft approval unknown::Could not query check-runs for ${HEAD_SHA} after retries, so the review result cannot be corroborated. Failing closed; re-run this job."
+            exit 1
           fi
 
           # Corroborate: same head, this run's external id, and an issuer this
@@ -500,8 +508,8 @@ jobs:
             ' 2>/dev/null || true)"
 
           if [ -z "${verdict}" ] && [ -z "${check}" ]; then
-            echo "::notice title=mergeCraft approval not posted::No mergecraft-approval check on ${HEAD_SHA} and no review verdict was produced. Not blocking (fail-open for missing check — branch protection handles the missing required check)."
-            exit 0
+            echo "::error title=mergeCraft review did not run::No review verdict and no mergecraft-approval check on ${HEAD_SHA}: the review step failed before it produced a result (see its log). Failing closed so this required check cannot pass unreviewed; re-run this job once the cause is fixed."
+            exit 1
           fi
           if [ -z "${verdict}" ]; then
             echo "::error title=mergeCraft review incomplete::The review step produced no verdict, so the mergecraft-approval check on ${HEAD_SHA} cannot be corroborated. Failing closed."
