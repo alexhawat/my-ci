@@ -76,10 +76,10 @@ config = {
     "enabled_providers": ["fixture"],
     "permission": {"*": "deny"},
 }
-adapter = importlib.import_module("mergecraft.agents.opencode")
+adapter = importlib.import_module("mergecraft.agents.opencode_config")
 with (
     patch.object(adapter, "_checkout_root", return_value=root),
-    patch.object(adapter, "_evidence_dir", return_value=root / "evidence"),
+    patch.object(adapter, "evidence_dir", return_value=root / "evidence"),
 ):
     config["permission"] = adapter._build_review_mode_permissions(SimpleNamespace(tmpdir=str(root)))
 assert config["permission"]["websearch"] == "deny"

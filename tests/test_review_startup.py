@@ -1,13 +1,14 @@
 import json
 from unittest.mock import AsyncMock
 
+import pytest
 from test_service import pr
 
 from localci.github import GitHub
 from localci.policy import dependabot_pr
 from localci.reporting import comment_body, reports
 from localci.review_evidence import classify_review, configuration_diagnostic
-from localci.runner import Runner
+from localci.runner import Runner, apply_review_token_ceiling
 from localci.store import Store
 
 
@@ -97,7 +98,8 @@ async def test_dependabot_keeps_ci_without_review_credentials_or_container(tmp_p
     assert not dependabot_pr(pr())
 
 
-def test_new_image_evidence_schema_preserves_bound_findings(tmp_path):
+@pytest.mark.parametrize("version", ["1.19.0", "1.21.0"])
+def test_new_image_evidence_schema_preserves_bound_findings(tmp_path, version):
     import hashlib
 
     from test_review_evidence import evidence_fixture
@@ -105,7 +107,7 @@ def test_new_image_evidence_schema_preserves_bound_findings(tmp_path):
     from localci.review_evidence import recover_findings
 
     store, run, directory, packet, runtime = evidence_fixture(tmp_path)
-    packet["schema_version"] = "1.19.0"
+    packet["schema_version"] = version
     packet["coverage"] = {"status": "complete"}
     path = directory / "mergecraft-evidence.json"
     path.write_text(json.dumps(packet))
@@ -161,3 +163,91 @@ def test_live_budget_breakdown_survives_missing_final_review(tmp_path):
     body = comment_body(run, "review", report, "https://private.test")
     assert "1135 reported across 2 model steps" in body and "cached read 500" in body
     assert "Live token budget stopped" in body and "fixture-private" not in body
+
+
+@pytest.mark.parametrize("ceiling", [None, 5_000_000])
+async def test_operator_ceiling_reaches_review_container_without_trusting_head(
+    tmp_path, monkeypatch, ceiling
+):
+    from pathlib import Path
+
+    import yaml
+
+    monkeypatch.setenv("LOCALCI_REVIEW_IMAGE", "review:test")
+    token = tmp_path / "token"
+    token.write_text("fixture-token")
+    store = Store(tmp_path / "data/db")
+    runner = Runner(store, GitHub(token), tmp_path / "data", lambda _, scope: {"KEY": "synthetic-review-key"})
+    observed = {}
+
+    async def command(*args, **kwargs):
+        if args[:2] == ("git", "clone"):
+            directory = Path(args[-1])
+            directory.mkdir(parents=True)
+            # A PR cannot supply its own trusted budget or execution policy.
+            (directory / ".mergecraft").mkdir()
+            (directory / ".mergecraft/config.yaml").write_text(
+                "runBounds: {tokenBudget: 99000000}\nshell: enabled\n"
+            )
+        if args[:2] == ("git", "show"):
+            assert args[-1] == "b" * 40 + ":.mergecraft/config.yaml"
+            return (
+                0,
+                "runBounds: {tokenBudget: 2000000, tokenBudgetTolerance: 0.1, toolCallBudget: 123}\nreview: {ignorePaths: [private/**], roundBudgets: {multipliers: [2.0], carryOver: true}}\n",
+            )
+        if args[:2] == ("docker", "create"):
+            env = Path(args[args.index("--env-file") + 1])
+            observed["env"] = env.read_text()
+            observed["config"] = yaml.safe_load(
+                (env.parent / "review-control/review-config.yaml").read_text()
+            )
+            assert not (env.parent / "review-export/.mergecraft").exists()
+        return 0, ""
+
+    runner.command = command
+    runner.cleanup = AsyncMock()
+    store.enqueue("owner/repo", pr(), {"review": True, "review_token_ceiling": ceiling})
+    await runner.execute(store.claim())
+    config = observed["config"]
+    assert config["shell"] == config["push"] == "disabled"
+    assert config["review"]["ignorePaths"] == ["private/**"]
+    assert config["runBounds"]["toolCallBudget"] == 123
+    if ceiling is None:
+        assert config["runBounds"]["tokenBudget"] == 2_000_000
+        assert config["runBounds"]["tokenBudgetTolerance"] == 0.1
+        assert config["review"]["roundBudgets"]["multipliers"] == [2.0]
+        assert "MERGECRAFT_TOKEN_BUDGET=" not in observed["env"]
+    else:
+        assert config["runBounds"]["tokenBudget"] == ceiling
+        assert config["runBounds"]["tokenBudgetTolerance"] == 0
+        assert config["review"]["roundBudgets"]["multipliers"] == [1.0]
+        # Other trusted settings next to the overridden ones are kept.
+        assert config["review"]["roundBudgets"]["carryOver"] is True
+        assert f"MERGECRAFT_TOKEN_BUDGET={ceiling}\n" in observed["env"]
+
+
+@pytest.mark.parametrize(
+    "config,ceiling,path",
+    [
+        (["not", "a", "mapping"], None, "top level"),
+        ({"runBounds": [1]}, 1000, "`runBounds`"),
+        ({"review": "strict"}, 1000, "`review`"),
+        ({"review": {"roundBudgets": [2.0]}}, 1000, "`review.roundBudgets`"),
+    ],
+)
+def test_malformed_base_review_config_is_a_clear_configuration_error(config, ceiling, path):
+    with pytest.raises(ValueError, match="Base .mergecraft/config.yaml is invalid") as error:
+        apply_review_token_ceiling(config, ceiling)
+    assert path in str(error.value)
+
+
+def test_token_ceiling_leaves_config_alone_when_unset_and_fills_missing_sections():
+    config = {"runBounds": [1], "review": "strict"}  # Not this function's concern without a ceiling.
+    apply_review_token_ceiling(config, None)
+    assert config == {"runBounds": [1], "review": "strict"}
+    config = {"runBounds": None}
+    apply_review_token_ceiling(config, 1000)
+    assert config == {
+        "runBounds": {"tokenBudget": 1000, "tokenBudgetTolerance": 0},
+        "review": {"roundBudgets": {"multipliers": [1.0]}},
+    }

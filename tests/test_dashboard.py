@@ -454,3 +454,23 @@ def test_threshold_is_validated_and_snapshotted_for_new_runs(client):
         ]
         == "trivial"
     )
+
+
+def test_operator_token_ceiling_validation_and_run_snapshot(client):
+    http, c = client
+    for invalid in (0, -1, 100_000_001, 1.5, True, "5000000"):
+        assert http.put("/api/repos/o/r", json={"review_token_ceiling": invalid}).status_code == 422
+    assert (
+        http.put("/api/repos/o/r", json={"review": True, "review_token_ceiling": 5_000_000}).status_code
+        == 200
+    )
+    config = json.loads(c.store.repo("o/r")["config"])
+    rid = c.store.enqueue("o/r", pr(), config)
+    assert http.put("/api/repos/o/r", json={"review": True, "review_token_ceiling": None}).status_code == 200
+    assert json.loads(c.store.repo("o/r")["config"])["review_token_ceiling"] is None
+    assert (
+        json.loads(c.store.rows("SELECT config FROM runs WHERE id=?", (rid,))[0]["config"])[
+            "review_token_ceiling"
+        ]
+        == 5_000_000
+    )

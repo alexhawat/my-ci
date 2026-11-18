@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 def check():
     adapter = importlib.import_module("mergecraft.agents.opencode")
+    runner = importlib.import_module("mergecraft.agents.cli_runner")
     for status, stdout, expected in [
         (137, "", "opencode exited 137: no diagnostic event"),
         (1, '{"type":"error","error":{"message":"fixture failure"}}\n', "fixture failure"),
@@ -23,21 +24,22 @@ def check():
         with ExitStack() as stack:
             stack.enter_context(
                 patch.object(
-                    adapter,
+                    runner,
                     "watchdog_for_process",
                     return_value=SimpleNamespace(stalled=False, touch=Mock(), stop=Mock()),
                 )
             )
-            stack.enter_context(patch.object(adapter, "spawn_agent_cli", return_value=process))
-            stack.enter_context(patch.object(adapter, "start_stderr_drain", return_value=drain))
-            stack.enter_context(patch.object(adapter, "track_process_group", return_value=nullcontext()))
-            stack.enter_context(patch.object(adapter, "wait_or_kill_process_group", return_value=status))
+            stack.enter_context(patch.object(runner, "spawn_agent_cli", return_value=process))
+            stack.enter_context(patch.object(runner, "start_stderr_drain", return_value=drain))
+            stack.enter_context(patch.object(runner, "track_process_group", return_value=nullcontext()))
+            stack.enter_context(patch.object(runner, "wait_or_kill_process_group", return_value=status))
             result = adapter._run_opencode_cli_streaming(
                 cmd=[],
                 ctx=SimpleNamespace(
-                    tool_state=SimpleNamespace(driver_reports_reads=False),
+                    tool_state=SimpleNamespace(driver_reports_reads=False, repos={}, primary_repo_key=""),
                     idle_timeout_s=60,
                     resolved_model=None,
+                    budget_tracker=None,
                 ),
                 env={},
                 session={},

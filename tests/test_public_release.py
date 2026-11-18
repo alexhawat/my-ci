@@ -46,7 +46,8 @@ PRIVATE_NETWORK = {
         r"(?<![0-9a-f:])(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):[0-9a-f:]*:[0-9a-f]{0,4}"
         r"(?![0-9a-f])(?![0-9a-f:]*(?<=::)/\d)"
     ),
-    "private registry namespace": "ghcr" + r"\.io/" + "alexhawat" + r"\b",
+    # Only the public mergeCraft image is an allowed registry dependency.
+    "private registry namespace": "ghcr" + r"\.io/" + "alexhawat" + r"\b(?!/mergecraft(?![\w./-]))",
 }
 # Only dotted domains look like deliverable addresses; action@sha pins and
 # single-label fixtures such as localci@localhost do not match.
@@ -202,8 +203,10 @@ def test_public_deployment_defaults():
     assert "${LOCALCI_HOST_LABEL:-local worker}" in compose
     assert "127.0.0.1:8787:8787" in compose
     build = (ROOT / "scripts/build_review.sh").read_text()
-    assert "https://github.com/alexhawat/mergeCraft.git" in build
-    assert "965c7346f89cc07828e4d359bc7806239c96fe33" in build
+    review = (ROOT / "Dockerfile.review").read_text()
+    assert "docker build" in build
+    assert "6dc67ab3ce873a4b313553d5e1ac9e469295eb03" in review
+    assert "sha256:8403a146bd7b6debc778652731a31df2af0280db0bdb8f68b41dd335ac9d8ddc" in review
 
 
 def test_host_label_is_configurable(tmp_path, monkeypatch):

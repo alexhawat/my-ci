@@ -1,4 +1,4 @@
-"""Fail closed on the pinned OpenCode stream without losing usage evidence."""
+"""Observe native per-step enforcement without charging stream usage twice."""
 
 from pathlib import Path
 
@@ -15,84 +15,39 @@ def apply(root):
 
     replace(
         "review/offline_agent.py",
-        "                try:\n                    result = await attempt_agent.run(attempt_ctx)\n                finally:",
+        "                result = await attempt_agent.run(attempt_ctx)",
         "                from mergecraft.localci_live_budget import bind\n"
-        "                try:\n                    with bind(budget_tracker) as live_budget:\n"
-        "                        result = await attempt_agent.run(attempt_ctx)\n                finally:",
-    )
-    replace(
-        "review/offline_agent.py",
-        '            record_agent_usage(budget_tracker, result.usage, phase="reviewer_dispatch")',
-        "            if not live_budget.steps:\n"
-        '                record_agent_usage(budget_tracker, result.usage, phase="reviewer_dispatch")',
+        "                budget_tracker.stream_tokens_charged = 0\n"
+        "                budget_tracker.stream_cost_charged = 0.0\n"
+        "                with bind(budget_tracker):\n"
+        "                    result = await attempt_agent.run(attempt_ctx)",
     )
     replace(
         "agents/opencode.py",
-        "    def _watched_handler(acc: StreamSpanAccumulator, event: dict[str, Any]) -> None:",
+        '    cache = tokens.get("cache")\n    cache = cache if isinstance(cache, dict) else {}',
         "    from mergecraft.localci_live_budget import current\n"
-        "    from mergecraft.utils.process_group import kill_process_group\n"
-        "    live_budget = current()\n\n"
-        "    def _watched_handler(acc: StreamSpanAccumulator, event: dict[str, Any]) -> None:",
+        "    live_budget = current()\n"
+        "    try:\n"
+        "        if live_budget is not None and not live_budget.accept(event):\n"
+        "            # A duplicate is skipped; invalid counters or cost stop the review.\n"
+        "            if live_budget.error:\n"
+        "                accumulator.halt_reason = str(live_budget.error)\n"
+        "            return\n"
+        "    except Exception:\n"
+        '        accumulator.halt_reason = "Live usage evidence failed; review stopped"\n'
+        "        return\n"
+        '    cache = tokens.get("cache")\n    cache = cache if isinstance(cache, dict) else {}',
     )
     replace(
         "agents/opencode.py",
-        "        base_handler(acc, event)\n",
-        """        if live_budget is not None:
-            if live_budget.error:
-                return
-
-            def _meter_failed(exc):
-                # The generic stream handler would swallow this and leave the agent
-                # running with metering stopped. Keep the first stop reason.
-                from mergecraft.utils.run_bounds import BudgetExhausted
-                live_budget.error = live_budget.error or BudgetExhausted(
-                    "token", "Live usage meter failed; review stopped: " + type(exc).__name__
-                )
-                live_budget.tracker.last_exhausted = live_budget.error
-                try:
-                    live_budget.save()
-                except Exception:
-                    pass
-                kill_process_group(getattr(process, "pid", None))
-
-            try:
-                accepted = live_budget.accept(event)
-            except Exception as exc:
-                _meter_failed(exc)
-                return
-            if not accepted:
-                # A rejected event (invalid counters or cost) stops the agent.
-                if live_budget.error:
-                    kill_process_group(getattr(process, "pid", None))
-                return
-            try:
-                before = acc.to_usage()
-                previous = (before.input_tokens + before.output_tokens, before.cost_usd or 0) if before else (0, 0)
-                base_handler(acc, event)
-            except Exception as exc:
-                if event.get("type") != "step_finish":
-                    raise  # Upstream behaviour: the generic handler logs it.
-                # An accepted step the upstream handler failed on would go unmetered.
-                _meter_failed(exc)
-                return
-            try:
-                usage = acc.to_usage()
-                if usage is not None:
-                    live_budget.charge(event, usage, previous)
-            except Exception as exc:
-                _meter_failed(exc)
-                return
-            if live_budget.error:
-                kill_process_group(getattr(process, "pid", None))
-            return
-        base_handler(acc, event)
-""",
-    )
-    replace(
-        "agents/opencode.py",
-        "    if watchdog.stalled:\n",
-        "    if live_budget is not None and live_budget.error:\n        raise live_budget.error\n\n"
-        "    if watchdog.stalled:\n",
+        "    if stop:\n        accumulator.halt_reason = stop\n        return\n    accumulator.absorb_usage(payload)",
+        "    if live_budget is not None:\n"
+        "        try:\n"
+        "            live_budget.observe(event, stop)\n"
+        "        except Exception:\n"
+        '            accumulator.halt_reason = "Live usage evidence failed; review stopped"\n'
+        "            return\n"
+        "    if stop:\n        accumulator.halt_reason = stop\n        return\n    accumulator.absorb_usage(payload)",
     )
     replace(
         "review/offline_agent.py",
@@ -107,9 +62,9 @@ def apply(root):
         packet_path = None
         try:
             packet_path = await asyncio.to_thread(
-                _emit_offline_packet, tool_context, cwd=cwd,
+                _emit_offline_packet, prepared.tool_context, cwd=cwd,
                 materialization=materialization, run_succeeded=False,
-                structured_output=tool_state.output, output_path=evidence_packet_path,
+                structured_output=prepared.tool_context.tool_state.output, output_path=evidence_packet_path,
             )
         except Exception:
             logger.warning("Budget-stop evidence export unavailable")

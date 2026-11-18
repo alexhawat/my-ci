@@ -1,6 +1,8 @@
+import asyncio
 import fcntl
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -16,6 +18,15 @@ ACTIVE = ("queued", "running")
 RECOVERABLE = ("pr_inactive", "repo_disabled", "worker_interrupted")
 MAX_RECOVERIES = 3  # Unbilled automatic re-runs per PR revision; bounds crash loops.
 SCHEMA_VERSION = 4
+_SELECT = re.compile(r"\s*SELECT\b", re.IGNORECASE)
+
+
+def _on_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 class RetryLimitReached(RuntimeError):
@@ -173,9 +184,32 @@ class Store:
             finally:
                 db.close()
 
-    def rows(self, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
-        with self.connect(write=False) as db:
-            return [dict(r) for r in db.execute(sql, args)]
+    def rows(self, sql: str, args: tuple = (), *, readonly: bool | None = None) -> list[dict[str, Any]]:
+        # WAL reader lock races can return SQLITE_PROTOCOL despite busy_timeout.
+        # Retry only reads on a fresh connection, never ambiguous mutations or
+        # unrelated database failures. A metadata poll must survive a brief race.
+        # A statement whose first keyword is SELECT cannot write. Anything else
+        # (WITH can front a mutation) is retried only when the caller passes
+        # readonly=True.
+        if readonly is None:
+            readonly = _SELECT.match(sql) is not None
+        attempt = 0
+        while True:
+            try:
+                with self.connect(write=False) as db:
+                    return [dict(r) for r in db.execute(sql, args)]
+            except sqlite3.OperationalError as exc:
+                if (
+                    getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_PROTOCOL
+                    or not readonly
+                    or attempt >= 4
+                ):
+                    raise
+                # Some callers run on the event loop. Never block it: retry at
+                # once there, and back off only in worker threads.
+                if not _on_event_loop():
+                    time.sleep(0.02 * 2**attempt)
+                attempt += 1
 
     def execute(self, sql: str, args: tuple = ()):
         with self.connect() as db:

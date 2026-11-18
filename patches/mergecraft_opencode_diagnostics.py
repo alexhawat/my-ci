@@ -37,6 +37,9 @@ def apply(root: Path):
         + anchor,
         1,
     )
+    path.write_text(source)
+    path = root / "agents/opencode_config.py"
+    source = path.read_text()
     permission = '        "webfetch": "deny",\n'
     if source.count(permission) != 1:
         raise RuntimeError("Pinned OpenCode review permission policy changed")
