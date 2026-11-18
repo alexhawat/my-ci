@@ -1,0 +1,10 @@
+# Intentional ignores only; each entry states why.
+rules:
+  dangerous-triggers:
+    ignore:
+      # The review must run with base-repository privileges to post review
+      # comments and check-runs. It never checks out or executes the pull
+      # request head: actions/checkout takes the default branch, the Action is
+      # pinned by commit SHA and runs with push and shell disabled, and fork
+      # pull requests receive no secret (same-repo guard).
+      - mergecraft.yml
