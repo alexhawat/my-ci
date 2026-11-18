@@ -1,0 +1,71 @@
+name: localci
+services:
+  app:
+    image: localci-controller:1
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      LOCALCI_URL: ${LOCALCI_URL:-http://localhost:8787}
+      LOCALCI_HOST_LABEL: ${LOCALCI_HOST_LABEL:-local worker}
+      LOCALCI_TAILSCALE_LOGIN: ${LOCALCI_TAILSCALE_LOGIN:?Set the permitted Tailscale login}
+    volumes:
+      - localci-data:/data
+      - ./runtime/github-token:/run/secrets/github-token:ro
+    mem_limit: 2g
+    cpus: 2
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  worker:
+    image: localci-executor:1
+    build: .
+    command: ["python", "-m", "localci.worker"]
+    restart: unless-stopped
+    init: true
+    environment:
+      LOCALCI_URL: ${LOCALCI_URL:-http://localhost:8787}
+      LOCALCI_HOST_LABEL: ${LOCALCI_HOST_LABEL:-local worker}
+      LOCALCI_REVIEW_IMAGE: localci-review:1
+      LOCALCI_NESTED_DNS: ${LOCALCI_NESTED_DNS:-}
+    volumes:
+      - localci-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./runtime/github-token:/run/secrets/github-token:ro
+      - ./runtime/runner-image.tar:/opt/localci/runner-image.tar:ro
+    mem_limit: 2g
+    cpus: 2
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+    healthcheck:
+      test: ["CMD", "python", "-m", "localci.worker", "--healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+  worker-image:
+    image: localci-worker:1
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    profiles: [build]
+  # Built from pinned public source by scripts/build_review.sh.
+  review-image:
+    image: localci-review:1
+    profiles: [build]
+  jobs-image:
+    image: localci-jobs:1
+    build:
+      context: .
+      dockerfile: Dockerfile.jobs
+    profiles: [build]
+volumes:
+  localci-data:

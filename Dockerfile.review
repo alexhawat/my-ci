@@ -1,0 +1,36 @@
+ARG BASE_IMAGE=localci-mergecraft-base:965c7346f89c
+FROM ${BASE_IMAGE}
+USER root
+COPY patches/mergecraft_fingerprints.py /tmp/localci-fingerprint-patch.py
+COPY patches/test_mergecraft_fingerprints.py /opt/localci/test_mergecraft_fingerprints.py
+COPY patches/mergecraft_opencode_diagnostics.py /tmp/localci-opencode-patch.py
+COPY patches/test_mergecraft_opencode_diagnostics.py /opt/localci/test_mergecraft_opencode_diagnostics.py
+COPY patches/test_opencode_websearch.py /opt/localci/test_opencode_websearch.py
+RUN python /tmp/localci-fingerprint-patch.py && rm /tmp/localci-fingerprint-patch.py
+RUN python /tmp/localci-opencode-patch.py && rm /tmp/localci-opencode-patch.py
+RUN --network=none python /opt/localci/test_mergecraft_fingerprints.py
+RUN --network=none python /opt/localci/test_mergecraft_opencode_diagnostics.py
+RUN --network=none python /opt/localci/test_opencode_websearch.py
+# Image layers are immutable; every review gets its own disposable cache copy.
+ENV XDG_CACHE_HOME=/home/mergecraft/.cache
+COPY patches/warm_review_analyzers.py /opt/localci/warm_review_analyzers.py
+RUN python /opt/localci/warm_review_analyzers.py && chown -R mergecraft:mergecraft /home/mergecraft/.cache
+RUN --network=none su -s /bin/sh mergecraft -c 'python /opt/localci/warm_review_analyzers.py'
+COPY patches/mergecraft_local_report.py /tmp/localci-report-patch.py
+RUN python /tmp/localci-report-patch.py && rm /tmp/localci-report-patch.py
+COPY patches/test_local_report_export.py /opt/localci/test_local_report_export.py
+RUN --network=none python /opt/localci/test_local_report_export.py
+COPY patches/localci_profile.py /opt/mergecraft/src/mergecraft/localci_profile.py
+COPY patches/localci_git_batch.py /opt/mergecraft/src/mergecraft/localci_git_batch.py
+COPY patches/mergecraft_profile_reads.py /tmp/localci-profile-patch.py
+RUN python /tmp/localci-profile-patch.py && rm /tmp/localci-profile-patch.py
+COPY patches/test_profile_reads.py /opt/localci/test_profile_reads.py
+RUN --network=none python /opt/localci/test_profile_reads.py
+# Match the image pinned by mergeCraft Action 4cf9131 (runtime source 965c7346).
+COPY patches/test_review_config.py /opt/localci/test_review_config.py
+RUN --network=none python /opt/localci/test_review_config.py
+COPY patches/localci_live_budget.py /opt/mergecraft/src/mergecraft/localci_live_budget.py
+COPY patches/mergecraft_live_budget.py /tmp/localci-budget-patch.py
+RUN python /tmp/localci-budget-patch.py && rm /tmp/localci-budget-patch.py
+COPY patches/test_live_budget.py /opt/localci/test_live_budget.py
+RUN --network=none python /opt/localci/test_live_budget.py

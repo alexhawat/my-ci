@@ -1,0 +1,16 @@
+.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.db
+**/*.key
+.env*
+data
+
+runtime
+.git
+**/*.pem
+**/*.sqlite*
+backups
+.DS_Store
+._*
