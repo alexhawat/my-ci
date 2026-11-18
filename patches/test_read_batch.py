@@ -28,7 +28,7 @@ async def main():
         (repo / "sample.txt").write_text("\n".join(f"line {i}" for i in range(500)) + "\n")
         (repo / "long.txt").write_text("shown\n" + "x" * 80000 + "\nnot returned\n")
         # One "\n"-terminated line holding characters that str.splitlines() also breaks on.
-        (repo / "breaks.txt").write_bytes("first\fstill\u2028first\x85line\nsecond\r\nthird\n".encode())
+        (repo / "breaks.txt").write_bytes("first\fstill\u2028first\x85same\rline\nsecond\r\nthird\n".encode())
         git("add", ".")
         git("commit", "-qm", "fixture")
         state = init_tool_state(owner="fixture", name="repo", dir=str(repo))
@@ -98,8 +98,8 @@ async def main():
         export_path = json.loads(exported.content[0]["text"])["outputPath"]
         data = await read([{"path": export_path, "start": 498, "limit": 3}])
         assert data["results"][0]["text"] == "498: line 497\n499: line 498\n500: line 499"
-        # Form feed, U+2028 and NEL inside a line do not start a new one: later lines keep the
-        # numbers Git gives them, and CRLF endings are not shown.
+        # Form feed, U+2028, NEL and a bare carriage return inside a line do not start a new
+        # one: later lines keep the numbers Git gives them, and CRLF endings are not shown.
         data = await read([{"path": "breaks.txt", "start": 2, "limit": 5}])
         assert data["results"][0]["text"] == "2: second\n3: third", data["results"][0]
         assert data["results"][0]["end"] == 3 and data["results"][0]["next_line"] is None

@@ -63,9 +63,10 @@ def read_batch_tool(ctx):
                 )
                 continue
             # Lines are what Git and the diff count: separated by "\n" only. splitlines()
-            # also breaks on form feed, U+2028 and similar, which would shift every later
-            # line number and credit read coverage to the wrong ranges.
-            lines = source.read_text(encoding="utf-8").split("\n")
+            # also breaks on form feed, U+2028 and similar, and text-mode reading turns a
+            # bare "\r" into "\n"; either would shift every later line number and credit
+            # read coverage to the wrong ranges. Decode the bytes without translation.
+            lines = source.read_bytes().decode("utf-8").split("\n")
             if lines and lines[-1] == "":
                 lines.pop()
             lines = [line.removesuffix("\r") for line in lines]
