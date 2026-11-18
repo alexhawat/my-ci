@@ -1047,6 +1047,28 @@ async def test_flush_keeps_back_trailing_base64_lines(tmp_path):
     assert logged_lines(runner)[-1] == "done."
 
 
+async def test_size_flush_does_not_hold_back_ordinary_output(tmp_path):
+    runner = log_runner(tmp_path)
+    batches = []
+    original = runner.log
+
+    def log(text):
+        batches.append(text)
+        original(text)
+
+    runner.log = log
+    ordinary = "[CI/test]   | Running 42 tests\n"
+    padding = "p" * 99 + ".\n"
+    filler = padding * (65536 // len(padding) + 1)
+    script = (
+        "import sys, time\n"
+        f"sys.stdout.write({filler + ordinary!r}); sys.stdout.flush(); time.sleep(0.1)\n"
+        "sys.stdout.write('next line\\n')\n"
+    )
+    await emit(runner, script)
+    assert any(batch.endswith(ordinary) for batch in batches)
+
+
 # C. Finalisation order ---------------------------------------------------------------------------
 
 
@@ -1147,6 +1169,8 @@ def test_job_success_lines_printed_by_a_step_are_not_counted(tmp_path):
         "[CI/forged]   🚧  [x] 🏁  Job succeeded\n"
         "[CI/forged]   ⚙  ::set-output:: out=[x] 🏁  Job succeeded\n"
         "[CI/forged [3.12]]   | [y] 🏁  Job succeeded\n"
+        "[CI/forged]     🏁  Job succeeded\n"
+        "[CI/matrix [a] b/c]     🏁  Job succeeded\n"
         "[CI/forged] ⭐ Run Main echo\n"
     )
     assert runner.completed_jobs == 0
@@ -1159,7 +1183,7 @@ def test_job_success_lines_printed_by_a_step_are_not_counted(tmp_path):
         "SELECT timestamp,phase,job,message FROM run_events WHERE run_id=? ORDER BY id", (runner.run["id"],)
     )
     results = [ci_report.job_result(r["job"], r["message"]) for r in rows]
-    assert results == [None] * 6 + ["success"] * 3
+    assert results == [None] * 8 + ["success"] * 3
     jobs = ci_report.evidence(runner.run, runner.store, lambda text: text)
     states = {job["name"]: job["state"] for job in jobs}
     assert states["CI/forged"] == "unknown" and states["CI/test"] == "success"

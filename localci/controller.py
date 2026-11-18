@@ -16,7 +16,7 @@ from localci.review_reconcile import reconcile_legacy_reviews
 from localci.runner import Runner
 from localci.store import Store
 
-PUBLISH_ATTEMPTS = 12  # About 45 minutes of backoff before a finished run's publish is abandoned.
+PUBLISH_ATTEMPTS = 3  # Only permanent failures of a final publication count toward abandonment.
 NETWORK_SWEEP_SECONDS = 600
 
 
@@ -44,7 +44,9 @@ class Controller:
         self.last_discovery = 0.0
         self.lock = asyncio.Lock()
         self.publish_lock = asyncio.Lock()
+        # Permanent final failures and transient/pending backoff have separate budgets.
         self.publish_retries: dict[str, tuple[int, float]] = {}
+        self.publish_backoff: dict[str, tuple[int, float]] = {}
         self.wake = asyncio.Event()
         self.base_url = os.environ.get("LOCALCI_URL", "http://localhost:8787").rstrip("/")
         self.host_label = os.environ.get("LOCALCI_HOST_LABEL", "local worker")
@@ -197,7 +199,10 @@ class Controller:
                 SELECT 1 FROM runs newer WHERE newer.repo=r.repo AND newer.pr=r.pr AND newer.created>r.created)
                 ORDER BY r.created DESC LIMIT 50""",
         ):
-            retry_at = self.publish_retries.get(run["id"], (0, 0))[1]
+            retry_at = max(
+                self.publish_retries.get(run["id"], (0, 0))[1],
+                self.publish_backoff.get(run["id"], (0, 0))[1],
+            )
             if time.time() < retry_at:
                 continue
             state = {
@@ -218,6 +223,8 @@ class Controller:
                             "UPDATE runs SET published=1,publish_error='Superseded revision; not published' WHERE id=?",
                             (run["id"],),
                         )
+                        self.publish_retries.pop(run["id"], None)
+                        self.publish_backoff.pop(run["id"], None)
                         continue
                 reporting = await self.github.status(
                     run, state, description, f"{self.base_url}/?run={run['id']}"
@@ -238,20 +245,23 @@ class Controller:
                     (run["id"], run["state"], run["steps"]),
                 )
                 self.publish_retries.pop(run["id"], None)
+                self.publish_backoff.pop(run["id"], None)
             except Exception as exc:
-                failures = self.publish_retries.get(run["id"], (0, 0))[0] + 1
-                status = getattr(exc, "status", None)
-                # A missing or rejected target will not start working; a rate limit will.
-                limit = 3 if status in (404, 410, 422) else PUBLISH_ATTEMPTS
-                if failures >= limit and run["state"] not in ("queued", "running"):
-                    # Stop retrying, and let retention prune the run: it only removes
-                    # published runs, so one that can never publish would stay forever.
+                final = state != "pending"
+                permanent = final and getattr(exc, "status", None) in (404, 410, 422)
+                failures = self.publish_retries.get(run["id"], (0, 0))[0] + int(permanent)
+                if permanent:
+                    self.publish_retries[run["id"]] = (failures, 0.0)
+                if failures >= PUBLISH_ATTEMPTS:
+                    # Only a final target that is missing or invalid is unrecoverable.
+                    # Network, authentication, server and rate-limit failures keep retrying.
                     self.publish_retries.pop(run["id"], None)
+                    self.publish_backoff.pop(run["id"], None)
                     await asyncio.to_thread(
                         self.store.execute,
                         "UPDATE runs SET published=1,publish_error=? WHERE id=? AND state=? AND steps=?",
                         (
-                            f"{exc}; not published after {failures} attempts",
+                            f"{exc}; not published after {failures} permanent failures",
                             run["id"],
                             run["state"],
                             run["steps"],
@@ -259,8 +269,9 @@ class Controller:
                     )
                     continue
                 # Honour GitHub's requested wait (rate limits) when it is longer than ours.
-                delay = max(min(300, 5 * 2 ** (failures - 1)), getattr(exc, "retry_after", None) or 0)
-                self.publish_retries[run["id"]] = (failures, time.time() + delay)
+                transient = self.publish_backoff.get(run["id"], (0, 0))[0] + 1
+                delay = max(min(300, 5 * 2 ** (transient - 1)), getattr(exc, "retry_after", None) or 0)
+                self.publish_backoff[run["id"]] = (transient, time.time() + delay)
                 await asyncio.to_thread(
                     self.store.execute,
                     "UPDATE runs SET publish_error=? WHERE id=?",
@@ -281,12 +292,23 @@ class Controller:
     def prune(self):
         self.store.execute("DELETE FROM run_usage WHERE created<?", (time.time() - 90 * 86400,))
         cutoff = time.time() - 14 * 86400
+        # Transient publication failures are retried for the full retention period,
+        # then abandoned explicitly so an unpublished run cannot be retained forever.
+        self.store.execute(
+            """UPDATE runs SET published=1,publish_error=CASE WHEN publish_error=''
+            THEN 'Publication abandoned at retention age'
+            ELSE publish_error||'; publication abandoned at retention age' END
+            WHERE finished<? AND published=0 AND state NOT IN ('queued','running')""",
+            (cutoff,),
+        )
         for run in self.store.rows("SELECT id FROM runs WHERE finished<? AND published=1", (cutoff,)):
             (self.root / "logs" / f"{run['id']}.log").unlink(missing_ok=True)
             shutil.rmtree(self.root / "artifacts" / run["id"], ignore_errors=True)
             self.store.execute("DELETE FROM run_events WHERE run_id=?", (run["id"],))
             self.store.execute("DELETE FROM resource_samples WHERE run_id=?", (run["id"],))
             self.store.execute("DELETE FROM runs WHERE id=?", (run["id"],))
+            self.publish_retries.pop(run["id"], None)
+            self.publish_backoff.pop(run["id"], None)
 
     async def worker(self):
         # Only the exclusive worker service may recover runs and manage containers.

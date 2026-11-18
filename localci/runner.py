@@ -18,6 +18,7 @@ from pathlib import Path
 
 import yaml
 
+from localci import ci_report
 from localci.github import GitHub
 from localci.policy import Blocked, dependabot_pr, github_token_referenced, plan, secret_references
 from localci.review_evidence import (
@@ -47,14 +48,6 @@ OUTPUT_LINE_LIMIT = 100_000
 OVERSIZED_LINE = "[oversized output line omitted]\n"
 CAPTURE_LIMIT = 2_000_000  # Bytes of captured stdout (workflow files, review.patch).
 HELD_BYTES = 16_384  # Trailing base64 lines a log batch may keep back for the next one.
-
-
-# act's own result line is "[<workflow>/<job>] 🏁  Job succeeded". Everything act
-# echoes on behalf of a step follows the job prefix with at least two spaces: output
-# as "[job]   | text", workflow commands as "[job]   ⚙  ..." or "[job]   🚧  ...". So
-# the prefix may not contain "]" followed by two spaces, which keeps job names with
-# brackets working while a step printing "[x] 🏁  Job succeeded" cannot count.
-_JOB_SUCCEEDED = re.compile(r"^\[(?:[^\]\n]|\](?! {2}))+\] 🏁  Job succeeded[ \t\r]*$", re.MULTILINE)
 
 
 def strip_controls(text: str) -> str:
@@ -134,6 +127,15 @@ def _base64_tail(line: str) -> tuple[int, int, int]:
     end = len(line.rstrip(" \t\r").rstrip("="))
     start = len(line[:end].rstrip(_BASE64_ALPHABET))
     return start, end, end - start
+
+
+def _plausible_base64_line(line: str) -> bool:
+    """Only hold a whole base64 payload, not any ordinary line ending in a word."""
+    start, _, length = _base64_tail(line)
+    if length < BASE64_WINDOW:
+        return False
+    payload = line[:start].strip()
+    return not payload or payload == "|" or (payload.startswith("[") and payload.endswith("|"))
 
 
 def _joined_spans(joined: str, offsets: list[int], windows: frozenset[str], short: tuple[str, ...]):
@@ -583,7 +585,10 @@ class Runner:
                         self.review_events.pop("run_finished", None)
                     self.review_events[event["event"]] = event
         if self._lane.get() != "review":
-            self.completed_jobs += len(_JOB_SUCCEEDED.findall(text))
+            for line in text.splitlines():
+                parsed = re.match(r"^\[([^]]+)\] ?(.*)", line)
+                if parsed and ci_report.job_result(parsed[1], parsed[2]) == "success":
+                    self.completed_jobs += 1
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         if self.log_path.exists() and self.log_path.stat().st_size > 8_000_000:
             return
@@ -595,9 +600,20 @@ class Runner:
                 stamp = datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="milliseconds")
                 f.write(f"{stamp} {line}\n")
                 if self.run.get("id") and self.event_count < 50000:
-                    parsed = re.match(r"^\[([^]]+)\]\s*(.*)", line)
+                    # Consume act's single separator only. Extra indentation identifies
+                    # step output and must reach the shared result recognizer intact.
+                    parsed = re.match(r"^\[([^]]+)\] ?(.*)", line)
                     job = parsed[1] if parsed else ""
-                    message = parsed[2] if parsed else line
+                    raw_message = parsed[2] if parsed else line
+                    result = ci_report.job_result(job, raw_message) if self._lane.get() != "review" else None
+                    message = raw_message.lstrip()
+                    if (
+                        not result
+                        and raw_message != message
+                        and re.fullmatch(r"\s*🏁  Job (?:succeeded|failed)\s*", raw_message)
+                    ):
+                        # Keep forged result-looking output distinguishable in the index.
+                        message = raw_message
                     level = (
                         "error"
                         if re.search(
@@ -682,7 +698,7 @@ class Runner:
                 # with its neighbouring lines in one batch instead of in two.
                 keep, kept = 0, 0
                 while hold and keep < len(lines) and kept + len(lines[-1 - keep]) <= HELD_BYTES:
-                    if _base64_tail(lines[-1 - keep].rstrip("\n"))[2] < 4:
+                    if not _plausible_base64_line(lines[-1 - keep].rstrip("\n")):
                         break
                     kept += len(lines[-1 - keep])
                     keep += 1

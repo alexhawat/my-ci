@@ -143,6 +143,7 @@ async def test_publish_comments_retry_without_losing_final_phase(tmp_path):
     controller.github.comment.side_effect = None
     controller.github.comment.reset_mock()
     controller.publish_retries.clear()
+    controller.publish_backoff.clear()
     await controller.publish()
     assert [call.args[1] for call in controller.github.comment.call_args_list] == ["ci", "review"]
     assert "timeout" in controller.github.comment.call_args.args[2]

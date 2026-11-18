@@ -136,6 +136,8 @@ class Store:
         # This connection holds no transaction and is never used for application queries.
         self._journal_connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self._journal_connection.execute("PRAGMA journal_mode=WAL")
+        # A single incomplete paginated result is not proof that a PR disappeared.
+        self._missing_pr_observations: set[str] = set()
 
     def close(self):
         self._journal_connection.close()
@@ -501,8 +503,19 @@ class Store:
 
     def cancel_stale(self, repo: str, prs: list[dict]):
         current = {p["number"]: p for p in prs}
-        for run in self.rows("SELECT * FROM runs WHERE repo=? AND state IN ('queued','running')", (repo,)):
+        active = self.rows("SELECT * FROM runs WHERE repo=? AND state IN ('queued','running')", (repo,))
+        active_ids = {run["id"] for run in active}
+        self._missing_pr_observations.intersection_update(active_ids)
+        for run in active:
             pr = current.get(run["pr"])
+            if not pr:
+                # Pagination can omit an open PR when another PR closes between pages.
+                # Cancel only after a second complete poll also fails to observe it.
+                if run["id"] not in self._missing_pr_observations:
+                    self._missing_pr_observations.add(run["id"])
+                    continue
+            else:
+                self._missing_pr_observations.discard(run["id"])
             if not pr or pr["draft"] or (pr["head"]["sha"], pr["base"]["sha"]) != (run["head"], run["base"]):
                 self.request_cancel(run["id"], "pr_inactive", "PR changed, closed, or became a draft")
 

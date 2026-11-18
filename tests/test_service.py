@@ -77,9 +77,27 @@ def test_stale_runs_cancel_on_any_test_context_change(tmp_path, change):
     if change == "draft":
         updated["draft"] = True
     store.cancel_stale("owner/repo", [] if change == "closed" else [updated])
+    if change == "closed":
+        store.cancel_stale("owner/repo", [])
     row = store.rows("SELECT * FROM runs WHERE id=?", (rid,))[0]
     assert row["cancel"] == 1 and row["state"] == "cancelled"
     assert store.claim() is None
+
+
+def test_one_incomplete_poll_does_not_cancel_a_pr_that_reappears(tmp_path):
+    store = Store(tmp_path / "db")
+    rid = store.enqueue("owner/repo", pr(), {})
+    store.cancel_stale("owner/repo", [])  # Simulated pagination drift.
+    assert store.rows("SELECT state,cancel FROM runs WHERE id=?", (rid,))[0] == {
+        "state": "queued",
+        "cancel": 0,
+    }
+    store.cancel_stale("owner/repo", [pr()])
+    store.cancel_stale("owner/repo", [])
+    assert store.rows("SELECT state,cancel FROM runs WHERE id=?", (rid,))[0]["cancel"] == 0
+    store.cancel_stale("owner/repo", [])  # Two consecutive genuine absences cancel.
+    row = store.rows("SELECT state,cancel,end_reason FROM runs WHERE id=?", (rid,))[0]
+    assert row == {"state": "cancelled", "cancel": 1, "end_reason": "pr_inactive"}
 
 
 def test_backup_restore(tmp_path):
@@ -318,12 +336,13 @@ async def test_status_retries_without_overwriting_newer_attempt(tmp_path):
     assert store.rows("SELECT published FROM runs WHERE id=?", (second,))[0]["published"] == 0
     controller.github.status = AsyncMock(return_value="GitHub commit status via gh login")
     controller.publish_retries.clear()
+    controller.publish_backoff.clear()
     await controller.publish()
     assert store.rows("SELECT published FROM runs WHERE id=?", (second,))[0]["published"] == 1
 
 
-@pytest.mark.parametrize("status,attempts", [(404, 3), (422, 3), (500, 12)])
-async def test_publish_that_cannot_succeed_is_abandoned_so_retention_can_prune_it(tmp_path, status, attempts):
+@pytest.mark.parametrize("status", [404, 410, 422])
+async def test_permanent_final_publication_failures_are_abandoned_after_three_attempts(tmp_path, status):
     from localci.github import GitHubError
 
     controller = Controller(tmp_path)
@@ -334,15 +353,54 @@ async def test_publish_that_cannot_succeed_is_abandoned_so_retention_can_prune_i
     controller.github.status = AsyncMock(
         side_effect=GitHubError(status, "POST", "repos/owner/repo/statuses/x")
     )
-    for attempt in range(1, attempts + 1):
+    for attempt in range(1, 4):
         assert store.rows("SELECT published FROM runs WHERE id=?", (rid,))[0]["published"] == 0
-        controller.publish_retries = {k: (n, 0.0) for k, (n, _) in controller.publish_retries.items()}
+        controller.publish_backoff = {k: (n, 0.0) for k, (n, _) in controller.publish_backoff.items()}
         await controller.publish()
         assert controller.github.status.call_count == attempt
     row = store.rows("SELECT published,publish_error FROM runs WHERE id=?", (rid,))[0]
-    assert row["published"] == 1 and f"not published after {attempts} attempts" in row["publish_error"]
+    assert row["published"] == 1 and "not published after 3 permanent failures" in row["publish_error"]
     await controller.publish()
-    assert controller.github.status.call_count == attempts  # No further requests.
+    assert controller.github.status.call_count == 3  # No further requests.
+
+
+@pytest.mark.parametrize("status", [None, 401, 403, 500, 503])
+async def test_transient_final_publication_failures_never_consume_abandonment_budget(tmp_path, status):
+    from localci.github import GitHubError
+
+    controller = Controller(tmp_path)
+    rid = controller.store.enqueue("owner/repo", pr(), {})
+    controller.store.finish(rid, "failure", "failed")
+    controller.github.request = AsyncMock(return_value=pr())
+    error = RuntimeError("network unavailable") if status is None else GitHubError(status, "POST", "statuses")
+    controller.github.status = AsyncMock(side_effect=error)
+    for attempt in range(1, 21):
+        controller.publish_backoff = {k: (n, 0.0) for k, (n, _) in controller.publish_backoff.items()}
+        await controller.publish()
+        assert controller.github.status.call_count == attempt
+        assert controller.store.rows("SELECT published FROM runs WHERE id=?", (rid,))[0]["published"] == 0
+        assert rid not in controller.publish_retries
+
+
+async def test_pending_failures_do_not_consume_final_permanent_failure_budget(tmp_path):
+    from localci.github import GitHubError
+
+    controller = Controller(tmp_path)
+    rid = controller.store.enqueue("owner/repo", pr(), {})
+    controller.github.status = AsyncMock(side_effect=GitHubError(422, "POST", "statuses"))
+    for _ in range(12):
+        controller.publish_backoff.clear()
+        await controller.publish()
+    assert rid not in controller.publish_retries
+    controller.store.finish(rid, "failure", "failed")
+    controller.github.request = AsyncMock(return_value=pr())
+    for _ in range(2):
+        controller.publish_backoff.clear()
+        await controller.publish()
+        assert controller.store.rows("SELECT published FROM runs WHERE id=?", (rid,))[0]["published"] == 0
+    controller.publish_backoff.clear()
+    await controller.publish()
+    assert controller.store.rows("SELECT published FROM runs WHERE id=?", (rid,))[0]["published"] == 1
 
 
 async def test_publish_backoff_honours_the_wait_github_asks_for(tmp_path):
@@ -360,7 +418,7 @@ async def test_publish_backoff_honours_the_wait_github_asks_for(tmp_path):
     controller.github.request = AsyncMock(return_value=pr())
     controller.github.status = AsyncMock(side_effect=GitHubError(403, "POST", "statuses", retry_after=900.0))
     await controller.publish()
-    assert controller.publish_retries[rid][1] - time.time() > 890  # Not the 5 s first backoff.
+    assert controller.publish_backoff[rid][1] - time.time() > 890  # Not the 5 s first backoff.
     await controller.publish()
     assert controller.github.status.call_count == 1
 
@@ -458,6 +516,22 @@ def test_retry_limit_survives_restart_and_new_revisions_get_fresh_budget(tmp_pat
     store.save_settings({"max_retries": 3})
     assert store.enqueue("owner/repo", pr(), {}, retry=True)
     store.close()
+
+
+def test_retention_prunes_a_run_whose_publication_never_recovered(tmp_path):
+    import time
+
+    controller = Controller(tmp_path)
+    rid = controller.store.enqueue("owner/repo", pr(), {})
+    controller.store.finish(rid, "failure", "failed")
+    controller.publish_backoff[rid] = (20, time.time() + 300)
+    controller.store.execute(
+        "UPDATE runs SET finished=?,publish_error='network unavailable' WHERE id=?",
+        (time.time() - 15 * 86400, rid),
+    )
+    controller.prune()
+    assert not controller.store.rows("SELECT id FROM runs WHERE id=?", (rid,))
+    assert rid not in controller.publish_backoff
 
 
 def test_retention_never_requeues_completed_revisions_or_resets_retry_budget(tmp_path):

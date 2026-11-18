@@ -93,6 +93,7 @@ def test_manual_retry_after_recovery_gets_unique_run_number_and_correct_billing(
     store = Store(tmp_path / "db")
     first = store.enqueue(REPO, pr(), {})
     store.cancel_stale(REPO, [])
+    store.cancel_stale(REPO, [])
     recovered = store.enqueue(REPO, pr(), {})
     store.finish(recovered, "failure", "Checks failed")
     assert store.enqueue(REPO, pr(), {}) is None  # A real failure is never re-run automatically.
@@ -109,6 +110,7 @@ def test_manual_retry_after_recovery_gets_unique_run_number_and_correct_billing(
 def test_reopening_the_database_does_not_bill_recoveries(tmp_path):
     store = Store(tmp_path / "db")
     store.enqueue(REPO, pr(), {})
+    store.cancel_stale(REPO, [])
     store.cancel_stale(REPO, [])
     store.enqueue(REPO, pr(), {})
     store.close()
@@ -132,12 +134,12 @@ def test_stale_cancel_never_finalizes_a_run_claimed_by_a_worker(tmp_path):
 
     def rows_then_worker_claims(sql, args=()):
         result = read(sql, args)
-        if "state IN ('queued','running')" in sql:
-            assert result[0]["state"] == "queued"
+        if "state IN ('queued','running')" in sql and result[0]["state"] == "queued":
             store.claim()  # The worker claims between the stale check's read and its write.
         return result
 
     store.rows = rows_then_worker_claims
+    store.cancel_stale(REPO, [])
     store.cancel_stale(REPO, [])
     store.rows = read
     row = run(store, rid)
