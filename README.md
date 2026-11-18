@@ -101,6 +101,16 @@ For repository-scoped Check Runs, connect a GitHub App with Checks read/write pe
 
 Each provider in a trusted review roster needs its own review-scoped credential binding, using the provider's configured environment index or documented credential name. Credential changes apply to the next execution. A confirmed free-tier HTTP 429 rejection is recorded against its single pending request with zero charged tokens and can proceed to the next configured model with the same shared budget. Completed requests retain their usage; incomplete or ambiguous accounting still stops the review.
 
+Which failures move on to the next model:
+
+- A failure that mergeCraft itself classes as retryable, such as a rate limit (HTTP 429) with or without an error type, falls back through mergeCraft's own handling, as it does for any model.
+- The typed `provider.free-limit` and `provider.no-route` errors additionally fall back when the failing model is the free model `opencode/deepseek-v4.1-flash-free`.
+- Any other error ends the review without trying the next model.
+
+The zero-charge handling of a 429 applies to `opencode/deepseek-v4.1-flash-free` only. A 429 from any other free model is treated as incomplete accounting and stops the review.
+
+A roster that starts with a free model sends the review content to that provider's free endpoint first: the diff, the source ranges the reviewer reads, and CI excerpts, for every enabled repository, private ones included. Free tiers often have different data-retention and training terms from paid API access. Check the provider's terms before putting a free model first for private repositories.
+
 ### Execution limits
 
 Repository settings control per-workflow job parallelism and time limits; selected workflow files run sequentially. Execution settings control simultaneous runs, CPU/memory reservations, and retry budgets. Defaults adapt to detected capacity, and queued runs report when they cannot fit.

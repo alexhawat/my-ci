@@ -47,6 +47,8 @@ if __name__ == "__main__":
 
     # OpenCode reports free-tier limits and missing routes with typed errors.
     # Let those failures reach Go once the usage journal has been reconciled.
+    # This adds to upstream's retryable path, which already moves a rate limit
+    # (typed or not) on to the next model; it does not replace or narrow it.
     stream = '            detail = event.get("error")\n'
     replace_once(
         "agents/opencode.py",

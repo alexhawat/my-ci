@@ -117,6 +117,8 @@ if __name__ == "__main__":
             patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "fixture", "LLM_PROVIDER_2_API_KEY": "fixture"}),
         ):
             asyncio.run(check(root, None, [FREE]))
+            # Untyped, so failover_eligible is False: upstream's retryable path
+            # is what moves a rate limit on to the next model.
             asyncio.run(check(root, {"message": "429 Too Many Requests"}, [FREE, GO]))
             free_limit = {"type": "provider.free-limit", "message": "Free usage limit reached"}
             asyncio.run(check(root, free_limit, [FREE, GO]))
@@ -125,4 +127,7 @@ if __name__ == "__main__":
                 check(root, {"type": "provider.no-route", "message": "Model unavailable"}, [FREE, GO])
             )
             asyncio.run(check(root, {"type": "other", "message": "Model unavailable"}, [FREE]))
+            # Untyped errors: only a rate limit falls back, through upstream's
+            # retryable path (the 429 case above). Anything else ends the review.
+            asyncio.run(check(root, {"message": "Model unavailable"}, [FREE]))
     print("PASS: OpenCode ordered fallback, offline roster credentials and verifier routing")
