@@ -55,7 +55,9 @@ EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b")
 PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net", "users.noreply.github.com")
 # git@github.com is a clone address and the other is the commit co-author trailer's
 # no-reply mailbox; other mailboxes at those domains belong to people.
-PLACEHOLDER_ADDRESSES = ("git@github.com", "noreply@" + "anthropic.com")
+# GitHub's own committer identity on merges and edits made through the web interface.
+GITHUB_COMMITTER = "noreply@" + "github.com"
+PLACEHOLDER_ADDRESSES = ("git@github.com", "noreply@" + "anthropic.com", GITHUB_COMMITTER)
 
 
 def personal_emails(text: str) -> list[str]:
@@ -83,13 +85,58 @@ def git_log(fmt: str) -> str:
     ).stdout
 
 
+# Published before this check covered merge commits; rewriting the default branch
+# would not withdraw it. Listed by commit so nothing else is exempt.
+KNOWN_IDENTITY_EXCEPTIONS = frozenset({"f5f7059e80fc35f92a0353dcff0ffd8cc2c5472f"})
+
+
+def noreply_identity(email: str) -> bool:
+    """A GitHub-provided address: a user's noreply alias, or GitHub's own committer
+    identity on merges and edits made through the web interface."""
+    email = email.casefold()
+    return email.endswith("@users.noreply.github.com") or email == GITHUB_COMMITTER
+
+
+def commits_with_personal_identity(log: str) -> list[str]:
+    exposed = []
+    for line in log.splitlines():
+        commit, author, committer = line.split("\t")
+        if commit in KNOWN_IDENTITY_EXCEPTIONS:
+            continue
+        fields = [
+            name
+            for name, email in (("author", author), ("committer", committer))
+            if not noreply_identity(email)
+        ]
+        if fields:
+            exposed.append(f"{commit[:12]}: {' and '.join(fields)}")
+    return exposed
+
+
 def test_no_personal_paths_or_commit_identities():
     failures = [
         f"{name}: developer path" for name, text in tracked_text().items() if PERSONAL_PATH.search(text)
     ]
-    for line in git_log("%an <%ae>%n%cn <%ce>").splitlines():
-        assert line.endswith("@users.noreply.github.com>"), f"Personal commit identity: {line}"
     assert not failures, "Personal paths in public release:\n" + "\n".join(failures)
+    exposed = commits_with_personal_identity(git_log("%H%x09%ae%x09%ce"))
+    # Names the commit and the field only: the address itself must not reach a public CI log.
+    assert not exposed, "Commits with a non-noreply identity:\n" + "\n".join(exposed)
+
+
+def test_commit_identity_check_names_the_commit_and_never_the_address():
+    personal = "someone@" + "mail.example.invalid"
+    log = "\n".join(
+        [
+            f"{'a' * 40}\t1+user@users.noreply.github.com\t{GITHUB_COMMITTER}",  # Web-interface merge.
+            f"{'b' * 40}\t{personal}\t{GITHUB_COMMITTER}",
+            f"{'c' * 40}\t2+bot@users.noreply.github.com\t{personal}",
+            f"{next(iter(KNOWN_IDENTITY_EXCEPTIONS))}\t{personal}\t{GITHUB_COMMITTER}",
+        ]
+    )
+    exposed = commits_with_personal_identity(log)
+    assert exposed == [f"{'b' * 12}: author", f"{'c' * 12}: committer"]
+    assert personal not in "\n".join(exposed)
+    assert not noreply_identity(GITHUB_COMMITTER + ".example.invalid")
 
 
 def test_commit_messages_hold_no_personal_details():
