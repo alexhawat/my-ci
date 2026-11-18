@@ -18,5 +18,5 @@ settings = RepoSettings.model_validate(
     }
 )
 assert settings.review.ignore_paths == ["**/.env", "**/*.pem", "reports/**"]
-assert PACKET_SCHEMA_VERSION == "1.19.0"
+assert PACKET_SCHEMA_VERSION == "1.21.0"
 print("PASS: consumer ignorePaths configuration and evidence schema supported")

@@ -174,8 +174,23 @@ class Store:
                 db.close()
 
     def rows(self, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
-        with self.connect(write=False) as db:
-            return [dict(r) for r in db.execute(sql, args)]
+        # WAL reader lock races can return SQLITE_PROTOCOL despite busy_timeout.
+        # Retry only SELECTs on a fresh connection, never ambiguous mutations or
+        # unrelated database failures. A metadata poll must survive a brief race.
+        attempt = 0
+        while True:
+            try:
+                with self.connect(write=False) as db:
+                    return [dict(r) for r in db.execute(sql, args)]
+            except sqlite3.OperationalError as exc:
+                if (
+                    getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_PROTOCOL
+                    or not sql.lstrip().upper().startswith("SELECT ")
+                    or attempt >= 4
+                ):
+                    raise
+                time.sleep(0.02 * 2**attempt)
+                attempt += 1
 
     def execute(self, sql: str, args: tuple = ()):
         with self.connect() as db:

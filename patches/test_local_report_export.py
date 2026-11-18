@@ -2,17 +2,12 @@
 
 import json
 import tempfile
-import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
+from mergecraft.localci_report import export
 from mergecraft.utils.run_bounds import BudgetTracker, RunBounds
 
-source = Path("/opt/mergecraft/src/mergecraft/review/offline_agent.py").read_text()
-assert "max_attempts=3," in source
-start = source.index("        # Local CI preserves only accounting")
-end = source.index("        # End local CI accounting export", start)
-code = compile(textwrap.dedent(source[start:end]), "<localci-accounting>", "exec")
 tracker = BudgetTracker(
     RunBounds(
         token_budget=1000,
@@ -37,7 +32,14 @@ with tempfile.TemporaryDirectory() as folder:
         ),
         "markdown_output": "Transport final output",
     }
-    exec(code, context)
+    export(
+        context["tmpdir"],
+        context["budget_tracker"],
+        context["_localci_usages"],
+        context["timing_payload"],
+        context["tool_state"],
+        context["markdown_output"],
+    )
     data = json.loads((Path(folder) / "localci-metrics.json").read_text())
     assert "123 used" in data["tokens"] and "$0.010000" in data["cost"]
     assert data["attempts"] == 1 and data["timing"] == "agent 4s"
@@ -45,7 +47,14 @@ with tempfile.TemporaryDirectory() as folder:
     context["tool_state"].terminal_submission = None
 
     context["_localci_usages"] = [None, SimpleNamespace(cost_usd=0.01)]
-    exec(code, context)
+    export(
+        context["tmpdir"],
+        context["budget_tracker"],
+        context["_localci_usages"],
+        context["timing_payload"],
+        context["tool_state"],
+        context["markdown_output"],
+    )
     data = json.loads((Path(folder) / "localci-metrics.json").read_text())
     assert data["tokens"].startswith("Unavailable") and data["cost"].startswith("Unavailable")
     assert data["attempts"] == 2

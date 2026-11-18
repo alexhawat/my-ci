@@ -82,6 +82,10 @@ These are read from `.env`. The following are internal container paths and image
 
 Do not place credentials in `.env.example`, Compose, workflow YAML, or documentation. `login.sh` copies the current GitHub CLI token into the ignored, mode-0600 `runtime/github-token` file without printing it or placing it in command arguments.
 
+### Review token ceiling
+
+Repository settings expose an optional **Review token ceiling** (1–100,000,000). This is an operator-controlled override: the worker writes it into its trusted review config with zero tolerance and a flat round multiplier, and pins the same value in the review process environment. Other base settings and all review gates remain intact. Blank preserves the trusted base budget. PR-head config cannot change its own review policy. Settings are snapshotted per run; save and Retry to apply a new ceiling. The startup log identifies the operator override. Usage arrives after each response, so the final in-flight response may exceed the limit.
+
 ### Repository credentials
 
 The dashboard separates two credential scopes:
@@ -117,7 +121,15 @@ Review configuration comes from the trusted base revision. PR-authored mergeCraf
 
 Each review has a fixed USD 5 provider budget and a per-repository timeout of at most 50 minutes (the default). Model calls use your configured provider and its charges/limits. CI and review use separate containers and credential namespaces, but host-root-equivalent PR code can defeat that separation. Findings below the configured severity threshold remain visible without failing an otherwise completed review; execution failures and blocking findings still fail closed.
 
-`scripts/build_review.sh` builds the pinned upstream runtime from the public mergeCraft source revision and then applies the local compatibility patches. It requires no private container registry or provider credential.
+`scripts/build_review.sh` builds the published, signature-verified mergeCraft image for source `6dc67ab3ce873a4b313553d5e1ac9e469295eb03`, pinned by digest, verifies its embedded revision, and applies and tests the local compatibility patches. No private registry authentication or provider credential is required.
+
+Native per-step budget enforcement charges streamed usage once while numeric telemetry retains the final in-flight response. A run-scoped plugin journals numeric cumulative usage for primary and compaction requests; monotonic deltas use upstream enforcement, and normal CLI primary events are reconciled rather than charged twice. Missing, incomplete, decreasing, or mismatched accounting stops the review. Journal request IDs include a process-unique prefix for safe session resumption, and no prompt, response, source, or credential content is journaled. Evidence schemas 1.13.0, 1.19.0, and 1.21.0 remain bound to the recorded reviewer revision and digest.
+
+The confined `read_batch` tool returns up to eight related source or authoritative-diff ranges per model turn. Batches contain at most 24,000 UTF-8 source bytes and 1,000 source lines, and final metadata plus source is validated below 40,000 bytes and 1,100 physical lines before coverage is credited. `@diff` reads the authoritative complete diff; repository paths use the existing Git guards for tracked HEAD files, and absolute paths are limited to guarded Git exports. Native file reads are disabled in the local reviewer. Only complete returned lines count as read, truncation includes a continuation, and budget notices precede source. Shell, approval, coverage, and completion policies remain unchanged.
+
+Automatic foreground compaction retains recent context and all unresolved findings, evidence, unread ranges, and verification requirements. Summary calls and cached input count toward the same operator ceiling. Full source remains available for targeted rereads.
+
+Metadata SELECTs reopen their SQLite connection and retry only transient `SQLITE_PROTOCOL` WAL-lock races up to four times with bounded backoff. Other database failures and exhausted retries still fail; mutations are never replayed.
 
 ## Logs, artifacts, and retention
 
