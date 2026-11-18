@@ -38,15 +38,21 @@ def test_select_reopens_connection_after_protocol_race(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "sql,code,expected_attempts",
+    "sql,options,code,expected_attempts",
     [
-        ("SELECT 1", sqlite3.SQLITE_PROTOCOL, 5),
-        ("SELECT 1", sqlite3.SQLITE_IOERR, 1),
-        ("DELETE FROM runs RETURNING id", sqlite3.SQLITE_PROTOCOL, 1),
+        ("SELECT 1", {}, sqlite3.SQLITE_PROTOCOL, 5),
+        ("select\n  1", {}, sqlite3.SQLITE_PROTOCOL, 5),
+        ("SELECT 1", {}, sqlite3.SQLITE_IOERR, 1),
+        ("DELETE FROM runs RETURNING id", {}, sqlite3.SQLITE_PROTOCOL, 1),
+        ("SELECTED", {}, sqlite3.SQLITE_PROTOCOL, 1),
+        # WITH can front a mutation, so only the caller can vouch for it.
+        ("WITH x AS (SELECT 1) SELECT * FROM x", {}, sqlite3.SQLITE_PROTOCOL, 1),
+        ("WITH x AS (SELECT 1) SELECT * FROM x", {"readonly": True}, sqlite3.SQLITE_PROTOCOL, 5),
+        ("SELECT 1", {"readonly": False}, sqlite3.SQLITE_PROTOCOL, 1),
     ],
 )
 def test_read_retries_are_bounded_and_do_not_replay_writes(
-    tmp_path, monkeypatch, sql, code, expected_attempts
+    tmp_path, monkeypatch, sql, options, code, expected_attempts
 ):
     store = Store(tmp_path / "ci.db")
     attempts = []
@@ -58,9 +64,34 @@ def test_read_retries_are_bounded_and_do_not_replay_writes(
         yield  # pragma: no cover - defines a failing context manager
 
     monkeypatch.setattr(store, "connect", fail)
+    monkeypatch.setattr("localci.store.time.sleep", lambda _seconds: None)
     with pytest.raises(sqlite3.OperationalError):
-        store.rows(sql)
+        store.rows(sql, **options)
     assert len(attempts) == expected_attempts
+    store.close()
+
+
+async def test_read_retry_never_sleeps_on_the_event_loop(tmp_path, monkeypatch):
+    store = Store(tmp_path / "ci.db")
+    original = store.connect
+    attempts, sleeps = [], []
+
+    @contextmanager
+    def flaky(*, write=True):
+        attempts.append(write)
+        if len(attempts) % 3:
+            raise protocol_error()
+        with original(write=write) as db:
+            yield db
+
+    monkeypatch.setattr(store, "connect", flaky)
+    monkeypatch.setattr("localci.store.time.sleep", sleeps.append)
+    # Called directly on the loop, as some request handlers do: retried without blocking it.
+    assert store.rows("SELECT 42 AS answer") == [{"answer": 42}]
+    assert len(attempts) == 3 and sleeps == []
+    # In a worker thread the retry backs off.
+    assert await asyncio.to_thread(store.rows, "SELECT 42 AS answer") == [{"answer": 42}]
+    assert len(attempts) == 6 and sleeps == [0.02, 0.04]
     store.close()
 
 

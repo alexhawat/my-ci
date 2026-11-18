@@ -31,6 +31,32 @@ from localci.store import Store
 from localci.telemetry import sample_resources
 
 
+def apply_review_token_ceiling(review_config, token_ceiling: int | None) -> None:
+    """Cap the trusted base review config at the operator's token ceiling.
+
+    Other keys of `runBounds`, `review` and `review.roundBudgets` are kept. A
+    section that is not a mapping raises ValueError with a message for the operator.
+    """
+
+    def section(parent, key, path):
+        value = parent.get(key)
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"Base .mergecraft/config.yaml is invalid: `{path}` must be a mapping")
+        return value
+
+    if not isinstance(review_config, dict):
+        raise ValueError("Base .mergecraft/config.yaml is invalid: the top level must be a mapping")
+    if token_ceiling is None:
+        return
+    run_bounds = section(review_config, "runBounds", "runBounds")
+    review = section(review_config, "review", "review")
+    round_budgets = section(review, "roundBudgets", "review.roundBudgets")
+    review_config["runBounds"] = {**run_bounds, "tokenBudget": token_ceiling, "tokenBudgetTolerance": 0}
+    review_config["review"] = {**review, "roundBudgets": {**round_budgets, "multipliers": [1.0]}}
+
+
 class Cancelled(RuntimeError):
     pass
 
@@ -1254,16 +1280,12 @@ class Runner:
                         # Only the operator's snapshotted repo setting can override
                         # the trusted base budget; never load this from the PR head.
                         token_ceiling = config.get("review_token_ceiling")
-                        if token_ceiling is not None:
-                            review_config["runBounds"] = {
-                                **(review_config.get("runBounds") or {}),
-                                "tokenBudget": token_ceiling,
-                                "tokenBudgetTolerance": 0,
-                            }
-                            review_config["review"] = {
-                                **(review_config.get("review") or {}),
-                                "roundBudgets": {"multipliers": [1.0]},
-                            }
+                        try:
+                            apply_review_token_ceiling(review_config, token_ceiling)
+                        except ValueError as exc:
+                            blockers.append(str(exc))
+                            await asyncio.to_thread(self.step, "mergeCraft", "blocked", blockers[-1])
+                            return
                         review_config.update(
                             push="disabled",
                             shell="disabled",

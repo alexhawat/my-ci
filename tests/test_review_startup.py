@@ -8,7 +8,7 @@ from localci.github import GitHub
 from localci.policy import dependabot_pr
 from localci.reporting import comment_body, reports
 from localci.review_evidence import classify_review, configuration_diagnostic
-from localci.runner import Runner
+from localci.runner import Runner, apply_review_token_ceiling
 from localci.store import Store
 
 
@@ -193,7 +193,7 @@ async def test_operator_ceiling_reaches_review_container_without_trusting_head(
             assert args[-1] == "b" * 40 + ":.mergecraft/config.yaml"
             return (
                 0,
-                "runBounds: {tokenBudget: 2000000, tokenBudgetTolerance: 0.1, toolCallBudget: 123}\nreview: {ignorePaths: [private/**], roundBudgets: {multipliers: [2.0]}}\n",
+                "runBounds: {tokenBudget: 2000000, tokenBudgetTolerance: 0.1, toolCallBudget: 123}\nreview: {ignorePaths: [private/**], roundBudgets: {multipliers: [2.0], carryOver: true}}\n",
             )
         if args[:2] == ("docker", "create"):
             env = Path(args[args.index("--env-file") + 1])
@@ -221,4 +221,33 @@ async def test_operator_ceiling_reaches_review_container_without_trusting_head(
         assert config["runBounds"]["tokenBudget"] == ceiling
         assert config["runBounds"]["tokenBudgetTolerance"] == 0
         assert config["review"]["roundBudgets"]["multipliers"] == [1.0]
+        # Other trusted settings next to the overridden ones are kept.
+        assert config["review"]["roundBudgets"]["carryOver"] is True
         assert f"MERGECRAFT_TOKEN_BUDGET={ceiling}\n" in observed["env"]
+
+
+@pytest.mark.parametrize(
+    "config,ceiling,path",
+    [
+        (["not", "a", "mapping"], None, "top level"),
+        ({"runBounds": [1]}, 1000, "`runBounds`"),
+        ({"review": "strict"}, 1000, "`review`"),
+        ({"review": {"roundBudgets": [2.0]}}, 1000, "`review.roundBudgets`"),
+    ],
+)
+def test_malformed_base_review_config_is_a_clear_configuration_error(config, ceiling, path):
+    with pytest.raises(ValueError, match="Base .mergecraft/config.yaml is invalid") as error:
+        apply_review_token_ceiling(config, ceiling)
+    assert path in str(error.value)
+
+
+def test_token_ceiling_leaves_config_alone_when_unset_and_fills_missing_sections():
+    config = {"runBounds": [1], "review": "strict"}  # Not this function's concern without a ceiling.
+    apply_review_token_ceiling(config, None)
+    assert config == {"runBounds": [1], "review": "strict"}
+    config = {"runBounds": None}
+    apply_review_token_ceiling(config, 1000)
+    assert config == {
+        "runBounds": {"tokenBudget": 1000, "tokenBudgetTolerance": 0},
+        "review": {"roundBudgets": {"multipliers": [1.0]}},
+    }
