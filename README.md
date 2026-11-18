@@ -159,6 +159,10 @@ Tests use temporary databases, synthetic workflow fixtures, and mocked GitHub en
 
 See [TESTING.md](TESTING.md) for validation guidance and [SECURITY.md](SECURITY.md) before deployment.
 
+## CI and review of this repository
+
+Every pull request runs `CI` and `CodeQL`, and pull requests from branches in this repository are reviewed by [mergeCraft](https://github.com/alexhawat/mergeCraft) with Claude Sonnet 5.5. Who can push, merge and trigger reviews, and the one-time settings that back it up, are in [docs/repository-security.md](docs/repository-security.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -1,0 +1,69 @@
+# CodeQL code scanning. Free for public repositories.
+#
+# Runs on `pull_request`, so a fork PR gets a read-only token: its analysis
+# runs but cannot upload results. The language list is detected per ref, so
+# the workflow works before and after the application code lands on main.
+name: CodeQL
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  detect:
+    name: CodeQL (detect languages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      languages: ${{ steps.languages.outputs.languages }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: List languages present on this ref
+        id: languages
+        run: |
+          set -euo pipefail
+          languages='"actions"'
+          if [ -n "$(git ls-files '*.py' | head -n 1)" ]; then
+            languages="${languages},\"python\""
+          fi
+          if [ -n "$(git ls-files '*.js' '*.mjs' '*.ts' | head -n 1)" ]; then
+            languages="${languages},\"javascript-typescript\""
+          fi
+          echo "languages=[${languages}]" >> "${GITHUB_OUTPUT}"
+
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.detect.outputs.languages) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}
