@@ -22,6 +22,17 @@ Privacy release tests reject personal paths, non-public commit identities, commo
 
 Build the review runtime from its pinned public source with `scripts/build_review.sh`. The script needs network access for source and dependencies, but no private registry login or model-provider credential.
 
+On a Linux Docker host with native ARM64 support or ARM64 emulation enabled, verify the ARM64 review image and its warmed analyzers with:
+
+```sh
+REVIEW_PLATFORM=linux/arm64 REVIEW_IMAGE=localci-review:arm64-check bash scripts/build_review.sh
+docker image inspect --format '{{.Os}}/{{.Architecture}}' localci-review:arm64-check
+docker run --rm --platform linux/arm64 --network none --user mergecraft --entrypoint python \
+  localci-review:arm64-check /opt/localci/test_review_analyzers.py linux-arm64
+```
+
+The architecture output should be `linux/arm64`. The offline check refuses to run as root, validates the binary architecture of TruffleHog, OSV-Scanner and `semgrep-core`, checks the TruffleHog and OSV-Scanner versions, runs Semgrep against a local fixture, and exercises platform selection, catalog provenance, and checksum rejection. Managed analyzers outside the warm-up list retain on-demand provisioning. This check covers the review image. Full deployment and the jobs image require an x86-64 host.
+
 Live GitHub reporting and paid provider reviews are optional acceptance checks, not prerequisites for the unit suite. Use dedicated test repositories and narrow credentials if you choose to run them.
 
 ## Compatibility limits

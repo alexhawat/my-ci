@@ -55,7 +55,9 @@ EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b")
 PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net", "users.noreply.github.com")
 # git@github.com is a clone address and the other is the commit co-author trailer's
 # no-reply mailbox; other mailboxes at those domains belong to people.
-PLACEHOLDER_ADDRESSES = ("git@github.com", "noreply@" + "anthropic.com")
+# GitHub's own committer identity on merges and edits made through the web interface.
+GITHUB_COMMITTER = "noreply@" + "github.com"
+PLACEHOLDER_ADDRESSES = ("git@github.com", "noreply@" + "anthropic.com", GITHUB_COMMITTER)
 
 
 def personal_emails(text: str) -> list[str]:
@@ -83,21 +85,88 @@ def git_log(fmt: str) -> str:
     ).stdout
 
 
+# Published before this check covered merge commits; rewriting the default branch
+# would not withdraw it. Listed by commit so nothing else is exempt.
+KNOWN_IDENTITY_EXCEPTIONS = frozenset({"f5f7059e80fc35f92a0353dcff0ffd8cc2c5472f"})
+
+
+def noreply_identity(email: str) -> bool:
+    """A GitHub-provided address: a user's noreply alias, or GitHub's own committer
+    identity on merges and edits made through the web interface."""
+    email = email.casefold()
+    return email.endswith("@users.noreply.github.com") or email == GITHUB_COMMITTER
+
+
+def commits_with_personal_identity(log: str) -> list[str]:
+    exposed = []
+    for line in log.splitlines():
+        commit, author, committer = line.split("\t")
+        if commit in KNOWN_IDENTITY_EXCEPTIONS:
+            continue
+        fields = [
+            name
+            for name, email in (("author", author), ("committer", committer))
+            if not noreply_identity(email)
+        ]
+        if fields:
+            exposed.append(f"{commit[:12]}: {' and '.join(fields)}")
+    return exposed
+
+
 def test_no_personal_paths_or_commit_identities():
     failures = [
         f"{name}: developer path" for name, text in tracked_text().items() if PERSONAL_PATH.search(text)
     ]
-    for line in git_log("%an <%ae>%n%cn <%ce>").splitlines():
-        assert line.endswith("@users.noreply.github.com>"), f"Personal commit identity: {line}"
     assert not failures, "Personal paths in public release:\n" + "\n".join(failures)
+    exposed = commits_with_personal_identity(git_log("%H%x09%ae%x09%ce"))
+    # Names the commit and the field only: the address itself must not reach a public CI log.
+    assert not exposed, "Commits with a non-noreply identity:\n" + "\n".join(exposed)
+
+
+def test_commit_identity_check_names_the_commit_and_never_the_address():
+    personal = "someone@" + "mail.example.invalid"
+    log = "\n".join(
+        [
+            f"{'a' * 40}\t1+user@users.noreply.github.com\t{GITHUB_COMMITTER}",  # Web-interface merge.
+            f"{'b' * 40}\t{personal}\t{GITHUB_COMMITTER}",
+            f"{'c' * 40}\t2+bot@users.noreply.github.com\t{personal}",
+            f"{next(iter(KNOWN_IDENTITY_EXCEPTIONS))}\t{personal}\t{GITHUB_COMMITTER}",
+        ]
+    )
+    exposed = commits_with_personal_identity(log)
+    assert exposed == [f"{'b' * 12}: author", f"{'c' * 12}: committer"]
+    assert personal not in "\n".join(exposed)
+    assert not noreply_identity(GITHUB_COMMITTER + ".example.invalid")
+
+
+# Dependabot signs off every commit with GitHub's support mailbox. Only that exact
+# trailer line is dropped; the mailbox anywhere else is still reported.
+DEPENDABOT_SIGNOFF = "Signed-off-by: dependabot[bot] <support@" + "github.com>"
+
+
+def without_dependabot_signoff(messages: str) -> str:
+    return "\n".join(line for line in messages.splitlines() if line != DEPENDABOT_SIGNOFF)
 
 
 def test_commit_messages_hold_no_personal_details():
-    messages = git_log("%B")
+    messages = without_dependabot_signoff(git_log("%B"))
     failures = [f"email: {address}" for address in personal_emails(messages)]
     failures += [f"developer path: {match.group(0)}" for match in PERSONAL_PATH.finditer(messages)]
     failures += private_network_names(messages)  # Tailnet names and addresses included.
     assert not failures, "Personal details in commit messages:\n" + "\n".join(failures)
+
+
+def test_only_the_exact_dependabot_signoff_is_exempt():
+    mailbox = "support@" + "github.com"
+    message = f"Bump x from 1 to 2\n\n{DEPENDABOT_SIGNOFF}\n"
+    assert not personal_emails(without_dependabot_signoff(message))
+    for line in (
+        f"Signed-off-by: someone <{mailbox}>",
+        f"Contact {mailbox}",
+        f"  {DEPENDABOT_SIGNOFF}",
+        f"{DEPENDABOT_SIGNOFF} and someone@" + "mail.example.invalid",
+    ):
+        assert personal_emails(without_dependabot_signoff(f"subject\n\n{line}\n")), line
 
 
 def test_privacy_patterns_flag_concrete_values_only():

@@ -1,0 +1,8 @@
+# False positives in history, listed by gitleaks fingerprint
+# (commit:file:rule:line). None of these is a credential.
+
+# Fingerprint of Google's public Linux package signing key.
+26c27993ccb4e39f5a30a93c4f13a98ee0f45ab1:Dockerfile.jobs:generic-api-key:12
+# Fixture-only values in the log redaction tests.
+b0cf2ed891dfcfbf2440197ec640a8ef4d958adb:tests/test_runner_regressions.py:generic-api-key:959
+b0cf2ed891dfcfbf2440197ec640a8ef4d958adb:tests/test_runner_regressions.py:generic-api-key:1024
