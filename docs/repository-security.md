@@ -68,6 +68,15 @@ an untrusted run can only conclude `neutral`, which the workflow counts as
 blocking. `full` lets a pull request from a branch in this repository reach
 `success`. It does not apply to forks.
 
+`review.coverage.onIncomplete` is `warn`. mergeCraft's default ends a run
+`inconclusive`, which also yields `neutral`, whenever a changed hunk is not
+recorded as read. In this setup no read is recorded at all: every run reports
+0 hunks covered and 0 files read, although the reviewer is handed the full
+diff. With the default the check could never pass. `warn` keeps the reviewer's
+verdict and reports the gap in the run record. The cost is that a passing
+check no longer proves that every changed hunk was read; it rests on the
+reviewer's verdict and findings. A blocking finding still fails the check.
+
 ## Settings that live outside the tree
 
 These cannot be set from a pull request. Do them once, in this order.
