@@ -103,11 +103,9 @@ Each provider in a trusted review roster needs its own review-scoped credential 
 
 Which failures move on to the next model:
 
-- A failure that mergeCraft itself classes as retryable, such as a rate limit (HTTP 429) with or without an error type, falls back through mergeCraft's own handling, as it does for any model.
-- The typed `provider.free-limit` and `provider.no-route` errors additionally fall back when the failing model is the free model `opencode/deepseek-v4.1-flash-free`.
-- Any other error ends the review without trying the next model.
-
-The zero-charge handling of a 429 applies to `opencode/deepseek-v4.1-flash-free` only. A 429 from any other free model is treated as incomplete accounting and stops the review.
+- A rate limit (HTTP 429) falls back only on the free model `opencode/deepseek-v4.1-flash-free`, and only when the rejected request is that session's only outstanding request. It is then recorded with zero charged tokens.
+- The typed `provider.free-limit` and `provider.no-route` errors also fall back when the failing model is that free model.
+- Any other error ends the review without trying the next model. That includes a 429 from any other model, paid or free, and a 429 that arrives while several requests are outstanding: both are incomplete accounting and stop the review.
 
 A roster that starts with a free model sends the review content to that provider's free endpoint first: the diff, the source ranges the reviewer reads, and CI excerpts, for every enabled repository, private ones included. Free tiers often have different data-retention and training terms from paid API access. Check the provider's terms before putting a free model first for private repositories.
 
