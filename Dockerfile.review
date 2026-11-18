@@ -1,4 +1,9 @@
-FROM ghcr.io/alexhawat/mergecraft@sha256:8403a146bd7b6debc778652731a31df2af0280db0bdb8f68b41dd335ac9d8ddc
+# The published reviewer image, pinned by digest. It exists for linux/amd64 only; for
+# linux/arm64, scripts/build_review.sh passes a base built from the same public
+# source revision. Either way the revision check below must hold.
+ARG BASE_IMAGE=ghcr.io/alexhawat/mergecraft@sha256:8403a146bd7b6debc778652731a31df2af0280db0bdb8f68b41dd335ac9d8ddc
+FROM ${BASE_IMAGE}
+ARG TARGETARCH
 USER root
 RUN python - <<'CHECK'
 from mergecraft import _build_metadata
@@ -17,9 +22,12 @@ RUN --network=none python /opt/localci/test_mergecraft_opencode_diagnostics.py
 RUN --network=none python /opt/localci/test_opencode_websearch.py
 # Image layers are immutable; every review gets its own disposable cache copy.
 ENV XDG_CACHE_HOME=/home/mergecraft/.cache
+COPY patches/mergecraft_analyzer_platform.patch /tmp/localci-analyzer-platform.patch
+RUN git -C /opt/mergecraft apply --no-index /tmp/localci-analyzer-platform.patch && rm /tmp/localci-analyzer-platform.patch
 COPY patches/warm_review_analyzers.py /opt/localci/warm_review_analyzers.py
-RUN python /opt/localci/warm_review_analyzers.py && chown -R mergecraft:mergecraft /home/mergecraft/.cache
-RUN --network=none su -s /bin/sh mergecraft -c 'python /opt/localci/warm_review_analyzers.py'
+RUN python /opt/localci/warm_review_analyzers.py "linux-${TARGETARCH}" && chown -R mergecraft:mergecraft /home/mergecraft/.cache
+COPY patches/test_review_analyzers.py /opt/localci/test_review_analyzers.py
+RUN --network=none su -s /bin/sh mergecraft -c "python /opt/localci/test_review_analyzers.py linux-${TARGETARCH}"
 COPY patches/localci_report.py /opt/mergecraft/src/mergecraft/localci_report.py
 COPY patches/mergecraft_local_report.py /tmp/localci-report-patch.py
 RUN python /tmp/localci-report-patch.py && rm /tmp/localci-report-patch.py
