@@ -8,10 +8,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from mergecraft.localci_git_batch import git_batch_tool
 from mergecraft.localci_profile import invoke
-from mergecraft.mcp.git import _git_show_preview
+from mergecraft.mcp.git import _git_show_result
 from mergecraft.mcp.tool_state import init_tool_state
 from mergecraft.utils.run_bounds import BudgetTracker, RunBounds
 
@@ -62,8 +63,11 @@ async def main():
         data = json.loads(result.content[0]["text"])
         assert len(data["results"]) == 2 and not any(r["isError"] for r in data["results"])
         path = Path(json.loads(data["results"][0]["content"][0]["text"])["outputPath"])
-        assert path.read_text() == content and path.is_relative_to(root / "evidence")
-        assert "line 119" in _git_show_preview(str(path)) and "truncated" in _git_show_preview(str(path))
+        assert path.read_text() == content and path.is_relative_to(root)
+        assert (
+            "line 119" in _git_show_result(str(path))["output"]
+            and "truncated" in _git_show_result(str(path))["output"]
+        )
         guards = await tool.execute(
             {
                 "requests": [
@@ -79,10 +83,15 @@ async def main():
         rows = [json.loads(line) for line in (root / "profile.jsonl").read_text().splitlines()]
         assert rows[0]["batch_size"] == 2 and rows[0]["seconds"] >= 0
         assert "sample.txt" not in json.dumps(rows) and "line 119" not in json.dumps(rows)
-        opencode = importlib.import_module("mergecraft.agents.opencode")
+        opencode = importlib.import_module("mergecraft.agents.opencode_config")
         allows = opencode._build_review_mode_read_allowlist(repo, root / "evidence")
         assert allows[str(root / "evidence") + "/**"] == "allow"
         assert allows[str(repo) + "/.git/**"] == "deny"
+        with (
+            patch.object(opencode, "_checkout_root", return_value=repo),
+            patch.object(opencode, "evidence_dir", return_value=root / "evidence"),
+        ):
+            assert opencode._build_review_mode_permissions(ctx)["read"] == "deny"
         print(
             "Batch reads, full exports, original mutation/config guards, budgets and metadata-only timing passed"
         )

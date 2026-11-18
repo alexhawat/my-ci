@@ -147,7 +147,7 @@ def bound_packet(run: dict, directory: Path):
     path = directory / "mergecraft-evidence.json"
     packet = read_json(path, 10_000_000)
     runtime = read_json(directory / "mergecraft-runtime.json", 100_000)
-    if not isinstance(packet, dict) or packet.get("schema_version") not in {"1.13.0", "1.19.0"}:
+    if not isinstance(packet, dict) or packet.get("schema_version") not in {"1.13.0", "1.19.0", "1.21.0"}:
         raise ValueError("Unsupported or missing evidence schema")
     if (
         not isinstance(runtime, dict)

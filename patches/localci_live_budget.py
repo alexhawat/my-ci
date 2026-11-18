@@ -40,6 +40,8 @@ class LiveBudget:
         self.duplicates = 0
         self.totals = dict(input=0, output=0, reasoning=0, cache_read=0, cache_write=0)
         self.error = None
+        self.journal = None
+        self.journal_error_type = ""
 
     @staticmethod
     def _fields(tokens):
@@ -87,47 +89,22 @@ class LiveBudget:
         self.seen.add(identity)
         return True
 
-    def charge(self, value, usage, previous):
+    def observe(self, value, stop):
+        """Persist numeric consumption; upstream alone enforces and charges limits."""
         if value.get("type") != "step_finish" or not isinstance(
             (value.get("part") or {}).get("tokens"), dict
         ):
             return
         fields = self._fields(value["part"]["tokens"])
         if any(v is None for v in fields.values()):
-            self._reject_counters()
-            return
+            raise ValueError("Invalid provider token counters")
         if not _valid_cost(value["part"].get("cost")):
-            self._reject_counters("cost", "cost")
-            return
+            raise ValueError("Invalid provider cost")
         self.steps += 1
         for key, number in fields.items():
             self.totals[key] += number
-        # The adapter's counters are disjoint in OpenCode 2.2.5. Cached
-        # input still counts as processed tokens, independently of its price.
-        count = usage.input_tokens + usage.output_tokens - previous[0]
-        cost = (usage.cost_usd or 0) - previous[1]
-        tokens_before, cost_before = self.tracker.tokens_used, self.tracker.cost_used
-        try:
-            self.tracker.record_tokens(count, phase="opencode_step")
-            if cost > 0:
-                self.tracker.record_cost(cost)
-        except BudgetExhausted as exc:
-            # These tokens were already consumed, even when the upstream
-            # admission-oriented tracker rejects the over-ceiling increment.
-            missing = tokens_before + count - self.tracker.tokens_used
-            if missing > 0:
-                self.tracker.tokens_used += missing
-                self.tracker.phase_totals["opencode_step"] += missing
-            self.tracker.cost_used = max(self.tracker.cost_used, cost_before + max(0, cost))
-            actual = self.prior_tokens + sum(self.totals.values())
-            self.error = BudgetExhausted(
-                exc.kind,
-                f"Live {exc.kind} budget stopped OpenCode after step {self.steps}: "
-                f"{actual} reported tokens; ceiling {self.tracker.bounds.token_ceiling}. "
-                "Usage arrives after each response, so the final in-flight response can exceed the limit; "
-                "no further model turn or fallback is permitted. " + str(exc),
-            )
-            self.tracker.last_exhausted = self.error
+        if stop:
+            self.error = BudgetExhausted("token", stop)
         event("usage_step", step=self.steps, **fields, total=sum(self.totals.values()))
         self.save()
 
@@ -139,14 +116,21 @@ class LiveBudget:
         data = {
             "schema_version": 1,
             "steps": self.steps,
+            "compaction_steps": self.journal.compactions if self.journal else 0,
+            "usage_source": "native_session_journal" if self.journal else "cli_step_finish",
             "duplicates_ignored": self.duplicates,
             "tokens": self.totals,
             "total_tokens": self.prior_tokens + sum(self.totals.values()),
             "prior_attempt_tokens": self.prior_tokens,
             "target": self.tracker.bounds.token_budget,
             "ceiling": self.tracker.bounds.token_ceiling,
-            "stopped": self.error is not None,
-            "reason": str(self.error) if self.error else "",
+            "stopped": self.error is not None or bool(self.journal_error_type),
+            "reason": str(self.error)
+            if self.error
+            else "Complete model usage unavailable"
+            if self.journal_error_type
+            else "",
+            "accounting_error_type": self.journal_error_type,
         }
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(data))

@@ -32,6 +32,7 @@ class RepoConfig(BaseModel):
     variables: dict[str, str] = Field(default_factory=dict)
     timeout: int = Field(default=7200, ge=60, le=14400)
     review_timeout: int = Field(default=3000, ge=60, le=3000)
+    review_token_ceiling: int | None = Field(default=None, strict=True, ge=1, le=100_000_000)
     # Bot-authored PRs carry third-party content; they wait for an operator unless enabled.
     run_bot_prs: bool = False
 
