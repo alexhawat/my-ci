@@ -99,6 +99,8 @@ The optional host GitHub login grants CI jobs all permissions of that login; wor
 
 For repository-scoped Check Runs, connect a GitHub App with Checks read/write permission and an RSA private key. App credentials are not passed to CI or review containers, but they are stored in the data volume, which host-root-equivalent PR code can read.
 
+Each provider in a trusted review roster needs its own review-scoped credential binding, using the provider's configured environment index or documented credential name. Credential changes apply to the next execution. A confirmed free-tier HTTP 429 rejection is recorded against its single pending request with zero charged tokens and can proceed to the next configured model with the same shared budget. Completed requests retain their usage; incomplete or ambiguous accounting still stops the review.
+
 ### Execution limits
 
 Repository settings control per-workflow job parallelism and time limits; selected workflow files run sequentially. Execution settings control simultaneous runs, CPU/memory reservations, and retry budgets. Defaults adapt to detected capacity, and queued runs report when they cannot fit.

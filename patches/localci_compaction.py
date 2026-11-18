@@ -69,6 +69,10 @@ class UsageJournal:
                         raise ValueError("Duplicate provider request")
                     self.request_seen.add(key)
                     self.pending[key] = row["request_kind"]
+                elif kind == "rejected":
+                    key = (row["session"], row["request"])
+                    if row.get("status") != 429 or self.pending.pop(key) != row["request_kind"]:
+                        raise ValueError("Invalid provider rejection")
                 elif kind == "usage":
                     key = (row["session"], row["request"])
                     request_kind = self.pending.pop(key)
@@ -130,7 +134,11 @@ def configure(ctx, model, config):
         *config.get("plugins", []),
         {
             "package": "/opt/localci/usage-plugin",
-            "options": {"journal": str(live.journal.path), "nonce": live.journal.nonce},
+            "options": {
+                "journal": str(live.journal.path),
+                "nonce": live.journal.nonce,
+                "allowRateLimit": model == "opencode/deepseek-v4.1-flash-free",
+            },
         },
     ]
     config["compaction"] = {
@@ -142,7 +150,7 @@ def configure(ctx, model, config):
     config["permission"]["subagent"] = "deny"
 
 
-def consume(accumulator, event, absorb, *, final=False):
+def consume(accumulator, event, absorb, *, final=False, unrouted=False):
     from mergecraft.localci_live_budget import current
 
     live = current()
@@ -152,7 +160,9 @@ def consume(accumulator, event, absorb, *, final=False):
     try:
         journal.note_native(event)
         journal.drain(absorb)
-        if (final or event.get("type") == "step_finish") and not journal.ready:
+        needs_ready = final or event.get("type") == "step_finish"
+        no_request = unrouted and not journal.request_seen and not journal.native_seen
+        if needs_ready and not journal.ready and not no_request:
             raise ValueError("Usage plugin did not initialize")
         if final:
             journal.finish()
