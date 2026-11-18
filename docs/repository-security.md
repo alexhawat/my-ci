@@ -92,6 +92,14 @@ These cannot be set from a pull request. Do them once, in this order.
    push protection, Dependabot alerts and private vulnerability reporting.
    `CI (dependency review)` needs the dependency graph: while it is off, the
    job fails with `403 Forbidden` and `CI gate` fails on every pull request.
+6. **Commit email privacy (account setting, not repository).** Under your GitHub
+   account's Settings → Emails, turn on "Keep my email addresses private" and
+   "Block command line pushes that expose my email". Merges and edits made through
+   the web interface, and the test-merge commit CI checks out for every pull
+   request, are authored with the account's email. `CI (python)` runs a release
+   test that fails on any commit whose author or committer is not a GitHub noreply
+   address, so with the setting off every pull request fails the gate. The test
+   names the commit, never the address.
 
 ## What this does not cover
 
