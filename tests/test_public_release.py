@@ -139,12 +139,34 @@ def test_commit_identity_check_names_the_commit_and_never_the_address():
     assert not noreply_identity(GITHUB_COMMITTER + ".example.invalid")
 
 
+# Dependabot signs off every commit with GitHub's support mailbox. Only that exact
+# trailer line is dropped; the mailbox anywhere else is still reported.
+DEPENDABOT_SIGNOFF = "Signed-off-by: dependabot[bot] <support@" + "github.com>"
+
+
+def without_dependabot_signoff(messages: str) -> str:
+    return "\n".join(line for line in messages.splitlines() if line != DEPENDABOT_SIGNOFF)
+
+
 def test_commit_messages_hold_no_personal_details():
-    messages = git_log("%B")
+    messages = without_dependabot_signoff(git_log("%B"))
     failures = [f"email: {address}" for address in personal_emails(messages)]
     failures += [f"developer path: {match.group(0)}" for match in PERSONAL_PATH.finditer(messages)]
     failures += private_network_names(messages)  # Tailnet names and addresses included.
     assert not failures, "Personal details in commit messages:\n" + "\n".join(failures)
+
+
+def test_only_the_exact_dependabot_signoff_is_exempt():
+    mailbox = "support@" + "github.com"
+    message = f"Bump x from 1 to 2\n\n{DEPENDABOT_SIGNOFF}\n"
+    assert not personal_emails(without_dependabot_signoff(message))
+    for line in (
+        f"Signed-off-by: someone <{mailbox}>",
+        f"Contact {mailbox}",
+        f"  {DEPENDABOT_SIGNOFF}",
+        f"{DEPENDABOT_SIGNOFF} and someone@" + "mail.example.invalid",
+    ):
+        assert personal_emails(without_dependabot_signoff(f"subject\n\n{line}\n")), line
 
 
 def test_privacy_patterns_flag_concrete_values_only():
