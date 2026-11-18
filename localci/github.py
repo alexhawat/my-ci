@@ -11,9 +11,26 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 
 class GitHubError(RuntimeError):
-    def __init__(self, status: int, method: str, path: str):
+    def __init__(self, status: int, method: str, path: str, retry_after: float | None = None):
         self.status, self.method, self.path = status, method, path.split("?")[0]
+        # Seconds GitHub asked the client to wait (rate limits), when it said so.
+        self.retry_after = retry_after
         super().__init__(f"GitHub returned HTTP {status} for {method} {self.path}")
+
+
+def retry_after(headers) -> float | None:
+    """GitHub's requested wait: ``Retry-After`` (secondary limits) or the reset time of
+    an exhausted primary limit. Bounded, so a bad header cannot park work for days."""
+    try:
+        if headers.get("retry-after"):
+            wait = float(headers["retry-after"])
+        elif headers.get("x-ratelimit-remaining") == "0" and headers.get("x-ratelimit-reset"):
+            wait = float(headers["x-ratelimit-reset"]) - time.time()
+        else:
+            return None
+    except ValueError:
+        return None
+    return min(max(wait, 0.0), 3600.0)
 
 
 def app_jwt(app_id: str, private_key: str) -> str:
@@ -55,7 +72,7 @@ class GitHub:
             response = await client.request(method, path, **kwargs)
             if response.status_code >= 400:
                 # Do not include request headers, repository payloads, or arbitrary server text.
-                raise GitHubError(response.status_code, method, path)
+                raise GitHubError(response.status_code, method, path, retry_after(response.headers))
             return response.json() if response.content else None
 
     async def pages(self, path: str, *, max_pages: int = 100, truncate: bool = False) -> list:
@@ -70,6 +87,9 @@ class GitHub:
             if len(values) < 100:
                 return result
         if truncate:
+            return result
+        # Exactly max_pages full pages is a complete list; only a further item is an overflow.
+        if not await self.request("GET", f"{path}{separator}per_page=1&page={max_pages * 100 + 1}"):
             return result
         raise RuntimeError(f"GitHub pagination exceeded {max_pages} pages; refusing a partial result")
 

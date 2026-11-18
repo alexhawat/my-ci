@@ -16,4 +16,4 @@ node --test tests/test_history.mjs tests/test_selection.mjs
 
 For execution changes, also run the relevant local Docker smoke tests in a disposable environment. Do not run paid model reviews or publish results to real repositories merely to validate a change.
 
-The privacy release tests must pass for every change. If a test fixture needs a password or token, use an unmistakable fixture-only value.
+The privacy release tests must pass for every change; they also check commit messages, so keep personal paths, private hostnames and personal email addresses out of those too. If a test fixture needs a password or token, use an unmistakable fixture-only value.

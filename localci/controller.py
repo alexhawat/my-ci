@@ -16,6 +16,9 @@ from localci.review_reconcile import reconcile_legacy_reviews
 from localci.runner import Runner
 from localci.store import Store
 
+PUBLISH_ATTEMPTS = 12  # About 45 minutes of backoff before a finished run's publish is abandoned.
+NETWORK_SWEEP_SECONDS = 600
+
 
 class Controller:
     def __init__(self, root: Path):
@@ -48,7 +51,8 @@ class Controller:
 
     @property
     def error(self) -> str:
-        failures = [message for message, _ in self.run_errors.values()]
+        # A copy: expire_run_errors() removes entries from a worker thread.
+        failures = [message for message, _ in list(self.run_errors.values())]
         return "; ".join(e for e in (self.poll_error, self.capacity_error, *failures) if e)
 
     def expire_run_errors(self):
@@ -57,7 +61,7 @@ class Controller:
         for rid, (_, since) in list(self.run_errors.items()):
             stuck = self.store.rows("SELECT 1 FROM runs WHERE id=? AND state IN ('queued','running')", (rid,))
             if not stuck and time.time() - since > 300:
-                del self.run_errors[rid]
+                self.run_errors.pop(rid, None)
 
     def status(self):
         rows = self.store.rows("SELECT value FROM settings WHERE key='worker_status'")
@@ -135,7 +139,11 @@ class Controller:
                 await self.discover()
             for repo in await asyncio.to_thread(self.store.rows, "SELECT * FROM repos WHERE enabled=1"):
                 try:
-                    prs = await self.github.pages(f"repos/{repo['name']}/pulls?state=open")
+                    # Oldest first: a PR closing between page requests then shifts later
+                    # pages toward newer PRs less often than the default newest-first order.
+                    prs = await self.github.pages(
+                        f"repos/{repo['name']}/pulls?state=open&sort=created&direction=asc"
+                    )
                     await asyncio.to_thread(self.store.cancel_stale, repo["name"], prs)
                     await asyncio.to_thread(self.store.replace_prs, repo["name"], prs)
                     config = json.loads(repo["config"])
@@ -232,7 +240,26 @@ class Controller:
                 self.publish_retries.pop(run["id"], None)
             except Exception as exc:
                 failures = self.publish_retries.get(run["id"], (0, 0))[0] + 1
-                delay = min(300, 5 * 2 ** (failures - 1))
+                status = getattr(exc, "status", None)
+                # A missing or rejected target will not start working; a rate limit will.
+                limit = 3 if status in (404, 410, 422) else PUBLISH_ATTEMPTS
+                if failures >= limit and run["state"] not in ("queued", "running"):
+                    # Stop retrying, and let retention prune the run: it only removes
+                    # published runs, so one that can never publish would stay forever.
+                    self.publish_retries.pop(run["id"], None)
+                    await asyncio.to_thread(
+                        self.store.execute,
+                        "UPDATE runs SET published=1,publish_error=? WHERE id=? AND state=? AND steps=?",
+                        (
+                            f"{exc}; not published after {failures} attempts",
+                            run["id"],
+                            run["state"],
+                            run["steps"],
+                        ),
+                    )
+                    continue
+                # Honour GitHub's requested wait (rate limits) when it is longer than ours.
+                delay = max(min(300, 5 * 2 ** (failures - 1)), getattr(exc, "retry_after", None) or 0)
                 self.publish_retries[run["id"]] = (failures, time.time() + delay)
                 await asyncio.to_thread(
                     self.store.execute,
@@ -306,6 +333,8 @@ class Controller:
     async def schedule(self):
         active = {}
         swept = time.monotonic()
+        sweep: asyncio.Future = asyncio.get_running_loop().create_future()
+        sweep.set_result(None)
         try:
             while True:
                 done = {t for t in active if t.done()}
@@ -317,10 +346,14 @@ class Controller:
                         self.run_errors[rid] = (f"Run {rid[:8]} finalization failed: {exc}", time.time())
                     del active[task]
                 await asyncio.to_thread(self.expire_run_errors)
-                if not active and time.monotonic() - swept > 600:
-                    # Networks whose removal lost a race with a slow container teardown.
+                if not active and time.monotonic() - swept > NETWORK_SWEEP_SECONDS and sweep.done():
+                    # Networks whose removal lost a race with a slow container teardown. In the
+                    # background: a slow Docker daemon must not delay claiming the next run.
+                    # Removal only succeeds for networks no container is attached to.
                     swept = time.monotonic()
-                    await Runner(self.store, self.github, self.root, self.secrets).cleanup_networks()
+                    sweep = asyncio.create_task(
+                        Runner(self.store, self.github, self.root, self.secrets).cleanup_networks()
+                    )
                 settings = await asyncio.to_thread(self.store.settings, self.capacity)
                 unfit = False
                 # Lowering the limit drains existing runs; it never kills them.
@@ -351,6 +384,7 @@ class Controller:
                 )
                 await asyncio.sleep(1)
         finally:
+            sweep.cancel()
             for task in active:
                 task.cancel()
             await asyncio.gather(*active, return_exceptions=True)

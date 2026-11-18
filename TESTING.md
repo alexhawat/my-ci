@@ -2,7 +2,7 @@
 
 ## Automated checks
 
-The Python suite covers queue persistence, retries, cancellation, workflow policy, reporting, redaction, credential isolation, artifact handling, dashboard authentication, execution limits, backup archive creation and failure handling, and database restore from backups. JavaScript tests cover run history, filtering, sorting, selection, and bounded reruns.
+The Python suite covers queue persistence, retries, cancellation, workflow policy, reporting, redaction, credential isolation, artifact handling, dashboard authentication, execution limits, backup archive creation (read-only, non-migrating snapshots) and failure handling, and database restore from backups. JavaScript tests cover run history, filtering, sorting, selection, and bounded reruns.
 
 ```sh
 uv sync --frozen
@@ -14,7 +14,7 @@ node --check localci/static/app.js
 node --test tests/test_history.mjs tests/test_selection.mjs
 ```
 
-Privacy release tests reject personal paths, non-public commit identities, common credential formats, private IPv4/IPv6 and Tailscale addresses and hostnames, the former private registry namespace, non-placeholder email addresses in files, and non-synthetic workflow fixtures without embedding a denylist of private names. They also verify generic deployment defaults and configurable host labels.
+Privacy release tests reject personal paths, non-public commit identities, common credential formats, concrete private IPv4/IPv6 and Tailscale addresses and hostnames (documented IPv6 ranges with an empty host part, such as `fd00::/8`, are allowed), the former private registry namespace, non-placeholder email addresses, and non-synthetic workflow fixtures without embedding a denylist of private names. Files and commit message bodies are both checked for personal paths, private network names and email addresses; the only allowed addresses are at example.com, example.org or example.net (and their subdomains), `users.noreply.github.com` addresses, `git@github.com`, and the `noreply@anthropic.com` co-author trailer. They also verify generic deployment defaults and configurable host labels.
 
 ## Docker validation
 

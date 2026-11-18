@@ -223,7 +223,12 @@ async def test_pagination_refuses_partial_results_unless_caller_opts_in(tmp_path
     github.request = AsyncMock(return_value=[{}] * 100)
     with pytest.raises(RuntimeError, match="partial"):
         await github.pages("repos/owner/repo/pulls?state=open", max_pages=3)
-    assert github.request.await_count == 3
+    assert github.request.await_count == 4  # Three pages, then one probe for a further item.
+    # Exactly max_pages full pages is a complete list, not an overflow.
+    github.request = AsyncMock(side_effect=[[{}] * 100, [{}] * 100, []])
+    assert len(await github.pages("repos/owner/repo/pulls?state=open", max_pages=2)) == 200
+    assert github.request.await_args.args[1].endswith("per_page=1&page=201")
+    github.request = AsyncMock(return_value=[{}] * 100)
     assert len(await github.pages("repos/owner/repo/pulls?state=closed", max_pages=2, truncate=True)) == 200
     github.request = AsyncMock(side_effect=[[{}] * 100, [{}] * 5])
     assert len(await github.pages("repos/owner/repo/pulls?state=open", max_pages=2)) == 105
@@ -331,6 +336,7 @@ def test_version_3_database_migrates_without_rebilling_and_keeps_recovery(tmp_pa
     with sqlite3.connect(path) as db:
         db.execute("ALTER TABLE runs DROP COLUMN end_reason")
         db.execute("ALTER TABLE revision_attempts DROP COLUMN recoveries")
+        db.execute("ALTER TABLE revision_attempts DROP COLUMN approved")
         for number, (state, message) in enumerate(revisions.values(), start=1):
             snapshot = {**pr(head=f"{number:040x}"), "number": number}
             # Run number 2 after one billed attempt: the old release's unbilled recovery.
@@ -537,3 +543,157 @@ async def test_poll_with_stale_configuration_cannot_release_or_run_bot_prs(tmp_p
         store.rows("SELECT COUNT(*) AS n FROM runs")[0]["n"] == 2 and run(store, held)["state"] == "blocked"
     )
     store.close()
+
+
+# Fifth-round review fixes ------------------------------------------------------------------------
+
+
+def bot_repo(store, run_bot_prs):
+    store.discover([repo()])
+    store.execute("UPDATE repos SET enabled=1,config=?", (json.dumps({"run_bot_prs": run_bot_prs}),))
+
+
+def interrupt(store, rid):
+    store.finish(rid, "error", "Execution worker stopped during this run", reason="worker_interrupted")
+
+
+def test_recovery_does_not_run_a_bot_revision_nobody_approved(tmp_path):
+    store = Store(tmp_path / "db")
+    bot_repo(store, True)
+    auto = store.enqueue(REPO, bot(), {}, bot_hold=BOT_HOLD)  # Automatic bot runs were on.
+    assert store.claim()["id"] == auto
+    bot_repo(store, False)  # The operator switches them off, then the worker is interrupted.
+    interrupt(store, auto)
+    held = store.enqueue(REPO, bot(), {}, bot_hold=BOT_HOLD)
+    row = run(store, held)
+    assert (row["state"], row["end_reason"], row["message"]) == ("blocked", "awaiting_approval", BOT_HOLD)
+    assert store.claim() is None and budget(store) == {"attempts": 1, "recoveries": 0}
+    assert store.enqueue(REPO, bot(), {}, bot_hold=BOT_HOLD) is None  # Not held again on each poll.
+    # Once an operator starts that revision, later interruptions recover as usual.
+    approved = store.enqueue(REPO, bot(), {}, retry=True, bot_hold=BOT_HOLD, reviewed=("a" * 40, "b" * 40))
+    assert store.claim()["id"] == approved
+    interrupt(store, approved)
+    recovered = store.enqueue(REPO, bot(), {}, bot_hold=BOT_HOLD)
+    assert recovered and run(store, recovered)["state"] == "queued"
+    assert budget(store) == {"attempts": 2, "recoveries": 1}
+
+
+def test_recovery_of_human_prs_and_of_opted_in_bot_prs_is_unchanged(tmp_path):
+    store = Store(tmp_path / "db")
+    bot_repo(store, True)
+    for snapshot, hold in ((pr(), None), ({**bot(head="c" * 40), "number": 6}, BOT_HOLD)):
+        first = store.enqueue(REPO, snapshot, {}, bot_hold=hold)
+        store.claim()
+        interrupt(store, first)
+        again = store.enqueue(REPO, snapshot, {}, bot_hold=hold)
+        assert again and run(store, again)["state"] == "queued"
+        store.finish(store.claim()["id"], "success", "All configured checks passed")
+
+
+def test_upgrade_does_not_rerun_a_bot_pr_that_the_old_release_ran_without_approval(tmp_path):
+    path = tmp_path / "db"
+    Store(path).close()
+    snapshot = bot()
+    with sqlite3.connect(path) as db:  # As the previous release left it when stopped for the upgrade.
+        db.execute("ALTER TABLE runs DROP COLUMN end_reason")
+        db.execute("ALTER TABLE revision_attempts DROP COLUMN recoveries")
+        db.execute("ALTER TABLE revision_attempts DROP COLUMN approved")
+        db.execute(
+            "INSERT INTO runs(id,repo,pr,head,base,attempt,state,created,finished,snapshot,config,message) "
+            "VALUES(?,?,?,?,?,1,'error',1,2,?,'{}',?)",
+            (
+                "1" * 32,
+                REPO,
+                snapshot["number"],
+                "a" * 40,
+                "b" * 40,
+                json.dumps(snapshot),
+                "ci.yml: error (Controller stopped during execution; retry this run)",
+            ),
+        )
+        db.execute(
+            "INSERT INTO revision_attempts VALUES(?,?,?,?,1)", (REPO, snapshot["number"], "a" * 40, "b" * 40)
+        )
+        db.execute("PRAGMA user_version=3")
+    store = Store(path)
+    bot_repo(store, False)
+    held = store.enqueue(REPO, snapshot, {}, bot_hold=BOT_HOLD, require_enabled=True)
+    assert run(store, held)["state"] == "blocked" and store.claim() is None
+
+
+def test_retry_uses_current_settings_for_the_bot_revision_check(client):  # noqa: F811
+    controller = client.app.state.controller
+    store = controller.store
+    enable = {"enabled": True, "review": True}
+    assert client.put("/api/repos/owner/repo", json={**enable, "run_bot_prs": True}).status_code == 200
+    failed = store.enqueue(REPO, bot(), {}, bot_hold=BOT_HOLD)
+    store.finish(store.claim()["id"], "failure", "Checks failed")
+
+    async def fetch_while_operator_switches_bot_runs_off(*_):
+        store.execute(
+            "UPDATE repos SET config=? WHERE name=?", (json.dumps({**enable, "run_bot_prs": False}), REPO)
+        )
+        return bot(head="c" * 40)  # And the bot has pushed a commit nobody reviewed.
+
+    controller.github.request = fetch_while_operator_switches_bot_runs_off
+    response = client.post(f"/api/runs/{failed}/retry")
+    assert response.status_code == 409 and "changed" in response.json()["detail"]
+    assert [r["head"] for r in store.rows("SELECT head FROM runs")] == ["a" * 40]
+    # The new run of an unchanged revision records the settings current at retry time.
+    controller.github.request = AsyncMock(return_value=bot())
+    retried = client.post(f"/api/runs/{failed}/retry").json()["id"]
+    assert json.loads(run(store, retried)["config"])["run_bot_prs"] is False
+
+
+def test_run_errors_can_expire_while_the_error_text_is_being_read(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_TOKEN_FILE", str(tmp_path / "token"))
+    controller = Controller(tmp_path / "data")
+    controller.run_errors = {f"{i:032x}": (f"Run {i} finalization failed", 0.0) for i in range(50)}
+    seen = []
+
+    class Watching(dict):
+        def values(self):  # The heartbeat reads while the expiry thread removes entries.
+            for key in list(self)[:10]:
+                self.pop(key)
+            return super().values()
+
+    controller.run_errors = Watching(controller.run_errors)
+    seen.append(controller.error)
+    controller.expire_run_errors()
+    assert seen[0].count("finalization failed") == 40 and controller.error == ""
+    controller.store.close()
+
+
+async def test_idle_scheduler_sweeps_networks_in_the_background(tmp_path, monkeypatch):
+    import localci.controller as module
+
+    monkeypatch.setenv("LOCALCI_TOKEN_FILE", str(tmp_path / "token"))
+    monkeypatch.setattr(module, "NETWORK_SWEEP_SECONDS", 0)
+    controller = Controller(tmp_path / "data")
+    controller.capacity = {"cpus": 8, "memory_gb": 16}
+    sweeping, release, started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    sweeps = 0
+
+    async def slow_sweep(self):
+        nonlocal sweeps
+        sweeps += 1
+        sweeping.set()
+        await release.wait()  # A Docker daemon that does not answer.
+
+    async def execute(claimed):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(module.Runner, "cleanup_networks", slow_sweep)
+    controller.execute_run = execute
+    task = asyncio.create_task(controller.schedule())
+    try:
+        await asyncio.wait_for(sweeping.wait(), 5)
+        controller.store.enqueue(REPO, pr(), {})
+        await asyncio.wait_for(started.wait(), 5)  # Claimed although the sweep is still hanging.
+        assert sweeps == 1  # And no second sweep is stacked on the unfinished one.
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        controller.store.close()

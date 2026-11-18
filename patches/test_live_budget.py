@@ -29,6 +29,12 @@ def part_step(part_id, identity, **tokens):
     return value
 
 
+def priced_step(part_id, cost, **tokens):
+    value = part_step(part_id, part_id, **tokens)
+    value["part"]["cost"] = cost
+    return value
+
+
 def stream(events):
     process = SimpleNamespace(
         stdout=io.StringIO("\n".join(json.dumps(e) for e in events)), stderr=io.StringIO(""), pid=123
@@ -153,6 +159,70 @@ async def main():
                 assert live.steps == 0
             else:
                 raise AssertionError("A failed rejection must stop the review")
+        # A failed meter write after a budget stop keeps the real stop reason and kind.
+        for kind, priced in (
+            ("token", part_step("over", "over", input=1200)),
+            ("cost", priced_step("pricey", 6, input=10)),
+        ):
+            budget = tracker()
+            with bind(budget) as live, patch.object(live, "save", side_effect=OSError("fixture")):
+                try:
+                    await asyncio.to_thread(stream, [priced])
+                except BudgetExhausted as exc:
+                    assert exc.kind == kind and f"Live {kind} budget stopped" in str(exc), str(exc)
+                    assert "meter failed" not in str(exc) and budget.last_exhausted is exc
+                else:
+                    raise AssertionError(f"{kind} budget stop was lost")
+        # An accepted step the upstream handler fails on is a meter failure, not an
+        # unmetered step; other event types keep the upstream logged-and-continue path.
+        real_handler = adapter._session_event_handler
+
+        def failing_handler(*args, **kwargs):
+            handle = real_handler(*args, **kwargs)
+
+            def wrapped(acc, value):
+                if (value.get("part") or {}).get("id") == "explode":
+                    raise ValueError("fixture")
+                handle(acc, value)
+
+            return wrapped
+
+        budget = tracker()
+        with bind(budget) as live, patch.object(adapter, "_session_event_handler", failing_handler):
+            try:
+                await asyncio.to_thread(
+                    stream,
+                    [part_step("explode", "explode", input=10), part_step("later", "later", input=900)],
+                )
+            except BudgetExhausted as exc:
+                assert "meter failed" in str(exc) and budget.last_exhausted is exc
+                assert live.steps == 0 and budget.tokens_used == 0
+            else:
+                raise AssertionError("A step the upstream handler failed on went unmetered")
+        budget = tracker()
+        with bind(budget) as live, patch.object(adapter, "_session_event_handler", failing_handler):
+            text = {"type": "text", "sessionID": "session", "part": {"id": "explode", "text": "x"}}
+            await asyncio.to_thread(stream, [text, part_step("after-text", "after-text", input=10)])
+            assert live.error is None and live.steps == 1 and budget.tokens_used == 10
+        # Step cost is validated like the token counters; absent, null and finite
+        # non-negative costs are charged.
+        for cost, used in ((None, 0), (0, 0), (0.25, 0.25), (1, 1)):
+            budget = tracker()
+            with bind(budget) as live:
+                await asyncio.to_thread(stream, [priced_step("ok", cost, input=1)])
+                assert live.error is None and live.steps == 1 and budget.cost_used == used
+        for invalid in (float("nan"), float("inf"), -float("inf"), -0.5, "1", True, [1]):
+            budget = tracker()
+            with bind(budget) as live:
+                try:
+                    await asyncio.to_thread(
+                        stream, [priced_step("bad", invalid, input=1), part_step("later", "later", input=1)]
+                    )
+                except BudgetExhausted as exc:
+                    assert exc.kind == "cost" and "Invalid provider cost" in str(exc)
+                else:
+                    raise AssertionError(f"Invalid cost accepted: {invalid!r}")
+                assert live.steps == 0 and budget.cost_used == 0
         # Prove the real OS process is terminated and reaped, without a provider.
         child = await asyncio.to_thread(
             subprocess.Popen,
@@ -192,7 +262,7 @@ async def main():
                 child.kill()
                 await asyncio.to_thread(child.wait)
     print(
-        "PASS: disjoint accounting, duplicate/replayed events, multi-step messages, counter validation, resumed-turn ceiling, fail-closed stream stop and durable usage"
+        "PASS: disjoint accounting, duplicate/replayed events, multi-step messages, counter and cost validation, resumed-turn ceiling, fail-closed stream stop (first stop reason kept, failed upstream step handler) and durable usage"
     )
 
 

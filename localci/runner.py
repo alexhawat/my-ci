@@ -45,6 +45,16 @@ MIN_SECRET_LINE = 12
 _PEM_ARMOR = re.compile(r"-----(?:BEGIN|END) [A-Z0-9 ]+-----")
 OUTPUT_LINE_LIMIT = 100_000
 OVERSIZED_LINE = "[oversized output line omitted]\n"
+CAPTURE_LIMIT = 2_000_000  # Bytes of captured stdout (workflow files, review.patch).
+HELD_BYTES = 16_384  # Trailing base64 lines a log batch may keep back for the next one.
+
+
+# act's own result line is "[<workflow>/<job>] 🏁  Job succeeded". Everything act
+# echoes on behalf of a step follows the job prefix with at least two spaces: output
+# as "[job]   | text", workflow commands as "[job]   ⚙  ..." or "[job]   🚧  ...". So
+# the prefix may not contain "]" followed by two spaces, which keeps job names with
+# brackets working while a step printing "[x] 🏁  Job succeeded" cannot count.
+_JOB_SUCCEEDED = re.compile(r"^\[(?:[^\]\n]|\](?! {2}))+\] 🏁  Job succeeded[ \t\r]*$", re.MULTILINE)
 
 
 def strip_controls(text: str) -> str:
@@ -72,70 +82,173 @@ def _base64_forms(secret: bytes) -> set[str]:
     return {form for form in forms if len(form) >= MIN_SECRET_FRAGMENT}
 
 
-@functools.lru_cache(maxsize=16)
-def _base64_cores(secrets: tuple[str, ...]) -> tuple[str, ...]:
-    cores: set[str] = set()
-    for secret in secrets:
-        if secret.strip():
-            cores |= {form.rstrip("=") for form in _base64_forms(secret.encode())}
-    return tuple(core for core in cores if len(core) >= MIN_SECRET_FRAGMENT)
-
-
 _BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_-"
-BASE64_WRAP_WIDTH = 60  # base64(1) and MIME wrap at 76 columns, PEM at 64.
+# Encoded secrets are also found piecewise: every BASE64_WINDOW-character substring
+# of an encoding is indexed, and text is probed every BASE64_STEP characters (plus
+# at both ends of each token). Any stretch of at least BASE64_WINDOW + BASE64_STEP - 1
+# encoded characters is therefore found wherever it is, and a stretch of at least
+# BASE64_WINDOW characters at the start or end of a token. 12 base64 characters are
+# 72 secret bits, so ordinary output does not match by chance.
+BASE64_WINDOW = 12
+BASE64_STEP = 4
+_GUARANTEED = BASE64_WINDOW + BASE64_STEP - 1
+# A maximal run of base64 characters (standard and URL-safe) long enough to hold a window.
+_BASE64_TOKEN = re.compile(rf"(?<![A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{{{BASE64_WINDOW},}})(={{0,2}})")
 
 
-def _base64_tail(line: str) -> tuple[int, int] | None:
-    """Span of the base64 token (padding excluded) that ends ``line``, if any.
+@functools.lru_cache(maxsize=16)
+def _base64_index(secrets: tuple[str, ...]) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Every BASE64_WINDOW-character window of every base64 form of the secrets, and
+    the cores too short to be found reliably by windows (searched for whole)."""
+    windows: set[str] = set()
+    short: set[str] = set()
+    for secret in secrets:
+        if not secret.strip():
+            continue
+        for form in _base64_forms(secret.encode()):
+            core = form.rstrip("=")
+            if len(core) < _GUARANTEED:
+                short.add(core)
+            windows.update(core[i : i + BASE64_WINDOW] for i in range(len(core) - BASE64_WINDOW + 1))
+    return frozenset(windows), tuple(core for core in short if len(core) >= MIN_SECRET_FRAGMENT)
 
-    Plain string scans from the end: linear even for a very long line, which a
-    regular expression retried from every start position would not be.
-    """
+
+def _probe(token: str, windows: frozenset[str]) -> bool:
+    """Whether ``token`` holds a window: every BASE64_STEP characters and at both ends."""
+    size = BASE64_WINDOW
+    last = len(token) - size
+    if last < 0:
+        return False
+    if token[:size] in windows or token[last:] in windows:
+        return True
+    for position in range(BASE64_STEP, last, BASE64_STEP):
+        if token[position : position + size] in windows:
+            return True
+    return False
+
+
+def _base64_tail(line: str) -> tuple[int, int, int]:
+    """The base64 token (padding and trailing blanks excluded) that ends ``line``:
+    start, end and length. Plain string scans from the end: linear even for a very
+    long line, which a regular expression retried at every position would not be."""
     end = len(line.rstrip(" \t\r").rstrip("="))
     start = len(line[:end].rstrip(_BASE64_ALPHABET))
-    return (start, end) if end - start >= 4 else None
+    return start, end, end - start
 
 
-def _redact_wrapped_base64(text: str, cores: tuple[str, ...]) -> str:
+def _joined_spans(joined: str, offsets: list[int], windows: frozenset[str], short: tuple[str, ...]):
+    """Spans of ``joined`` covered by an encoded secret that crosses a line boundary.
+
+    An encoding inside a single token is the token scan's job; here only windows
+    around each boundary between tokens are probed: the last window of the token
+    before it, the first window after it and the two in between on the same
+    BASE64_STEP grid. Every stretch of BASE64_WINDOW + BASE64_STEP - 1 encoded
+    characters that crosses a boundary holds one of them. A hit is extended one
+    character at a time while every window is indexed, so the span reaches the
+    true ends of the encoding, including pieces too small to be found alone.
+    """
+    size = BASE64_WINDOW
+    last = len(joined) - size
+    probes = sorted(
+        position
+        for boundary in offsets[1:]
+        for position in range(boundary - size, boundary + 1, BASE64_STEP)
+        if 0 <= position <= last
+    )
+    spans = []
+    covered = 0  # Positions before this are already inside a span.
+    for position in probes:
+        if position < covered or joined[position : position + size] not in windows:
+            continue
+        first = position
+        while first > covered and joined[first - 1 : first - 1 + size] in windows:
+            first -= 1
+        final = position
+        while final < last and joined[final + 1 : final + 1 + size] in windows:
+            final += 1
+        spans.append((first, final + size))
+        covered = final + 1
+    for core in short:
+        found = joined.find(core)
+        while found >= 0:
+            spans.append((found, found + len(core)))
+            found = joined.find(core, found + 1)
+    return spans
+
+
+def _redact_wrapped_base64(text: str, windows: frozenset[str], short: tuple[str, ...]) -> str:
     """Redact encoded secrets that a tool wrapped across consecutive output lines.
 
-    ``base64`` breaks long output into lines, so the encoded secret straddles a
-    newline and no single line contains it. Consecutive lines that end in a
-    base64 token are joined; wherever a secret's encoding appears in the joined
-    text, the tokens it touches are redacted. A line prefix (act's ``[job] | ``)
-    is kept.
+    ``base64`` breaks long output into lines (76 columns; PEM 64; ``fold -w N``),
+    so no single line holds the whole encoding. Consecutive lines that end in a
+    base64 token are joined (a final 1-3 character token, as the last line of a
+    wrapped block often is, closes the run) and every token that overlaps an
+    encoded secret in the joined text is redacted, so the edges of the encoding on
+    neighbouring lines go too. A line prefix (act's ``[job]   | ``) is kept.
     """
-    if not cores or "\n" not in text:
+    if "\n" not in text:
         return text
     lines = text.split("\n")
     run: list[tuple[int, int, int]] = []  # line index, token start, token end
 
     def flush():
-        if len(run) > 1 and any(end - start >= BASE64_WRAP_WIDTH for _, start, end in run):
+        if len(run) > 1:
             joined = "".join(lines[index][start:end] for index, start, end in run)
-            spans = []
-            for core in cores:
-                found = joined.find(core)
-                while found >= 0:
-                    spans.append((found, found + len(core)))
-                    found = joined.find(core, found + 1)
-            offset = 0
-            for index, start, end in run if spans else ():
-                after = offset + end - start
-                if any(first < after and last > offset for first, last in spans):
+            offsets, offset = [], 0
+            for _, start, end in run:
+                offsets.append(offset)
+                offset += end - start
+            spans = sorted(_joined_spans(joined, offsets, windows, short))
+            current = 0  # Spans ending at or before a token cannot touch later tokens.
+            for (index, start, end), first in zip(run if spans else (), offsets, strict=False):
+                after = first + end - start
+                while current < len(spans) and spans[current][1] <= first:
+                    current += 1
+                if current < len(spans) and spans[current][0] < after:
                     line = lines[index]
                     lines[index] = line[:start] + "[redacted]" + line[end:].lstrip("=")
-                offset = after
         run.clear()
 
     for index, line in enumerate(lines):
-        tail = _base64_tail(line)
-        if tail:
-            run.append((index, *tail))
+        start, end, size = _base64_tail(line)
+        if size >= 4:
+            run.append((index, start, end))
+        elif size and run:
+            run.append((index, start, end))  # A short last line closes the run.
+            flush()
         else:
             flush()
     flush()
     return "\n".join(lines)
+
+
+def _redact_base64(text: str, secrets: tuple[str, ...]) -> str:
+    """Redact base64 encodings of secrets, including partial and wrapped ones.
+
+    First wrapped blocks (see ``_redact_wrapped_base64``), then every remaining
+    base64 token that holds a window of an encoding, wherever it is on its line:
+    this alone covers a block interleaved with other output, split across two
+    calls (log batches are flushed every 0.25 s or 64 KiB) or wrapped at any
+    width of at least BASE64_WINDOW + BASE64_STEP - 1 columns.
+
+    Residual exposure: a piece of an encoding cut off from the rest by an
+    interleaved line, a batch boundary or a prefix glued to the token with
+    base64 characters survives if it is shorter than 15 base64 characters
+    (BASE64_WINDOW + BASE64_STEP - 1, at most 10 secret bytes), or shorter than
+    12 characters (at most 8 bytes) when it is at the start or end of its token.
+    Secrets whose encoding is shorter than 15 characters (about 10 bytes) are only
+    found whole, on one line or across a wrapped block.
+    """
+    windows, short = _base64_index(secrets)
+    if not windows and not short:
+        return text
+    text = _redact_wrapped_base64(text, windows, short)
+    if not windows:
+        return text
+    return _BASE64_TOKEN.sub(
+        lambda match: "[redacted]" if _probe(match[1], windows) else match[0],
+        text,
+    )
 
 
 def _distinctive(fragment: str) -> bool:
@@ -183,7 +296,7 @@ def redact(text: str, secrets: list[str]) -> str:
     key = tuple(secrets)
     for form in _secret_forms(key):
         text = text.replace(form, "[redacted]")
-    text = _redact_wrapped_base64(text, _base64_cores(key))
+    text = _redact_base64(text, key)
     return re.sub(r"(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "[redacted]", text)
 
 
@@ -191,9 +304,13 @@ def sanitize(text: str, secrets: list[str]) -> str:
     """Redact, strip escapes/control characters, then redact again.
 
     The first pass catches secrets that themselves contain stripped characters;
-    the second catches secrets split by escapes that stripping rejoined.
+    the second catches secrets split by escapes that stripping rejoined. When
+    stripping changed nothing, the second pass would see the first pass's own
+    output again and is skipped.
     """
-    return redact(strip_controls(redact(text, secrets)), secrets)
+    first = redact(text, secrets)
+    stripped = strip_controls(first)
+    return first if stripped == first else redact(stripped, secrets)
 
 
 AGENT_FILES = {
@@ -233,6 +350,82 @@ SCOPED_AGENT_ENTRIES = {
 }
 
 
+_DOTENV_KEY = re.compile(r"[A-Za-z0-9_.]+")  # What godotenv accepts as a name (ASCII subset).
+_DOTENV_BLANK = " \t\v\f\r\x85\xa0"  # godotenv's isSpace: trimmed around unquoted values.
+
+
+def _dotenv_value(value: str, unused: str) -> str:
+    """One value for act's ``--secret-file``/``--var-file``, read by joho/godotenv v1.5.1.
+
+    Single-quoted values are taken literally, but the closing quote must not follow
+    a backslash. Double-quoted values get backslash escapes (``\\n``, ``\\r``, and a
+    backslash before any other character drops it) and then ``$NAME`` expansion,
+    which ``\\$`` prevents; a value must not end in ``"`` either, since quote
+    characters at both ends are trimmed: an empty expansion of a name that is not
+    in the file is appended to keep it. Unquoted values are trimmed, lose a
+    `` #comment`` and get ``$`` expansion: used only for a value ending in a
+    backslash, which neither quoted form can hold.
+    """
+    if not any(c in value for c in "'\n\r") and not value.endswith("\\"):
+        return f"'{value}'"
+    if not value.endswith("\\"):
+        escaped = "".join(
+            {"\\": "\\\\", '"': '\\"', "$": "\\$", "\n": "\\n", "\r": "\\r"}.get(c, c) for c in value
+        )
+        return f'"{escaped}' + ("${" + unused + "}" if value.endswith('"') else "") + '"'
+    unquoted_safe = (
+        not any(c in value for c in "\n\r")
+        and value[:1] not in ("'", '"', *_DOTENV_BLANK)
+        and value[-1:] not in _DOTENV_BLANK
+        and not any(value[i] == "#" and value[i - 1] in _DOTENV_BLANK for i in range(1, len(value)))
+    )
+    if unquoted_safe:
+        return value.replace("$", "\\$")
+    raise RuntimeError("A variable or secret value ending in a backslash cannot be passed to act unchanged")
+
+
+def dotenv_file(values: dict[str, str]) -> str:
+    """The ``KEY=value`` file act reads with godotenv, every value preserved exactly.
+
+    The only encoder for act's secret and variable files: unquoted ``KEY=value``
+    would lose `` #...`` and surrounding blanks and expand ``$VAR``; JSON
+    double-quoting additionally mangles ``\\uXXXX`` escapes. Non-ASCII is written
+    as UTF-8.
+    """
+    unused = "LOCALCI_EMPTY"
+    while unused in values:
+        unused += "_"
+    lines = []
+    for key, value in values.items():
+        if not _DOTENV_KEY.fullmatch(key):
+            raise RuntimeError(f"Name {key!r} is not usable in act's secret or variable files")
+        lines.append(f"{key}={_dotenv_value(str(value), unused)}\n")
+    return "".join(lines)
+
+
+def docker_env_file(values: dict[str, str]) -> str:
+    """A ``docker --env-file``: everything after ``=`` is literal (no quotes, comments
+    or expansion) and a line is one variable, so values cannot hold line breaks."""
+    lines = []
+    for key, value in values.items():
+        if not key or any(c in key for c in "= \t\r\n\0") or key.startswith("#"):
+            raise RuntimeError(f"Name {key!r} is not usable in the review environment")
+        if any(c in value for c in "\r\n\0"):
+            raise RuntimeError(
+                f"Value of {key} contains a line break or NUL and cannot be passed to the review"
+            )
+        lines.append(f"{key}={value}\n")
+    return "".join(lines)
+
+
+# Run with ``sh -c`` in the CI worker (docker:dind, busybox): remove every container on
+# the nested daemon and verify none is left. No ``xargs -r``, which busybox builds may
+# lack: an empty list must not run ``docker rm`` (it would fail without arguments).
+NESTED_CLEANUP = (
+    'ids=$(docker ps -aq) && { [ -z "$ids" ] || docker rm -f $ids >/dev/null; } && [ -z "$(docker ps -aq)" ]'
+)
+
+
 def nested_dns_arguments() -> list[str]:
     """dockerd ``--dns`` options for the nested daemon, from LOCALCI_NESTED_DNS.
 
@@ -259,7 +452,11 @@ def remove_agent_configuration(root: Path) -> list[str]:
     """Delete PR-authored agent instructions/configuration at any depth, case-insensitively.
 
     Never follows symlinks: a matching link is unlinked itself, and linked
-    directories are not descended into. ``.git`` is skipped.
+    directories are not descended into. A link named like a directory that holds
+    agent configuration (``.github``, ``.vscode``, ``.claude``...) is unlinked too:
+    its scoped entries (``copilot-instructions.md``, ``mcp.json``) would otherwise
+    stay readable through it, under a target whose own name does not match.
+    ``.git`` is skipped.
     """
     removed = []
     for directory, dirs, files in os.walk(root, topdown=True, followlinks=False):
@@ -277,6 +474,8 @@ def remove_agent_configuration(root: Path) -> list[str]:
                 or lowered in SCOPED_AGENT_ENTRIES.get(parent.name.casefold(), ())
             )
             target = parent / name
+            if not match and lowered in SCOPED_AGENT_ENTRIES:
+                match = target.is_symlink()  # The link only; its target is never touched.
             if not match:
                 if name in dirs:
                     kept.append(name)
@@ -384,7 +583,7 @@ class Runner:
                         self.review_events.pop("run_finished", None)
                     self.review_events[event["event"]] = event
         if self._lane.get() != "review":
-            self.completed_jobs += len(re.findall(r"^\[[^\n]+\] 🏁  Job succeeded", text, re.MULTILINE))
+            self.completed_jobs += len(_JOB_SUCCEEDED.findall(text))
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         if self.log_path.exists() and self.log_path.stat().st_size > 8_000_000:
             return
@@ -426,24 +625,47 @@ class Runner:
         check: bool = True,
         max_seconds: int = 3600,
         honor_cancel: bool = True,
+        output: Path | None = None,
+        quiet: bool = False,
     ) -> tuple[int, str]:
-        """Run a command; ``honor_cancel=False`` is for bounded cleanup that must run anyway."""
+        """Run a command; ``honor_cancel=False`` is for bounded cleanup that must run anyway.
+
+        Uncaptured, stdout and stderr go to the run log together, in order. With
+        ``capture`` stdout is returned as text instead (undecodable bytes replaced);
+        with ``output`` its exact bytes are written to that file (review.patch) and
+        "" is returned. Captured stdout is never logged and at most 2 MB. A captured
+        command's stderr still goes to the run log, sanitized like any output, so
+        warnings stay visible without corrupting the captured data; ``quiet``
+        discards it instead, for probes whose failure is expected and already
+        reported by the caller (an optional file that is absent, a daemon that is
+        not ready yet).
+        """
         if honor_cancel:
             await asyncio.to_thread(self.cancelled)
+        captured = capture or output is not None
+        if not captured:
+            stderr = asyncio.subprocess.STDOUT
+        else:
+            stderr = asyncio.subprocess.DEVNULL if quiet else asyncio.subprocess.PIPE
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=cwd,
             env=env,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=stderr,
             start_new_session=True,
         )
-        output: list[str] = []
-        output_size = 0
+        data = bytearray()
 
-        async def consume():
-            nonlocal output_size
-            assert proc.stdout
+        async def collect(stream: asyncio.StreamReader):
+            # Byte-exact: workflow files and review.patch must not be altered, so long
+            # lines are kept and nothing is decoded here; only the total size is bounded.
+            while chunk := await stream.read(65536):
+                data.extend(chunk)
+                if len(data) > CAPTURE_LIMIT:
+                    raise RuntimeError("Command output exceeded limit")
+
+        async def log_lines(stream: asyncio.StreamReader):
             pending = b""
             # True while skipping the rest of a line already known to exceed the limit.
             oversized = False
@@ -451,34 +673,34 @@ class Runner:
             buffered = 0
             last_flush = time.monotonic()
 
-            async def flush():
+            async def flush(hold: bool = False):
                 nonlocal buffered, last_flush
-                if lines:
-                    # Bound commit frequency during verbose scanners without delaying
-                    # sparse live output. The raw log and structured index stay aligned.
-                    await asyncio.to_thread(self.log, "".join(lines))
-                    lines.clear()
-                    buffered = 0
+                # Bound commit frequency during verbose scanners without delaying
+                # sparse live output. The raw log and structured index stay aligned.
+                # A batch flushed while output continues keeps back its trailing lines
+                # that end in base64 (bounded): a wrapped encoding is then redacted
+                # with its neighbouring lines in one batch instead of in two.
+                keep, kept = 0, 0
+                while hold and keep < len(lines) and kept + len(lines[-1 - keep]) <= HELD_BYTES:
+                    if _base64_tail(lines[-1 - keep].rstrip("\n"))[2] < 4:
+                        break
+                    kept += len(lines[-1 - keep])
+                    keep += 1
+                ready = len(lines) - keep
+                if ready:
+                    await asyncio.to_thread(self.log, "".join(lines[:ready]))
+                    del lines[:ready]
+                    buffered = kept
                 last_flush = time.monotonic()
 
             def emit(text: str):
-                nonlocal output_size, buffered
-                if capture:
-                    output.append(text)
-                    output_size += len(text)
-                    if output_size > 2_000_000:
-                        raise RuntimeError("Command output exceeded limit")
-                else:
-                    lines.append(text)
-                    buffered += len(text)
-
-            def omit():
-                # Drop the entire line, including its tail, so no secret fragment survives.
-                emit(OVERSIZED_LINE)
+                nonlocal buffered
+                lines.append(text)
+                buffered += len(text)
 
             while True:
                 try:
-                    chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=0.25)
+                    chunk = await asyncio.wait_for(stream.read(65536), timeout=0.25)
                 except TimeoutError:
                     await flush()
                     continue
@@ -488,17 +710,13 @@ class Runner:
                 while True:
                     end = chunk.find(b"\n", start)
                     piece = chunk[start:] if end < 0 else chunk[start:end]
-                    if capture:
-                        # Captured output (workflow files, review.patch) is never logged and must
-                        # stay byte-exact, so long lines are kept; only the total size is bounded.
-                        if len(pending) + len(piece) > 2_000_000:
-                            raise RuntimeError("Command output exceeded limit")
-                    elif not oversized and len(pending) + len(piece) > OUTPUT_LINE_LIMIT:
+                    if not oversized and len(pending) + len(piece) > OUTPUT_LINE_LIMIT:
+                        # Drop the entire line, including its tail, so no secret fragment survives.
                         oversized, pending = True, b""
-                        omit()
+                        emit(OVERSIZED_LINE)
                     if end < 0:
                         if not oversized:
-                            pending += piece  # bounded by the line limit, or the capture limit
+                            pending += piece  # bounded by the line limit
                         break
                     if oversized:
                         oversized = False
@@ -507,12 +725,15 @@ class Runner:
                     pending = b""
                     start = end + 1
                 if buffered >= 65536 or time.monotonic() - last_flush >= 0.25:
-                    await flush()
+                    await flush(hold=True)
             if pending and not oversized:
                 emit(pending.decode(errors="replace"))
             await flush()
 
-        reader = asyncio.create_task(consume())
+        assert proc.stdout
+        readers = [asyncio.create_task(collect(proc.stdout) if captured else log_lines(proc.stdout))]
+        if captured and proc.stderr:
+            readers.append(asyncio.create_task(log_lines(proc.stderr)))
         start = time.monotonic()
         try:
             while proc.returncode is None:
@@ -520,22 +741,28 @@ class Runner:
                     await asyncio.to_thread(self.cancelled)
                 if time.monotonic() - start > max_seconds:
                     raise TimeoutError(f"{args[0]} exceeded timeout")
-                if reader.done() and reader.exception():
-                    raise reader.exception()  # type: ignore[misc]
+                for reader in readers:
+                    if reader.done() and reader.exception():
+                        raise reader.exception()  # type: ignore[misc]
                 await asyncio.sleep(0.4)
-            await reader
+            for reader in readers:
+                await reader
         finally:
             if proc.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(proc.pid, 9)
                 await proc.wait()
-            reader.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await reader
+            for reader in readers:
+                reader.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader
         code = proc.returncode or 0
         if code and check:
             raise RuntimeError(f"{args[0]} exited {code}; see run log")
-        return code, "".join(output)
+        if output is not None:
+            output.write_bytes(bytes(data))
+            return code, ""
+        return code, data.decode(errors="replace")
 
     async def _quiet_docker(self, *args: str) -> str:
         try:
@@ -553,9 +780,8 @@ class Runner:
         return output.decode(errors="replace")
 
     async def cleanup(self, name: str):
-        """Remove a run container (idempotent). Never the run network: both lanes of a
-        run share it, and a lane that finishes first must not remove it before the
-        other lane's container attaches."""
+        """Remove a run container (idempotent). Never the run network: _finalize
+        removes it once the run is finished and the CI worker attached to it is gone."""
         await self._quiet_docker("rm", "-fv", name)
 
     async def remove_network(self, name: str):
@@ -622,7 +848,8 @@ class Runner:
         resources = config.get("execution", {})
         final_state, message = "success", "All configured checks passed"
         end_reason = None
-        executed = 0
+        executed = 0  # CI jobs that ran, plus the review.
+        ci_jobs = 0  # CI jobs alone: a passing review must not stand in for CI that never ran.
         try:
             work.mkdir(parents=True, mode=0o700)
             control.mkdir()
@@ -734,9 +961,7 @@ class Runner:
                 "sender": pr["user"],
             }
             (control / "event.json").write_text(json.dumps(event))
-            (control / "vars").write_text(
-                "\n".join(f"{k}={v}" for k, v in config.get("variables", {}).items())
-            )
+            (control / "vars").write_text(dotenv_file(config.get("variables", {})), encoding="utf-8")
             # Values referenced by each workflow; written and copied into the worker only
             # for the duration of that workflow's act invocation (see ci_phase), never
             # via argv/logs. With host GitHub login enabled, every workflow also gets the token.
@@ -774,20 +999,6 @@ class Runner:
                 await asyncio.to_thread(self.step, filename, "queued")
             if run_review:
                 await asyncio.to_thread(self.step, "mergeCraft", "queued")
-            # A user-defined bridge per run: concurrent runs cannot reach each other's
-            # artifact server or job service ports over Docker's shared default bridge.
-            # Named after the worker container; removed only by _finalize (remove_network).
-            await self.command("docker", "network", "rm", network, check=False, capture=True)
-            await self.command(
-                "docker",
-                "network",
-                "create",
-                "--driver",
-                "bridge",
-                "--label",
-                "localci.worker=true",
-                network,
-            )
 
             async def remove_worker_secrets(filename: str) -> bool:
                 (ci_secret_dir / f"{filename}.secrets").unlink(missing_ok=True)
@@ -808,9 +1019,47 @@ class Runner:
                     return False
                 return code == 0
 
+            async def remove_nested_containers() -> bool:
+                # Every container on the nested daemon, verified gone: a job of the
+                # previous workflow could otherwise leave one running (detached, with
+                # /control mounted) to read the next workflow's secrets file.
+                try:
+                    code, _ = await self.command(
+                        "docker",
+                        "exec",
+                        name,
+                        "sh",
+                        "-c",
+                        NESTED_CLEANUP,
+                        check=False,
+                        capture=True,
+                        max_seconds=120,
+                        honor_cancel=False,
+                    )
+                except Exception:
+                    return False
+                return code == 0
+
             async def ci_phase():
-                nonlocal executed, final_state, message
+                nonlocal executed, ci_jobs, final_state, message
                 if prepared:
+                    # A user-defined bridge per run, for the CI worker only: concurrent runs
+                    # cannot reach each other's artifact server or job service ports over
+                    # Docker's shared default bridge. Named after the worker container;
+                    # removed only by _finalize (remove_network), after the container.
+                    await self.command(
+                        "docker", "network", "rm", network, check=False, capture=True, quiet=True
+                    )
+                    await self.command(
+                        "docker",
+                        "network",
+                        "create",
+                        "--driver",
+                        "bridge",
+                        "--label",
+                        "localci.worker=true",
+                        network,
+                    )
                     await self.command(
                         "docker",
                         "run",
@@ -833,7 +1082,7 @@ class Runner:
                     )
                     for _ in range(60):
                         code, _ = await self.command(
-                            "docker", "exec", name, "docker", "info", capture=True, check=False
+                            "docker", "exec", name, "docker", "info", capture=True, check=False, quiet=True
                         )
                         if code == 0:
                             break
@@ -863,7 +1112,16 @@ class Runner:
                         "docker load -i /runner-image.tar && rm /runner-image.tar",
                         max_seconds=600,
                     )
-                    for filename in prepared:
+                    for index, filename in enumerate(prepared):
+                        # Workflows share the worker and its nested daemon; fail closed if a
+                        # previous workflow's containers cannot be removed. Still least
+                        # exposure only: a privileged job can escape the nested daemon into
+                        # the worker itself and outlive this cleanup.
+                        if index and not await remove_nested_containers():
+                            raise RuntimeError(
+                                f"Could not remove containers left by the previous workflow from the "
+                                f"CI worker; stopping CI before {filename}"
+                            )
                         self.completed_jobs = 0
                         await asyncio.to_thread(self.step, filename, "running")
                         await asyncio.to_thread(self.log, f"\n--- {filename} ---\n")
@@ -917,10 +1175,7 @@ class Runner:
                         secret_file = ci_secret_dir / f"{filename}.secrets"
                         secret_file.touch(mode=0o600)
                         secret_file.write_text(
-                            "\n".join(
-                                f"{k}={json.dumps(v)}"
-                                for k, v in {"GITHUB_TOKEN": "", **workflow_values[filename]}.items()
-                            )
+                            dotenv_file({"GITHUB_TOKEN": "", **workflow_values[filename]}), encoding="utf-8"
                         )
                         removed = False
                         try:
@@ -935,6 +1190,7 @@ class Runner:
                                 f"Could not remove {filename} secrets from the CI worker; stopping CI"
                             )
                         executed += self.completed_jobs
+                        ci_jobs += self.completed_jobs
                         state = "failure" if code else ("success" if self.completed_jobs else "skipped")
                         await asyncio.to_thread(
                             self.step,
@@ -975,6 +1231,7 @@ class Runner:
                             cwd=checkout,
                             capture=True,
                             check=False,
+                            quiet=True,  # Optional file: absent in most repositories.
                         )
                         review_config = yaml.safe_load(base_config) if code == 0 else {}
                         review_config = review_config or {}
@@ -999,14 +1256,29 @@ class Runner:
                             review_control / "review-bootstrap.py",
                         )
                         (review_control / "review-config.yaml").write_text(yaml.safe_dump(review_config))
-                        _, patch = await self.command(
-                            "git", "diff", f"{run['base']}...{run['head']}", cwd=checkout, capture=True
+                        # The exact bytes of the diff (non-UTF-8 hunks included); git's
+                        # warnings (e.g. the rename limit) go to the run log, not the patch.
+                        await self.command(
+                            "git",
+                            "diff",
+                            f"{run['base']}...{run['head']}",
+                            cwd=checkout,
+                            output=review_control / "review.patch",
                         )
-                        (review_control / "review.patch").write_text(patch)
                         review_timeout = config.get("review_timeout", 3000)
                         (work / "review-env").write_text(
-                            "\n".join(f"{k}={v}" for k, v in review_secrets.items())
-                            + f"\nLOCALCI_PROFILE_PATH=/tmp/mergecraft-profile.jsonl\nMERGECRAFT_NONINTERACTIVE=1\nMERGECRAFT_ENV=/dev/null\nMERGECRAFT_CONFIG=/control/review-config.yaml\nMERGECRAFT_RUN_TIMEOUT_S={review_timeout}\nMERGECRAFT_COST_BUDGET_USD=5\n"
+                            docker_env_file(
+                                {
+                                    **review_secrets,
+                                    "LOCALCI_PROFILE_PATH": "/tmp/mergecraft-profile.jsonl",
+                                    "MERGECRAFT_NONINTERACTIVE": "1",
+                                    "MERGECRAFT_ENV": "/dev/null",
+                                    "MERGECRAFT_CONFIG": "/control/review-config.yaml",
+                                    "MERGECRAFT_RUN_TIMEOUT_S": str(review_timeout),
+                                    "MERGECRAFT_COST_BUDGET_USD": "5",
+                                }
+                            ),
+                            encoding="utf-8",
                         )
                         (work / "review-env").chmod(0o600)
                         await asyncio.to_thread(
@@ -1021,8 +1293,10 @@ class Runner:
                             review_name,
                             "--label",
                             "localci.worker=true",
-                            "--network",
-                            network,
+                            # No --network: Docker's default bridge gives the outbound access
+                            # to the model provider it needs. The per-run network would also
+                            # reach the privileged CI worker running PR code; user-defined
+                            # bridges are isolated from the default bridge.
                             f"--memory={review_memory}g",
                             f"--cpus={review_cpus}",
                             "--pids-limit=1024",
@@ -1081,6 +1355,7 @@ class Runner:
                             str(artifact_dir / "mergecraft.json"),
                             check=False,
                             capture=True,
+                            quiet=True,  # Absent when the review did not produce it.
                         )
                         if artifact_code:
                             await asyncio.to_thread(
@@ -1107,6 +1382,7 @@ class Runner:
                             str(evidence_file),
                             check=False,
                             capture=True,
+                            quiet=True,  # Absent when the review did not produce it.
                         )
                         evidence_data = await asyncio.to_thread(export, evidence_file, 10_000_000)
                         for filename, limit in (
@@ -1123,6 +1399,7 @@ class Runner:
                                 str(exported),
                                 check=False,
                                 capture=True,
+                                quiet=True,  # Absent when the review did not produce it.
                             )
                             await asyncio.to_thread(export, exported, limit)
                         runtime_path = artifact_dir / "mergecraft-runtime.json"
@@ -1215,6 +1492,13 @@ class Runner:
                 await asyncio.gather(*tasks, return_exceptions=True)
             if blockers and final_state == "success":
                 final_state, message = "blocked", "; ".join(blockers)
+            if prepared and not ci_jobs and final_state == "success":
+                # Every selected workflow ran zero jobs (e.g. all `if:` false). The review's
+                # own result stays on its step; the run is not green without CI.
+                final_state, message = (
+                    "blocked",
+                    "No CI job executed in the selected workflows; check workflow conditions and variables",
+                )
             if not prepared and not run_review:
                 final_state, message = "blocked", "; ".join(blockers) or "No CI workflows selected"
             if final_state == "success" and not executed:
@@ -1228,7 +1512,7 @@ class Runner:
             # Re-queued by the next poll without using the retry budget (see RECOVERABLE).
             final_state, message = (
                 "error",
-                "Execution worker stopped during this run; it is re-queued automatically",
+                "Execution worker stopped during this run; it is re-queued automatically if still eligible",
             )
             end_reason = "worker_interrupted"
         except Cancelled as exc:
@@ -1246,7 +1530,14 @@ class Runner:
     async def _finalize(self, rid, work, containers, metrics, state, message, reason):
         """Each step runs even if an earlier one fails; credential removal and
         run finalisation always complete, and a cancellation arriving meanwhile is
-        re-raised afterwards instead of being swallowed."""
+        re-raised afterwards instead of being swallowed.
+
+        Order: containers, metrics, the decrypted work directory, the run's final
+        state, and only then the network, whose removal may wait for slow
+        teardown: a graceful stop's grace period must not expire with
+        credentials on disk or the run still marked running. When the run is
+        being interrupted the network is left to the worker's startup sweep.
+        """
         interrupted: asyncio.CancelledError | None = None
 
         async def attempt(action, *args):
@@ -1276,13 +1567,14 @@ class Runner:
         await attempt(asyncio.to_thread, self.log, f"\n{state.upper()}: {message}\n")
         for container in containers:
             await attempt(self.cleanup, container)
-        # Only here, once both lanes' containers are gone: the network is named after
-        # the CI worker container, the last entry.
-        await attempt(self.remove_network, containers[-1])
         await attempt(stop_metrics)
         await complete(shutil.rmtree, work, ignore_errors=True)
         try:
             await complete(self.store.finish, rid, state, message, reason=reason)
+            # Once the CI worker container is gone: the network is named after it,
+            # the last entry.
+            if interrupted is None and reason != "worker_interrupted":
+                await attempt(self.remove_network, containers[-1])
         finally:
             if interrupted is not None:
                 raise interrupted

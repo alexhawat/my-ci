@@ -9,14 +9,33 @@ import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
-from localci.store import Store
+
+def snapshot_database(database: Path, target: Path) -> None:
+    """Copy a consistent snapshot of the live database without ever writing to it.
+
+    The connection is read-only and nothing here migrates the schema, so a newer
+    release's tool can take a pre-upgrade backup of an older database. A WAL-mode
+    database is read through its WAL, so committed changes not yet checkpointed into
+    the main file are included.
+    """
+    uri = f"file:{quote(str(database.absolute()))}?mode=ro"
+    source = sqlite3.connect(uri, uri=True, timeout=30)
+    try:
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
 
 
 def create_backup(root: Path) -> Path:
     database = root / "localci.db"
     key = root / "encryption.key"
-    # Check first: opening a missing database would create and migrate an empty one.
+    # Check first, for a clear error: the read-only connection cannot create a database.
     if not database.is_file():
         raise RuntimeError(f"Database {database} is missing; no backup was created")
     if not key.is_file():
@@ -32,7 +51,7 @@ def create_backup(root: Path) -> Path:
     path = destination / f"localci-{datetime.now(UTC):%Y%m%dT%H%M%SZ}.tar.gz"
     with tempfile.TemporaryDirectory() as tmp:
         snapshot = Path(tmp) / "localci.db"
-        Store(database).backup(snapshot)
+        snapshot_database(database, snapshot)
         # A unique 0600 temporary name: concurrent backups never share a partial file.
         fd, name = tempfile.mkstemp(dir=destination, prefix=f".{path.name}.", suffix=".partial")
         partial = Path(name)

@@ -322,6 +322,49 @@ async def test_status_retries_without_overwriting_newer_attempt(tmp_path):
     assert store.rows("SELECT published FROM runs WHERE id=?", (second,))[0]["published"] == 1
 
 
+@pytest.mark.parametrize("status,attempts", [(404, 3), (422, 3), (500, 12)])
+async def test_publish_that_cannot_succeed_is_abandoned_so_retention_can_prune_it(tmp_path, status, attempts):
+    from localci.github import GitHubError
+
+    controller = Controller(tmp_path)
+    store = controller.store
+    rid = store.enqueue("owner/repo", pr(), {})
+    store.finish(rid, "failure", "failed")
+    controller.github.request = AsyncMock(return_value=pr())
+    controller.github.status = AsyncMock(
+        side_effect=GitHubError(status, "POST", "repos/owner/repo/statuses/x")
+    )
+    for attempt in range(1, attempts + 1):
+        assert store.rows("SELECT published FROM runs WHERE id=?", (rid,))[0]["published"] == 0
+        controller.publish_retries = {k: (n, 0.0) for k, (n, _) in controller.publish_retries.items()}
+        await controller.publish()
+        assert controller.github.status.call_count == attempt
+    row = store.rows("SELECT published,publish_error FROM runs WHERE id=?", (rid,))[0]
+    assert row["published"] == 1 and f"not published after {attempts} attempts" in row["publish_error"]
+    await controller.publish()
+    assert controller.github.status.call_count == attempts  # No further requests.
+
+
+async def test_publish_backoff_honours_the_wait_github_asks_for(tmp_path):
+    import time
+
+    from localci.github import GitHubError, retry_after
+
+    assert retry_after({"retry-after": "120"}) == 120
+    assert retry_after({"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(time.time() + 600)}) > 590
+    assert retry_after({"retry-after": "999999"}) == 3600 and retry_after({"retry-after": "soon"}) is None
+    assert retry_after({"x-ratelimit-remaining": "12", "x-ratelimit-reset": "1"}) is None
+    controller = Controller(tmp_path)
+    rid = controller.store.enqueue("owner/repo", pr(), {})
+    controller.store.finish(rid, "failure", "failed")
+    controller.github.request = AsyncMock(return_value=pr())
+    controller.github.status = AsyncMock(side_effect=GitHubError(403, "POST", "statuses", retry_after=900.0))
+    await controller.publish()
+    assert controller.publish_retries[rid][1] - time.time() > 890  # Not the 5 s first backoff.
+    await controller.publish()
+    assert controller.github.status.call_count == 1
+
+
 async def test_changed_base_is_not_published_as_passing(tmp_path):
     controller = Controller(tmp_path)
     rid = controller.store.enqueue("owner/repo", pr(), {})
@@ -438,7 +481,9 @@ def test_retention_never_requeues_completed_revisions_or_resets_retry_budget(tmp
     c.store.close()
 
 
-def test_v3_upgrade_backfills_budget_and_keeps_v2_restore_backup(tmp_path):
+def test_v2_upgrade_backfills_budget_and_keeps_v2_restore_backup(tmp_path):
+    # The old layout is reproduced from the current schema; no database file written by a
+    # released v1 or v2 build is available to this repository.
     import sqlite3
 
     from localci.store import RetryLimitReached

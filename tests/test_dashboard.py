@@ -364,6 +364,63 @@ def test_closed_prs_are_display_only_cached_and_limited_to_enabled_repos(client)
     assert http.get("/api/prs?state=invalid").status_code == 422
 
 
+async def test_simultaneous_closed_pr_requests_share_one_fetch_per_repository(tmp_path, monkeypatch):
+    import asyncio
+
+    import httpx
+
+    monkeypatch.setenv("LOCALCI_TAILSCALE_LOGIN", "owner@example.com")
+    monkeypatch.setenv("LOCALCI_URL", "https://machine.example:9443")
+    app = create_app(tmp_path, background=False)
+    c = app.state.controller
+    for name in ("o/r", "o/second"):
+        c.store.discover([{"full_name": name, "private": True, "default_branch": "main"}])
+    c.store.execute("UPDATE repos SET enabled=1")
+    release, running, peak, calls = asyncio.Event(), 0, 0, []
+
+    async def pages(path, **_):
+        nonlocal running, peak
+        calls.append(path)
+        running += 1
+        peak = max(peak, running)
+        await release.wait()
+        running -= 1
+        return []
+
+    c.github.pages = pages
+    transport = httpx.ASGITransport(app=app)
+    headers = {"Tailscale-User-Login": "owner@example.com"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test", headers=headers) as http:
+        requests = [asyncio.create_task(http.get("/api/prs?state=closed")) for _ in range(5)]
+        await asyncio.sleep(0.2)
+        release.set()
+        assert all(r.status_code == 200 for r in await asyncio.gather(*requests))
+    # One request per repository, and the two repositories were fetched at the same time.
+    assert sorted(calls) == sorted(
+        f"repos/{n}/pulls?state=closed&sort=updated&direction=desc" for n in ("o/r", "o/second")
+    )
+    assert peak == 2
+    c.store.close()
+
+
+def test_failed_closed_pr_refresh_keeps_the_time_of_the_last_success(client, monkeypatch):
+    import localci.dashboard as module
+
+    http, c = client
+    assert http.put("/api/repos/o/r", json={"enabled": True, "review": True}).status_code == 200
+    closed = pr(12)
+    closed.update(state="closed", closed_at="2026-11-14T10:00:00Z")
+    c.github.pages = AsyncMock(return_value=[closed])
+    first = http.get("/api/prs?state=closed").json()
+    now = module.time.time()
+    monkeypatch.setattr(module.time, "time", lambda: now + 120)  # The cache is stale.
+    c.github.pages = AsyncMock(side_effect=RuntimeError("GitHub returned HTTP 403"))
+    second = http.get("/api/prs?state=closed").json()
+    assert [p["number"] for p in second["prs"]] == [12] and second["errors"]
+    # The time of the last success (within the first request), not of the failed attempt.
+    assert abs(second["last_poll"] - first["last_poll"]) < 5 and second["last_poll"] < now + 60
+
+
 def test_closed_pr_fetch_failure_is_reported_without_changing_open_snapshot(client):
     http, c = client
     assert http.put("/api/repos/o/r", json={"enabled": True, "review": True}).status_code == 200

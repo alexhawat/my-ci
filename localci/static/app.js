@@ -14,6 +14,7 @@ const fixed = n => Number(n || 0).toLocaleString(undefined,{maximumFractionDigit
 const memory = n => n ? fixed(n / 2**30)+' GiB' : '—';
 function elapsed(seconds) { if(seconds == null) return '—'; const s=Math.max(0,Math.floor(seconds)); return `${Math.floor(s/60)}m ${s%60}s`; }
 function duration(r) {return r.started ? elapsed((r.finished||Date.now()/1000)-r.started) : '—';}
+let workerError='';
 function notice(message) {if($('settings').open) $('settings-error').textContent=message; $('notice').textContent=message; $('notice').hidden=!message;}
 async function api(path, options={}) {
   const response=await fetch('/api'+path,{...options,headers:{'Content-Type':'application/json',...options.headers}});
@@ -112,7 +113,10 @@ function render() {
   $('account').textContent=state.login?`● ${state.login} · GitHub connected`:'Waiting for GitHub login';
   $('updated').textContent=state.last_poll?'Synced '+date(state.last_poll):'Waiting for first sync';
   renderOverviewRuns(); filterRuns(); $('enabled-repos').innerHTML=repoCards(enabled); filterRepos();
-  if(state.error) notice(state.error);
+  // The worker's own error is shown while it lasts and cleared when it ends, without
+  // replacing a message from an action the operator has just taken in a dialog.
+  if(state.error){if(state.error!==workerError){workerError=state.error;$('notice').textContent=workerError;$('notice').hidden=false;}}
+  else if(workerError){if($('notice').textContent===workerError)$('notice').hidden=true;workerError='';}
   $('worker-notice').hidden=!state.worker || state.worker.online;
 }
 async function refresh() {if(loading)return;loading=true;try{state=await api('/state');render();if(selectedRun&&$('run-detail').open)await refreshRun();if(currentView==='analytics')await loadAnalytics();if(currentView==='prs'&&prMode==='open')await loadPRs();}catch(e){notice(e.message);}finally{loading=false;}}

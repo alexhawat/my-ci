@@ -16,8 +16,8 @@ from pydantic import BaseModel, Field, field_validator
 from localci.controller import Controller
 from localci.dashboard import enrich_run, register_dashboard
 from localci.github import app_jwt
-from localci.policy import bot_pr, eligible, is_pr_workflow, workflow
-from localci.store import RetryLimitReached
+from localci.policy import BOT_HOLD, bot_pr, eligible, is_pr_workflow, workflow
+from localci.store import RetryLimitReached, RevisionChanged
 
 ROOT = Path(os.environ.get("LOCALCI_DATA", "/data"))
 
@@ -340,25 +340,27 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
         pr = await controller.github.request("GET", f"repos/{run['repo']}/pulls/{run['pr']}")
         if not eligible(pr, run["repo"]):
             raise HTTPException(400, "Only open, non-draft, same-repository PRs can run")
-        config = json.loads(repo["config"])
-        # Starting a held bot PR is the operator's approval of one exact revision. A retry
-        # runs the PR's current head, so refuse when that is not the revision of this run.
-        if (
-            bot_pr(pr)
-            and not config.get("run_bot_prs")
-            and (pr["head"]["sha"], pr["base"]["sha"]) != (run["head"], run["base"])
-        ):
-            raise HTTPException(
-                409,
-                "This bot-authored PR changed after this run; review the new revision and retry its own run",
-            )
+        # Settings may have changed while this request waited on GitHub: use the current
+        # configuration for the new run. The enabled flag and the bot-PR gate are checked
+        # again inside the enqueue transaction.
+        config = json.loads(controller.store.repo(run["repo"])["config"])
         try:
-            # The enabled check is repeated inside the enqueue transaction: the repository
-            # may have been disabled while this request waited on GitHub.
             new_id = await asyncio.to_thread(
-                partial(controller.store.enqueue, run["repo"], pr, config, retry=True, require_enabled=True)
+                partial(
+                    controller.store.enqueue,
+                    run["repo"],
+                    pr,
+                    config,
+                    retry=True,
+                    require_enabled=True,
+                    # Starting a held bot PR is the operator's approval of one exact revision.
+                    # A retry runs the PR's current head, so it is refused when that is not
+                    # the revision of the run being retried.
+                    bot_hold=BOT_HOLD if bot_pr(pr) else None,
+                    reviewed=(run["head"], run["base"]),
+                )
             )
-        except RetryLimitReached as exc:
+        except (RetryLimitReached, RevisionChanged) as exc:
             raise HTTPException(409, str(exc)) from None
         if new_id is None and not controller.store.repo(run["repo"])["enabled"]:
             raise HTTPException(400, "Enable the repository before retrying")

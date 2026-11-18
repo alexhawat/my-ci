@@ -1,4 +1,6 @@
+import hashlib
 import os
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -110,3 +112,79 @@ def test_volume_without_hard_links_fails_clearly_and_leaves_nothing(tmp_path, mo
     with pytest.raises(RuntimeError, match="hard links"):
         backup.create_backup(root)
     assert not list((root / "backups").iterdir())
+
+
+def restored_database(path: Path, tmp_path: Path) -> Path:
+    with tarfile.open(path) as archive:
+        archive.extractall(tmp_path / "restored", filter="data")
+    return tmp_path / "restored" / "localci.db"
+
+
+def test_wal_rows_not_yet_in_the_main_file_are_backed_up_read_only(tmp_path):
+    root = tmp_path / "data"
+    root.mkdir()
+    (root / "encryption.key").write_bytes(Fernet.generate_key())
+    database = root / "localci.db"
+    # The service keeps its connection open; committed rows live only in the WAL.
+    live = sqlite3.connect(database)
+    try:
+        assert live.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        live.execute("PRAGMA wal_autocheckpoint=0")
+        live.execute("CREATE TABLE items (value TEXT)")
+        live.executemany("INSERT INTO items VALUES (?)", [("a",), ("b",)])
+        live.commit()
+        assert (root / "localci.db-wal").stat().st_size > 0
+        main_file = database.read_bytes()
+        assert b"CREATE TABLE items" not in main_file  # Only in the WAL so far.
+        path = backup.create_backup(root)
+        assert database.read_bytes() == main_file  # No checkpoint or write by the backup.
+        live.execute("INSERT INTO items VALUES ('after')")
+        live.commit()
+    finally:
+        live.close()
+    snapshot = restored_database(path, tmp_path)
+    assert not snapshot.with_name("localci.db-wal").exists()
+    restored = sqlite3.connect(snapshot)
+    try:
+        assert restored.execute("SELECT value FROM items ORDER BY value").fetchall() == [("a",), ("b",)]
+    finally:
+        restored.close()
+
+
+def test_backup_never_migrates_an_older_database(tmp_path):
+    root = data_root(tmp_path)
+    database = root / "localci.db"
+    # As if the database was written by an older release and this is a newer tool.
+    older = sqlite3.connect(database)
+    try:
+        older.execute("PRAGMA user_version=1")
+        older.commit()
+    finally:
+        older.close()
+    files = sorted(os.listdir(root))
+    before = hashlib.sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns
+    result = run(root)
+    assert result.returncode == 0, result.stderr
+    assert (hashlib.sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns) == before
+    # Nothing else was written beside it: no WAL, and no migration's pre-upgrade copy.
+    assert sorted(os.listdir(root)) == sorted([*files, "backups"])
+    for path in (database, restored_database(Path(result.stdout.strip()), tmp_path)):
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        finally:
+            connection.close()
+
+
+def test_backup_tool_does_not_import_the_store(tmp_path):
+    probe = "import sys, backup; print('localci' in sys.modules)"
+    result = subprocess.run(
+        [sys.executable, "-c", probe], cwd=SCRIPT.parent, capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "False"
+
+
+def test_database_path_is_quoted_in_the_read_only_uri(tmp_path):
+    root = data_root(tmp_path / "odd?name#dir %41")
+    path = backup.create_backup(root)
+    assert Store(restored_database(path, tmp_path)).settings()["max_parallel_runs"] == 1

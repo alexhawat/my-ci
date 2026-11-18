@@ -40,38 +40,52 @@ def apply(root):
         """        if live_budget is not None:
             if live_budget.error:
                 return
-            try:
-                accepted = live_budget.accept(event)
-            except Exception as exc:
+
+            def _meter_failed(exc):
                 # The generic stream handler would swallow this and leave the agent
-                # running with metering already stopped.
+                # running with metering stopped. Keep the first stop reason.
                 from mergecraft.utils.run_bounds import BudgetExhausted
                 live_budget.error = live_budget.error or BudgetExhausted(
                     "token", "Live usage meter failed; review stopped: " + type(exc).__name__
                 )
                 live_budget.tracker.last_exhausted = live_budget.error
-                accepted = False
+                try:
+                    live_budget.save()
+                except Exception:
+                    pass
+                kill_process_group(getattr(process, "pid", None))
+
+            try:
+                accepted = live_budget.accept(event)
+            except Exception as exc:
+                _meter_failed(exc)
+                return
             if not accepted:
-                # A rejected event (invalid counters, failed meter) stops the agent.
+                # A rejected event (invalid counters or cost) stops the agent.
                 if live_budget.error:
                     kill_process_group(getattr(process, "pid", None))
                 return
-        before = acc.to_usage()
-        previous = (before.input_tokens + before.output_tokens, before.cost_usd or 0) if before else (0, 0)
-        base_handler(acc, event)
-        if live_budget is not None:
-            usage = acc.to_usage()
-            if usage is not None:
-                try:
+            try:
+                before = acc.to_usage()
+                previous = (before.input_tokens + before.output_tokens, before.cost_usd or 0) if before else (0, 0)
+                base_handler(acc, event)
+            except Exception as exc:
+                if event.get("type") != "step_finish":
+                    raise  # Upstream behaviour: the generic handler logs it.
+                # An accepted step the upstream handler failed on would go unmetered.
+                _meter_failed(exc)
+                return
+            try:
+                usage = acc.to_usage()
+                if usage is not None:
                     live_budget.charge(event, usage, previous)
-                except Exception as exc:
-                    # Do not let the generic stream handler swallow a failed meter.
-                    from mergecraft.utils.run_bounds import BudgetExhausted
-                    live_budget.error = BudgetExhausted("token", "Live usage meter failed; review stopped: " + type(exc).__name__)
-                    live_budget.tracker.last_exhausted = live_budget.error
-                    kill_process_group(getattr(process, "pid", None))
-                if live_budget.error:
-                    kill_process_group(getattr(process, "pid", None))
+            except Exception as exc:
+                _meter_failed(exc)
+                return
+            if live_budget.error:
+                kill_process_group(getattr(process, "pid", None))
+            return
+        base_handler(acc, event)
 """,
     )
     replace(

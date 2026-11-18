@@ -80,8 +80,41 @@ def register_dashboard(app, controller, repo_name, get_run):
     def run_reports(rid: str):
         return controller.reports(get_run(rid))
 
-    closed_cache: dict[str, tuple[float, list, str]] = {}
-    closed_lock = asyncio.Lock()
+    # Per repository: time of the last attempt, PRs, error of that attempt, time of the
+    # last successful fetch.
+    closed_cache: dict[str, tuple[float, list, str, float]] = {}
+    closed_fetches: dict[str, asyncio.Task] = {}
+
+    async def fetch_closed(name: str):
+        previous = closed_cache.get(name)
+        try:
+            prs = await controller.github.pages(
+                f"repos/{name}/pulls?state=closed&sort=updated&direction=desc",
+                max_pages=2,
+                truncate=True,  # Display only: the 200 most recently updated.
+            )
+        except (RuntimeError, httpx.HTTPError) as exc:
+            # Keep what was shown before, and the time it was actually fetched.
+            closed_cache[name] = (
+                time.time(),
+                previous[1] if previous else [],
+                str(exc),
+                previous[3] if previous else 0.0,
+            )
+        else:
+            closed_cache[name] = (time.time(), prs, "", time.time())
+        return closed_cache[name]
+
+    async def closed_prs(name: str):
+        cached = closed_cache.get(name)
+        if cached and time.time() - cached[0] < 60:
+            return cached
+        # One request per repository at a time: simultaneous dashboard requests that find
+        # the cache stale share it instead of each calling GitHub.
+        task = closed_fetches.get(name)
+        if task is None or task.done():
+            task = closed_fetches[name] = asyncio.create_task(fetch_closed(name))
+        return await asyncio.shield(task)
 
     @app.get("/api/prs")
     async def pull_requests(state: Literal["open", "closed"] = "open"):
@@ -101,24 +134,13 @@ def register_dashboard(app, controller, repo_name, get_run):
             synced = time.time()
             # Display-only cache: never replace the executor's open-PR snapshot
             # or enqueue work while browsing closed/merged pull requests.
-            for repo in await asyncio.to_thread(store.rows, "SELECT name FROM repos WHERE enabled=1"):
-                name = repo["name"]
-                async with closed_lock:
-                    cached = closed_cache.get(name)
-                if not cached or time.time() - cached[0] >= 60:
-                    try:
-                        prs = await controller.github.pages(
-                            f"repos/{name}/pulls?state=closed&sort=updated&direction=desc",
-                            max_pages=2,
-                            truncate=True,  # Display only: the 200 most recently updated.
-                        )
-                    except (RuntimeError, httpx.HTTPError) as exc:
-                        cached = (time.time(), cached[1] if cached else [], str(exc))
-                    else:
-                        cached = (time.time(), prs, "")
-                    async with closed_lock:
-                        closed_cache[name] = cached
-                synced = min(synced, cached[0])
+            names = [
+                repo["name"]
+                for repo in await asyncio.to_thread(store.rows, "SELECT name FROM repos WHERE enabled=1")
+            ]
+            for name, cached in zip(names, await asyncio.gather(*map(closed_prs, names)), strict=True):
+                # The oldest successful fetch, so a failed refresh does not look current.
+                synced = min(synced, cached[3])
                 if cached[2]:
                     errors.append({"name": name, "error": cached[2]})
                 rows.extend(

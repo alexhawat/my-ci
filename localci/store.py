@@ -22,6 +22,10 @@ class RetryLimitReached(RuntimeError):
     pass
 
 
+class RevisionChanged(RuntimeError):
+    """An operator's approval named a revision that is no longer the PR's current one."""
+
+
 class Store:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,6 +64,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS revision_attempts (
                     repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
                     attempts INTEGER NOT NULL, recoveries INTEGER NOT NULL DEFAULT 0,
+                    approved INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(repo,pr,head,base)
                 );
                 CREATE TABLE IF NOT EXISTS secrets (
@@ -93,8 +98,12 @@ class Store:
             """)
             if "end_reason" not in {r[1] for r in db.execute("PRAGMA table_info(runs)")}:
                 db.execute("ALTER TABLE runs ADD COLUMN end_reason TEXT NOT NULL DEFAULT ''")
-            if "recoveries" not in {r[1] for r in db.execute("PRAGMA table_info(revision_attempts)")}:
+            budget_columns = {r[1] for r in db.execute("PRAGMA table_info(revision_attempts)")}
+            if "recoveries" not in budget_columns:
                 db.execute("ALTER TABLE revision_attempts ADD COLUMN recoveries INTEGER NOT NULL DEFAULT 0")
+            if "approved" not in budget_columns:
+                # Whether an operator started this revision; nothing earlier recorded that.
+                db.execute("ALTER TABLE revision_attempts ADD COLUMN approved INTEGER NOT NULL DEFAULT 0")
             if version == 3:
                 # The previous release re-ran these system-ended runs by matching their
                 # message; keep them recoverable now that the reason is a column.
@@ -211,6 +220,7 @@ class Store:
         retry: bool = False,
         hold: str | None = None,
         bot_hold: str | None = None,
+        reviewed: tuple[str, str] | None = None,
         require_enabled: bool = False,
     ) -> str | None:
         """Queue a run for the PR's current head/base revision.
@@ -220,8 +230,11 @@ class Store:
         charging the retry budget, at most MAX_RECOVERIES times. ``retry`` is the
         operator path and is charged against the budget. ``hold`` records the first
         run as blocked with that message instead of queueing it (operator approval gate).
-        ``bot_hold`` is such a message for a bot-authored PR; it applies unless the
-        repository's stored configuration allows automatic bot runs at this moment.
+        ``bot_hold`` is such a message for a bot-authored PR. Unless the repository's
+        stored configuration allows automatic bot runs at this moment, such a PR runs
+        only on a revision an operator started: its first run is held, an automatic
+        recovery of a never-approved revision becomes a held run, and a retry must name
+        the revision the operator ``reviewed`` (head, base) or RevisionChanged is raised.
         ``require_enabled`` makes the repository's enabled flag part of the transaction.
         """
         head, base = pr["head"]["sha"], pr["base"]["sha"]
@@ -240,31 +253,42 @@ class Store:
             watched = db.execute("SELECT enabled,config FROM repos WHERE name=?", (repo,)).fetchone()
             if require_enabled and (not watched or not watched["enabled"]):
                 return None
-            if bot_hold and not retry:
-                # Read here, not by the caller before its slow GitHub request: an operator
-                # who just switched automatic bot runs off must not be overtaken by a poll.
-                allowed = bool(watched and json.loads(watched["config"]).get("run_bot_prs"))
-                hold = None if allowed else bot_hold
             budget = db.execute(
-                "SELECT attempts,recoveries FROM revision_attempts WHERE repo=? AND pr=? AND head=? AND base=?",
+                "SELECT attempts,recoveries,approved FROM revision_attempts "
+                "WHERE repo=? AND pr=? AND head=? AND base=?",
                 key,
             ).fetchone()
-            attempts, recoveries = (budget["attempts"], budget["recoveries"]) if budget else (0, 0)
+            attempts, recoveries, approved = tuple(budget) if budget else (0, 0, 0)
+            # Read here, not by the caller before its slow GitHub request: an operator who
+            # just switched automatic bot runs off must not be overtaken by a poll or retry.
+            gated = bool(bot_hold) and not (watched and json.loads(watched["config"]).get("run_bot_prs"))
+            if gated and retry and reviewed is not None and reviewed != (head, base):
+                raise RevisionChanged(
+                    "This bot-authored PR changed after this run; review the new revision and retry its own run"
+                )
+            # The automatic path may start a gated bot PR only on a revision an operator started.
+            gated = gated and not retry and not approved
+            if gated:
+                hold = bot_hold
             recovery = bool(
                 not retry
                 and previous
                 and previous["end_reason"] in RECOVERABLE
                 and recoveries < MAX_RECOVERIES
             )
+            # An interrupted bot run nobody approved (auto-run before the option was switched
+            # off, or by a release that had no gate) is held for approval, not re-run.
+            hold_recovery = recovery and gated
+            recovery = recovery and not gated
             # ``attempts`` outlives pruned run rows, so a completed revision is never re-run
             # automatically just because its history aged out.
             # A held bot PR starts on its own once the repository opts into automatic bot runs.
             release = bool(
                 not retry and hold is None and previous and previous["end_reason"] == "awaiting_approval"
             )
-            if (previous or attempts) and not retry and not recovery and not release:
+            if (previous or attempts) and not retry and not recovery and not release and not hold_recovery:
                 return None
-            hold = None if previous or retry else hold
+            hold = None if (previous and not hold_recovery) or retry else hold
             if retry:
                 setting = db.execute("SELECT value FROM settings WHERE key='execution'").fetchone()
                 max_retries = (json.loads(setting[0]) if setting else {}).get("max_retries", 2)
@@ -304,10 +328,12 @@ class Store:
                 )
             billed = 0 if recovery or hold else 1
             db.execute(
-                "INSERT INTO revision_attempts(repo,pr,head,base,attempts,recoveries) VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(repo,pr,head,base) DO UPDATE SET "
-                "attempts=attempts+excluded.attempts,recoveries=recoveries+excluded.recoveries",
-                (*key, billed, int(recovery)),
+                "INSERT INTO revision_attempts(repo,pr,head,base,attempts,recoveries,approved) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(repo,pr,head,base) DO UPDATE SET "
+                "attempts=attempts+excluded.attempts,recoveries=recoveries+excluded.recoveries,"
+                "approved=MAX(approved,excluded.approved)",
+                # A retry is an operator starting this exact revision.
+                (*key, billed, int(recovery), int(retry)),
             )
             return rid
 

@@ -15,10 +15,12 @@ ARG CHROME_VERSION=
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     list=/etc/apt/sources.list.d/localci-google-chrome.list; \
-    keyring=/usr/share/keyrings/google-chrome.gpg; \
+    keyring=/usr/share/keyrings/localci-google-chrome.gpg; \
     drop_other_chrome_sources() { \
         for source in /etc/apt/sources.list.d/*; do \
-            if [ "$source" != "$list" ] && grep -qs 'dl\.google\.com/linux/chrome' "$source"; then rm -f "$source"; fi; \
+            if [ "$source" = "$list" ]; then continue; fi; \
+            case "${source##*/}" in google-chrome*) rm -rf "$source"; continue ;; esac; \
+            if grep -Eqis 'dl(-ssl)?\.google\.com/linux/chrome' "$source"; then rm -f "$source"; fi; \
         done; \
     }; \
     drop_other_chrome_sources; \
@@ -45,20 +47,46 @@ RUN set -eux; \
     google-chrome --version
 # The package's post-install can add its own apt source and trusted key in the
 # background. A separate step runs only after every process of the install step has
-# ended, removes them, and fails the build if any other Chrome source or key remains.
+# ended, removes them, and fails the build unless our source is the only Chrome source
+# and our keyring (a name the package does not use) still holds only the pinned key.
 RUN set -eu; \
     list=/etc/apt/sources.list.d/localci-google-chrome.list; \
+    keyring=/usr/share/keyrings/localci-google-chrome.gpg; \
+    pattern='dl(-ssl)?\.google\.com/linux/chrome'; \
+    fail() { echo "Chrome apt verification failed: $1" >&2; exit 1; }; \
     for source in /etc/apt/sources.list.d/*; do \
-        if [ "$source" != "$list" ] && grep -qs 'dl\.google\.com/linux/chrome' "$source"; then rm -f "$source"; fi; \
+        if [ "$source" = "$list" ]; then continue; fi; \
+        case "${source##*/}" in google-chrome*) rm -rf "$source"; continue ;; esac; \
+        if grep -Eqis "$pattern" "$source"; then rm -f "$source"; fi; \
     done; \
-    rm -f /etc/apt/trusted.gpg.d/google-chrome.gpg /etc/apt/trusted.gpg.d/google-chrome.asc; \
-    test -s "$list"; \
-    if grep -rlsF 'dl.google.com/linux/chrome' /etc/apt/sources.list /etc/apt/sources.list.d | grep -vxF "$list"; then \
-        echo 'unexpected Chrome apt source' >&2; exit 1; \
+    rm -rf /etc/apt/trusted.gpg.d/google-chrome* /usr/share/keyrings/google-chrome*; \
+    check="$(mktemp -d)"; \
+    test -s "$list" || fail "missing $list"; \
+    printf 'deb [arch=amd64 signed-by=%s] https://dl.google.com/linux/chrome/deb/ stable main\n' "$keyring" > "$check/expected"; \
+    cmp -s "$check/expected" "$list" || fail "unexpected content in $list"; \
+    set -- /etc/apt/sources.list.d; \
+    if [ -e /etc/apt/sources.list ]; then set -- "$@" /etc/apt/sources.list; fi; \
+    status=0; grep -RElis "$pattern" "$@" > "$check/sources" || status=$?; \
+    if [ "$status" -gt 1 ]; then fail 'cannot scan apt sources'; fi; \
+    grep -qxF "$list" "$check/sources" || fail 'source scan did not find our list'; \
+    if grep -vxF "$list" "$check/sources" >&2; then fail 'unexpected Chrome apt source'; fi; \
+    if [ -d /etc/apt/trusted.gpg.d ]; then \
+        find /etc/apt/trusted.gpg.d -iname '*google-chrome*' > "$check/keys"; \
+        if [ -s "$check/keys" ]; then cat "$check/keys" >&2; fail 'unexpected Chrome apt key'; fi; \
     fi; \
-    if ls /etc/apt/trusted.gpg.d 2>/dev/null | grep -qi 'google-chrome'; then \
-        echo 'unexpected Chrome apt key' >&2; exit 1; \
-    fi
+    export GNUPGHOME="$check/gnupg"; mkdir -m 0700 "$GNUPGHOME"; \
+    test -s "$keyring" || fail "missing $keyring"; \
+    gpg --batch --show-keys --with-colons "$keyring" > "$check/keyring"; \
+    awk -F: '$1 == "fpr" && prev == "pub" { print $10 } { prev = $1 }' "$check/keyring" > "$check/primary.fpr"; \
+    test "$(wc -l < "$check/primary.fpr")" -eq 1 || fail "$keyring must hold exactly one key"; \
+    grep -qx "${CHROME_KEY_FINGERPRINT}" "$check/primary.fpr" || fail "$keyring fingerprint changed"; \
+    if [ -s /etc/apt/trusted.gpg ]; then \
+        gpg --batch --show-keys --with-colons /etc/apt/trusted.gpg > "$check/legacy"; \
+        test -s "$check/legacy" || fail 'cannot read /etc/apt/trusted.gpg'; \
+        if grep -i '^uid:.*google' "$check/legacy" >&2; then fail 'Google key in /etc/apt/trusted.gpg'; fi; \
+    fi; \
+    gpgconf --kill all 2>/dev/null || true; \
+    rm -rf "$check"
 RUN useradd -m -u 1001 -s /bin/bash runner \
     && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
     && chmod 440 /etc/sudoers.d/runner

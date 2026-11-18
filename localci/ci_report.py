@@ -45,6 +45,23 @@ class StepOutput:
         return result
 
 
+# The event index splits "[<job>] <message>" at the first "]". act prints its own
+# result as "[<job>] 🏁  Job succeeded", while everything it echoes for a step
+# follows the prefix with two or more spaces ("[job]   | output", "[job]   🚧  ...").
+_RESULT = re.compile(r"🏁  Job (succeeded|failed)\s*")
+# A job name with "]" leaves the rest of the name in the message: "b] 🏁  Job ...".
+_RESULT_AFTER_BRACKET = re.compile(r"(?:[^\]\n]|\](?! {2}))*\] 🏁  Job (succeeded|failed)\s*")
+
+
+def job_result(job: str, text: str) -> str | None:
+    """'success'/'failure' for act's own job result line; None for anything else,
+    including a step that prints a forged "[x] 🏁  Job succeeded"."""
+    match = _RESULT.fullmatch(text) or ("[" in job and _RESULT_AFTER_BRACKET.fullmatch(text))
+    if not match:
+        return None
+    return "success" if match[1] == "succeeded" else "failure"
+
+
 def evidence(run, store, clean):
     jobs = OrderedDict()
     output = {}
@@ -101,8 +118,9 @@ def evidence(run, store, clean):
             else:
                 pending_failure.pop(key, None)
                 context = output[key] = StepOutput()
-        if "🏁  Job succeeded" in text or "🏁  Job failed" in text:
-            job["state"] = "success" if "succeeded" in text else "failure"
+        result = job_result(row["job"], text)
+        if result:
+            job["state"] = result
             job["finished"] = row["timestamp"]
             pending_failure.pop(key, None)
         # These are evidence snippets, never inputs to the workflow success gate.

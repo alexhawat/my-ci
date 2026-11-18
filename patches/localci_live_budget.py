@@ -1,6 +1,7 @@
 """Meter OpenCode steps during execution, with numeric-only durable evidence."""
 
 import json
+import math
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -23,6 +24,13 @@ def _counter(value):
     return value
 
 
+def _valid_cost(value):
+    """A cost is absent, null or a finite non-negative number (bool is not)."""
+    if value is None:
+        return True
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
 class LiveBudget:
     def __init__(self, tracker):
         self.tracker = tracker
@@ -41,8 +49,8 @@ class LiveBudget:
         fields.update(cache_read=_counter(cache.get("read")), cache_write=_counter(cache.get("write")))
         return fields
 
-    def _reject_counters(self):
-        self.error = BudgetExhausted("token", "Invalid provider token counters; review stopped")
+    def _reject_counters(self, what="token counters", kind="token"):
+        self.error = BudgetExhausted(kind, f"Invalid provider {what}; review stopped")
         self.tracker.last_exhausted = self.error
         self.save()
 
@@ -56,6 +64,11 @@ class LiveBudget:
         tokens = part.get("tokens")
         if isinstance(tokens, dict) and any(v is None for v in self._fields(tokens).values()):
             self._reject_counters()
+            return False
+        # Upstream adds any int/float cost; NaN, infinity or a negative value
+        # would make the accumulated cost stop counting against the cost budget.
+        if not _valid_cost(part.get("cost")):
+            self._reject_counters("cost", "cost")
             return False
         # One assistant message can contain several step_finish parts, each
         # billed separately, so the part ID identifies a step. Replayed events
@@ -82,6 +95,9 @@ class LiveBudget:
         fields = self._fields(value["part"]["tokens"])
         if any(v is None for v in fields.values()):
             self._reject_counters()
+            return
+        if not _valid_cost(value["part"].get("cost")):
+            self._reject_counters("cost", "cost")
             return
         self.steps += 1
         for key, number in fields.items():

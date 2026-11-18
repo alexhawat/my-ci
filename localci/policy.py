@@ -34,16 +34,27 @@ def is_pr_workflow(data: dict) -> bool:
     return events == "pull_request" if isinstance(events, str) else "pull_request" in events
 
 
-_SECRET_NAME = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)", re.I)
-_SECRET_INDEX = re.compile(r"\bsecrets\s*\[\s*(?:'([^'\]]+)'|\"([^\"\]]+)\")\s*\]", re.I)
+# The secrets context, not a property such as needs.scan.outputs.secrets-found or
+# inputs.secrets.TOKEN: never preceded by ".", a word character or "-".
+_CONTEXT = r"(?<![.\w-])secrets"
+_SECRET_NAME = re.compile(_CONTEXT + r"\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)(?![\w-])", re.I)
+_SECRET_INDEX = re.compile(_CONTEXT + r"\s*\[\s*(?:'([^'\]]+)'|\"([^\"\]]+)\")\s*\]", re.I)
 # Access that cannot be resolved statically: toJSON(secrets), secrets.*, secrets[<expr>].
 _SECRET_DYNAMIC = re.compile(
-    r"toJSON\s*\(\s*secrets\s*\)|\bsecrets\s*\.\s*\*|\bsecrets\s*\[(?!\s*(?:'[^'\]]+'|\"[^\"\]]+\")\s*\])",
+    r"toJSON\s*\(\s*secrets\s*\)|"
+    + _CONTEXT
+    + r"\s*\.\s*\*|"
+    + _CONTEXT
+    + r"\s*\[(?!\s*(?:'[^'\]]+'|\"[^\"\]]+\")\s*\])",
     re.I,
 )
 _STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
-_INDEX_BEFORE = re.compile(r"\bsecrets\s*\[\s*$", re.I)
+# A context indexed by a string literal that must survive _code: secrets['NAME'] names
+# a secret and github['token'] is github.token.
+_INDEXED_CONTEXT = re.compile(r"(?<![.\w-])(?:secrets|github)\s*\[\s*\Z", re.I)
 _INDEX_AFTER = re.compile(r"\s*\]")
+# Longest text before a literal that _INDEXED_CONTEXT needs to see, blanks included.
+_INDEX_CONTEXT_WINDOW = 256
 
 
 def _embedded_expressions(text: str) -> list[str]:
@@ -71,20 +82,26 @@ def _embedded_expressions(text: str) -> list[str]:
 
 def _code(expression: str) -> str:
     """The expression with string literals emptied, so words inside text such as
-    ``'rotate secrets'`` are not read as references. A literal used as an index of
-    ``secrets[...]`` is kept: it names the secret."""
+    ``'rotate secrets'`` are not read as references. A literal used as the index
+    of ``secrets[...]`` or ``github[...]`` is kept: it names the secret or property.
+
+    Linear: only a bounded stretch before each literal is inspected (an index
+    padded with more blanks than that is emptied, which reads as dynamic access,
+    the safe direction for secrets).
+    """
 
     def replace(match: re.Match) -> str:
-        indexed = _INDEX_BEFORE.search(expression, 0, match.start()) and _INDEX_AFTER.match(
-            expression, match.end()
-        )
-        return match.group() if indexed else "''"
+        start = match.start()
+        before = expression[max(0, start - _INDEX_CONTEXT_WINDOW) : start]
+        if _INDEXED_CONTEXT.search(before) and _INDEX_AFTER.match(expression, match.end()):
+            return match.group()
+        return "''"
 
     return _STRING_LITERAL.sub(replace, expression)
 
 
-_BARE_SECRETS = re.compile(r"\bsecrets\b(?!\s*[.\[])", re.I)
-_GITHUB_TOKEN = re.compile(r"\bgithub\s*(?:\.\s*token\b|\[\s*['\"]token['\"]\s*\])", re.I)
+_BARE_SECRETS = re.compile(_CONTEXT + r"(?![\w-])(?!\s*[.\[])", re.I)
+_GITHUB_TOKEN = re.compile(r"(?<![.\w-])github\s*(?:\.\s*token(?![\w-])|\[\s*['\"]token['\"]\s*\])", re.I)
 
 
 def _expressions(document, conditional: bool = False):
