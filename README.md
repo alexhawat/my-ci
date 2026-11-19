@@ -99,6 +99,16 @@ The optional host GitHub login grants CI jobs all permissions of that login; wor
 
 For repository-scoped Check Runs, connect a GitHub App with Checks read/write permission and an RSA private key. App credentials are not passed to CI or review containers, but they are stored in the data volume, which host-root-equivalent PR code can read.
 
+Each provider in a trusted review roster needs its own review-scoped credential binding, using the provider's configured environment index or documented credential name. Credential changes apply to the next execution. A confirmed free-tier HTTP 429 rejection is recorded against its single pending request with zero charged tokens and can proceed to the next configured model with the same shared budget. Completed requests retain their usage; incomplete or ambiguous accounting still stops the review.
+
+Which failures move on to the next model:
+
+- A rate limit (HTTP 429) falls back only on the free model `opencode/deepseek-v4.1-flash-free`, and only when the rejected request is that session's only outstanding request. It is then recorded with zero charged tokens.
+- The typed `provider.free-limit` and `provider.no-route` errors also fall back when the failing model is that free model.
+- Any other error ends the review without trying the next model. That includes a 429 from any other model, paid or free, and a 429 that arrives while several requests are outstanding: both are incomplete accounting and stop the review.
+
+A roster that starts with a free model sends the review content to that provider's free endpoint first: the diff, the source ranges the reviewer reads, and CI excerpts, for every enabled repository, private ones included. Free tiers often have different data-retention and training terms from paid API access. Check the provider's terms before putting a free model first for private repositories.
+
 ### Execution limits
 
 Repository settings control per-workflow job parallelism and time limits; selected workflow files run sequentially. Execution settings control simultaneous runs, CPU/memory reservations, and retry budgets. Defaults adapt to detected capacity, and queued runs report when they cannot fit.
