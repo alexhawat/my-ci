@@ -15,8 +15,11 @@ COPY patches/test_mergecraft_fingerprints.py /opt/localci/test_mergecraft_finger
 COPY patches/mergecraft_opencode_diagnostics.py /tmp/localci-opencode-patch.py
 COPY patches/test_mergecraft_opencode_diagnostics.py /opt/localci/test_mergecraft_opencode_diagnostics.py
 COPY patches/test_opencode_websearch.py /opt/localci/test_opencode_websearch.py
+COPY patches/mergecraft_opencode_fallback.py /tmp/localci-fallback-patch.py
+COPY patches/test_opencode_fallback.py /opt/localci/test_opencode_fallback.py
 RUN python /tmp/localci-fingerprint-patch.py && rm /tmp/localci-fingerprint-patch.py
 RUN python /tmp/localci-opencode-patch.py && rm /tmp/localci-opencode-patch.py
+RUN python /tmp/localci-fallback-patch.py && rm /tmp/localci-fallback-patch.py
 RUN --network=none python /opt/localci/test_mergecraft_fingerprints.py
 RUN --network=none python /opt/localci/test_mergecraft_opencode_diagnostics.py
 RUN --network=none python /opt/localci/test_opencode_websearch.py
@@ -59,3 +62,4 @@ COPY patches/mergecraft_compaction.py /tmp/localci-compaction-patch.py
 RUN python /tmp/localci-compaction-patch.py && rm /tmp/localci-compaction-patch.py
 COPY patches/test_compaction_usage.py /opt/localci/test_compaction_usage.py
 RUN --network=none python /opt/localci/test_compaction_usage.py
+RUN --network=none python /opt/localci/test_opencode_fallback.py
