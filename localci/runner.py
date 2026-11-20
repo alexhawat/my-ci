@@ -6,9 +6,12 @@ import hashlib
 import ipaddress
 import json
 import os
+import posixpath
 import re
 import shutil
 import stat
+import tarfile
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -454,6 +457,62 @@ NESTED_CLEANUP = (
 )
 
 
+WORKER_RUNTIMES = {"privileged": ["--privileged"], "sysbox-runc": ["--runtime=sysbox-runc"]}
+
+
+def worker_runtime() -> str:
+    """The CI worker's container runtime, from LOCALCI_WORKER_RUNTIME.
+
+    ``privileged`` (the default) runs Docker-in-Docker with ``--privileged``.
+    ``sysbox-runc`` runs it as a Sysbox system container, which the host must have
+    installed and registered as a Docker runtime. ``docker cp`` cannot write into a
+    Sysbox container's filesystem, so files are streamed with tar in that mode.
+    """
+    value = os.environ.get("LOCALCI_WORKER_RUNTIME", "").strip() or "privileged"
+    if value not in WORKER_RUNTIMES:
+        raise RuntimeError(
+            f"LOCALCI_WORKER_RUNTIME must be one of {', '.join(WORKER_RUNTIMES)}; got {value!r}"
+        )
+    return value
+
+
+def nested_network_arguments() -> list[str]:
+    """dockerd address options for the nested daemon, from LOCALCI_NESTED_BIP and
+    LOCALCI_NESTED_ADDRESS_POOL; neither is passed when unset.
+
+    By default the nested daemon gives its docker0 Docker's default bridge address.
+    On a host whose daemon sends container DNS to a resolver on the host's own
+    docker0 (``"dns"`` in daemon.json set to that address), the nested docker0 then
+    holds the resolver's address: the worker's lookups reach its own bridge, where
+    nothing answers, and every image pull fails with "server misbehaving". Setting
+    ranges that are unused on the host avoids that.
+    """
+    bip = os.environ.get("LOCALCI_NESTED_BIP", "").strip()
+    pool = os.environ.get("LOCALCI_NESTED_ADDRESS_POOL", "").strip()
+    args = []
+    try:
+        interface = ipaddress.ip_interface(bip) if bip else None
+        network = ipaddress.ip_network(pool) if pool else None
+    except ValueError:
+        raise RuntimeError(
+            "LOCALCI_NESTED_BIP must be an IPv4 address with prefix and LOCALCI_NESTED_ADDRESS_POOL an IPv4 "
+            f"network; got {bip!r} and {pool!r}"
+        ) from None
+    if interface is not None:
+        if interface.version != 4:
+            raise RuntimeError(f"LOCALCI_NESTED_BIP must be an IPv4 address with prefix; got {bip!r}")
+        args.append(f"--bip={bip}")
+    if network is not None:
+        if network.version != 4 or network.prefixlen > 24:
+            raise RuntimeError(
+                f"LOCALCI_NESTED_ADDRESS_POOL must be an IPv4 network of /24 or larger; got {pool!r}"
+            )
+        args.append(f"--default-address-pool=base={pool},size=24")
+    if interface is not None and network is not None and interface.network.overlaps(network):
+        raise RuntimeError("LOCALCI_NESTED_BIP must not overlap LOCALCI_NESTED_ADDRESS_POOL")
+    return args
+
+
 def nested_dns_arguments() -> list[str]:
     """dockerd ``--dns`` options for the nested daemon, from LOCALCI_NESTED_DNS.
 
@@ -669,6 +728,8 @@ class Runner:
         honor_cancel: bool = True,
         output: Path | None = None,
         quiet: bool = False,
+        stdin_file: Path | None = None,
+        stdout_file: Path | None = None,
     ) -> tuple[int, str]:
         """Run a command; ``honor_cancel=False`` is for bounded cleanup that must run anyway.
 
@@ -681,22 +742,30 @@ class Runner:
         discards it instead, for probes whose failure is expected and already
         reported by the caller (an optional file that is absent, a daemon that is
         not ready yet).
+
+        ``stdin_file`` feeds a file to the command's stdin; ``stdout_file`` writes its
+        stdout to a file without the capture limit, with stderr logged as for a
+        captured command. Both are for tar streams into and out of a Sysbox worker.
         """
         if honor_cancel:
             await asyncio.to_thread(self.cancelled)
         captured = capture or output is not None
-        if not captured:
+        if not captured and stdout_file is None:
             stderr = asyncio.subprocess.STDOUT
         else:
             stderr = asyncio.subprocess.DEVNULL if quiet else asyncio.subprocess.PIPE
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=cwd,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=stderr,
-            start_new_session=True,
-        )
+        with contextlib.ExitStack() as files:
+            stdin = files.enter_context(stdin_file.open("rb")) if stdin_file else None
+            stdout = files.enter_context(stdout_file.open("wb")) if stdout_file else asyncio.subprocess.PIPE
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=cwd,
+                env=env,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+            )
         data = bytearray()
 
         async def collect(stream: asyncio.StreamReader):
@@ -772,9 +841,10 @@ class Runner:
                 emit(pending.decode(errors="replace"))
             await flush()
 
-        assert proc.stdout
-        readers = [asyncio.create_task(collect(proc.stdout) if captured else log_lines(proc.stdout))]
-        if captured and proc.stderr:
+        readers = []
+        if proc.stdout:
+            readers.append(asyncio.create_task(collect(proc.stdout) if captured else log_lines(proc.stdout)))
+        if (captured or stdout_file is not None) and proc.stderr:
             readers.append(asyncio.create_task(log_lines(proc.stderr)))
         start = time.monotonic()
         try:
@@ -805,6 +875,70 @@ class Runner:
             output.write_bytes(bytes(data))
             return code, ""
         return code, data.decode(errors="replace")
+
+    async def copy_to_worker(self, name: str, source: Path, dest: str, sysbox: bool, max_seconds: int = 3600):
+        """Copy a file or directory to ``dest`` in the CI worker, as ``docker cp`` would."""
+        if not sysbox:
+            await self.command("docker", "cp", str(source), f"{name}:{dest}", max_seconds=max_seconds)
+            return
+        parent, target = posixpath.split(dest.rstrip("/"))
+        with tempfile.NamedTemporaryFile(dir=source.parent, prefix=".localci-", suffix=".tar") as archive:
+
+            def pack():
+                with tarfile.open(fileobj=archive, mode="w") as bundle:
+                    bundle.add(source, arcname=target)
+                archive.flush()
+
+            await asyncio.to_thread(pack)
+            await self.command(
+                "docker",
+                "exec",
+                "-i",
+                name,
+                "tar",
+                "-xf",
+                "-",
+                "-C",
+                parent or "/",
+                stdin_file=Path(archive.name),
+                max_seconds=max_seconds,
+            )
+
+    async def copy_artifacts_from_worker(self, name: str, dest: Path, sysbox: bool):
+        """Copy the worker's /artifacts tree into ``dest``; missing artifacts are not an error."""
+        if not sysbox:
+            await self.command("docker", "cp", f"{name}:/artifacts/.", str(dest), check=False)
+            return
+        with tempfile.NamedTemporaryFile(dir=dest.parent, prefix=".localci-", suffix=".tar") as archive:
+            code, _ = await self.command(
+                "docker",
+                "exec",
+                name,
+                "tar",
+                "-C",
+                "/artifacts",
+                "-cf",
+                "-",
+                ".",
+                stdout_file=Path(archive.name),
+                check=False,
+            )
+            if code:
+                return
+
+            def unpack():
+                # Regular files and directories only, never outside dest: the tar stream
+                # comes from a worker that ran PR code.
+                def regular(member, path):
+                    return tarfile.data_filter(member, path) if member.isfile() or member.isdir() else None
+
+                with tarfile.open(archive.name, "r") as bundle:
+                    bundle.extractall(dest, filter=regular)
+
+            try:
+                await asyncio.to_thread(unpack)
+            except (tarfile.TarError, OSError) as exc:
+                await asyncio.to_thread(self.log, f"Could not copy CI artifacts: {exc}\n")
 
     async def _quiet_docker(self, *args: str) -> str:
         try:
@@ -1085,6 +1219,8 @@ class Runner:
             async def ci_phase():
                 nonlocal executed, ci_jobs, final_state, message
                 if prepared:
+                    runtime = worker_runtime()
+                    sysbox = runtime == "sysbox-runc"
                     # A user-defined bridge per run, for the CI worker only: concurrent runs
                     # cannot reach each other's artifact server or job service ports over
                     # Docker's shared default bridge. Named after the worker container;
@@ -1112,7 +1248,7 @@ class Runner:
                         "localci.worker=true",
                         "--network",
                         network,
-                        "--privileged",
+                        *WORKER_RUNTIMES[runtime],
                         f"--memory={ci_memory}g",
                         f"--cpus={ci_cpus}",
                         "--pids-limit=8192",
@@ -1120,6 +1256,7 @@ class Runner:
                         "DOCKER_TLS_CERTDIR=",
                         os.environ.get("LOCALCI_WORKER_IMAGE", "localci-worker:1"),
                         "--host=unix:///var/run/docker.sock",
+                        *nested_network_arguments(),
                         *nested_dns_arguments(),
                     )
                     for _ in range(60):
@@ -1133,27 +1270,43 @@ class Runner:
                         raise RuntimeError("Docker worker failed to start")
                     await asyncio.to_thread(
                         self.log,
-                        "Privileged nested Docker ready. PR code has host-root-equivalent access; trusted repositories only.\n",
+                        "Sysbox nested Docker ready. PR code runs in a user-namespaced system container "
+                        "that shares the host kernel; trusted repositories only.\n"
+                        if sysbox
+                        else "Privileged nested Docker ready. PR code has host-root-equivalent access; "
+                        "trusted repositories only.\n",
                     )
-                    await self.command("docker", "cp", str(checkout), f"{name}:/workspace")
-                    await self.command("docker", "cp", str(control), f"{name}:/control")
+                    await self.copy_to_worker(name, checkout, "/workspace", sysbox)
+                    await self.copy_to_worker(name, control, "/control", sysbox)
                     # Seed the local runner image, avoiding a full image download on every run.
-                    await self.command(
-                        "docker",
-                        "cp",
-                        "/opt/localci/runner-image.tar",
-                        f"{name}:/runner-image.tar",
-                        max_seconds=600,
-                    )
-                    await self.command(
-                        "docker",
-                        "exec",
-                        name,
-                        "sh",
-                        "-c",
-                        "docker load -i /runner-image.tar && rm /runner-image.tar",
-                        max_seconds=600,
-                    )
+                    if sysbox:
+                        await self.command(
+                            "docker",
+                            "exec",
+                            "-i",
+                            name,
+                            "docker",
+                            "load",
+                            stdin_file=Path("/opt/localci/runner-image.tar"),
+                            max_seconds=600,
+                        )
+                    else:
+                        await self.command(
+                            "docker",
+                            "cp",
+                            "/opt/localci/runner-image.tar",
+                            f"{name}:/runner-image.tar",
+                            max_seconds=600,
+                        )
+                        await self.command(
+                            "docker",
+                            "exec",
+                            name,
+                            "sh",
+                            "-c",
+                            "docker load -i /runner-image.tar && rm /runner-image.tar",
+                            max_seconds=600,
+                        )
                     for index, filename in enumerate(prepared):
                         # Workflows share the worker and its nested daemon; fail closed if a
                         # previous workflow's containers cannot be removed. Still least
@@ -1221,8 +1374,8 @@ class Runner:
                         )
                         removed = False
                         try:
-                            await self.command(
-                                "docker", "cp", str(secret_file), f"{name}:/control/{filename}.secrets"
+                            await self.copy_to_worker(
+                                name, secret_file, f"/control/{filename}.secrets", sysbox
                             )
                             code, _ = await self.command(*args, check=False)
                         finally:
@@ -1245,7 +1398,7 @@ class Runner:
                     # CI-controlled artifacts cannot overwrite review evidence.
                     ci_artifacts = artifact_dir / "ci"
                     ci_artifacts.mkdir(exist_ok=True)
-                    await self.command("docker", "cp", f"{name}:/artifacts/.", str(ci_artifacts), check=False)
+                    await self.copy_artifacts_from_worker(name, ci_artifacts, sysbox)
 
             async def review_phase():
                 nonlocal executed, final_state, message
