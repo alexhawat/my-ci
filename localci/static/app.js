@@ -211,9 +211,40 @@ function resourceChart(samples) {
   $('run-resources').innerHTML=`<h3>CPU over time · ${samples.length} samples</h3><svg class="resource-chart" viewBox="0 0 1000 120" role="img" aria-label="Sampled CPU usage, peak ${fixed(max)} percent; 100 percent is one CPU core"><polyline points="${points}" fill="none" stroke="currentColor" stroke-width="2"/><line x1="20" x2="980" y1="105" y2="105" stroke="#344259"/></svg><p class="muted">${date(start)} → ${date(end)} · ${fixed(max)}% chart maximum (100% = 1 CPU core). Samples about every 5 seconds.</p>`;
 }
 async function loadExecution() {
+  loadUpdate();
   const data=await api('/execution'),s=data.settings,c=data.capacity;
   $('max-runs').value=s.max_parallel_runs;$('max-retries').value=s.max_retries;$('run-cpus').value=s.cpus_per_run;$('run-memory').value=s.memory_gb_per_run;$('queue-paused').checked=s.paused;
   $('host-capacity').textContent=c.cpus?`${state.host||'Configured worker'}: ${c.cpus} logical CPUs · ${c.memory_gb} GiB RAM. The scheduler reserves up to 2 CPUs and 4 GiB for the host where capacity permits. CI and review share each run’s total limit. Parallel review reserves up to 2 CPUs / 4 GiB (at most one quarter of each limit); CI gets the rest.`:'Reading host capacity…';capacityPlan();
+}
+let updateTimer=null;
+const shortSha = sha => sha ? sha.slice(0,7) : 'unknown';
+async function loadUpdate() {
+  clearTimeout(updateTimer); updateTimer=null;
+  let data;
+  try {data=await api('/update');}
+  catch(error) {
+    $('update-status').textContent=`Waiting for my-ci to respond: ${error.message}`; $('update-now').disabled=true;
+    if(currentView==='execution') updateTimer=setTimeout(loadUpdate,5000);
+    return;
+  }
+  const u=data.update||{}, latest=data.latest||{}, active=['requested','running'].includes(u.state);
+  const current=data.current?`<code>${esc(shortSha(data.current))}</code>`:'an unrecorded build';
+  const upstream=latest.sha?`<a href="${esc(latest.url)}" target="_blank" rel="noreferrer"><code>${esc(shortSha(latest.sha))}</code></a> ${esc(latest.message)} · ${date(latest.date)}`:esc(latest.error||'unknown');
+  const upToDate=Boolean(data.current&&latest.sha&&data.current===latest.sha);
+  $('update-versions').innerHTML=`Running ${current}. Latest on ${esc(latest.repo||'upstream')}@${esc(latest.branch||'main')}: ${upstream}.${upToDate?' This deployment is up to date.':''}`;
+  const status={
+    requested:`Update requested ${date(u.requested)}. New runs are paused until it finishes; waiting for ${data.active_runs} active run${data.active_runs===1?'':'s'} to finish.`,
+    running:`Updating since ${date(u.started)}: pulling, rebuilding and restarting my-ci. The dashboard disconnects for about a minute.`,
+    succeeded:`Last update finished ${date(u.finished)}${u.to?`: now at ${esc(shortSha(u.to))}`:''}.`,
+    failed:`Last update failed ${date(u.finished)}: ${esc(u.error||'see the log')}. Runs have resumed.`,
+    cancelled:`Update cancelled ${date(u.finished)}.`,
+  }[u.state];
+  $('update-status').innerHTML=[status,data.unavailable&&!active?esc(data.unavailable):''].filter(Boolean).join(' ');
+  $('update-now').disabled=active||Boolean(data.unavailable)||upToDate;
+  $('update-now').textContent=upToDate?'Up to date':'Update to latest';
+  $('update-cancel').hidden=u.state!=='requested';
+  $('update-log-box').hidden=!u.log; $('update-log').textContent=u.log||'';
+  if(active&&currentView==='execution') updateTimer=setTimeout(loadUpdate,5000);
 }
 function capacityPlan() {$('capacity-plan').textContent=`At full concurrency: up to ${Number($('max-runs').value)*Number($('run-cpus').value)} CPU cores and ${Number($('max-runs').value)*Number($('run-memory').value)} GiB allocated across workers. These are limits, not measured usage.`;}
 async function loadAnalytics() {
@@ -269,6 +300,15 @@ $('sync').addEventListener('click',async()=>{try{await api('/sync',{method:'POST
 $('cancel').addEventListener('click',async()=>{try{await api(`/runs/${selectedRun}/cancel`,{method:'POST'});await refresh();}catch(e){notice(e.message);}});
 $('retry').addEventListener('click',async()=>{try{await api(`/runs/${selectedRun}/retry`,{method:'POST'});$('run-detail').close();await refresh();}catch(e){notice(e.message);}});
 $('execution-form').addEventListener('input',capacityPlan);
+$('update-now').addEventListener('click',async()=>{
+  if(!confirm('Update my-ci to the latest upstream commit? New runs pause, active runs finish first, then the dashboard and worker rebuild and restart.')) return;
+  try {await api('/update',{method:'POST'}); notice('');} catch(error) {notice(error.message);}
+  await loadUpdate();
+});
+$('update-cancel').addEventListener('click',async()=>{
+  try {await api('/update',{method:'DELETE'}); notice('');} catch(error) {notice(error.message);}
+  await loadUpdate();
+});
 $('execution-form').addEventListener('submit',async e=>{e.preventDefault();try{await api('/execution',{method:'PUT',body:JSON.stringify({max_parallel_runs:Number($('max-runs').value),max_retries:Number($('max-retries').value),cpus_per_run:Number($('run-cpus').value),memory_gb_per_run:Number($('run-memory').value),paused:$('queue-paused').checked})});$('execution-result').textContent='Saved. New containers start on demand within these limits.';await refresh();}catch(e){$('execution-result').textContent=e.message;}});
 $('analytics-days').addEventListener('change',()=>loadAnalytics().catch(e=>notice(e.message)));
 $('app-setup').addEventListener('click',()=>$('app-dialog').showModal());

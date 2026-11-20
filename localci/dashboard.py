@@ -4,13 +4,15 @@ import asyncio
 import json
 import re
 import time
+from datetime import datetime
 from typing import Literal
 
 import httpx
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
+from localci import updater
 from localci.policy import is_pr_workflow, workflow
 from localci.results import check_summary
 
@@ -221,6 +223,73 @@ def register_dashboard(app, controller, repo_name, get_run):
             raise HTTPException(400, "Combined memory limits must leave host memory free where possible.")
         store.save_settings(value.model_dump())
         return execution()
+
+    latest: dict = {}
+
+    async def latest_commit() -> dict:
+        """The upstream branch head, cached for five minutes; errors are cached for one."""
+        if latest and time.time() - latest["fetched"] < (300 if latest.get("sha") else 60):
+            return latest
+        repo, branch = updater.upstream()
+        try:
+            data = await controller.github.request("GET", f"repos/{repo}/commits/{branch}")
+            commit = data["commit"]
+            when = datetime.fromisoformat(commit["committer"]["date"].replace("Z", "+00:00"))
+            value = {
+                "sha": data["sha"],
+                "message": commit["message"].splitlines()[0][:200] if commit["message"] else "",
+                "date": when.timestamp(),
+                "url": data.get("html_url", f"https://github.com/{repo}/commit/{data['sha']}"),
+            }
+        except (RuntimeError, httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            value = {"error": f"Could not read {repo}@{branch} from GitHub: {exc}"}
+        latest.clear()
+        latest.update(value, repo=repo, branch=branch, fetched=time.time())
+        return latest
+
+    def update_status() -> dict:
+        worker = controller.status()
+        running = store.rows("SELECT COUNT(*) AS n FROM runs WHERE state='running'")[0]["n"]
+        unavailable = worker.get("update_unavailable", "The execution worker does not support updates yet.")
+        if not worker["online"]:
+            unavailable = "The execution worker is offline."
+        return {
+            "current": worker.get("version") or updater.version(),
+            "update": updater.load(store),
+            "unavailable": unavailable,
+            "active_runs": running,
+        }
+
+    @app.get("/api/update")
+    async def get_update():
+        status = await asyncio.to_thread(update_status)
+        return {**status, "latest": {k: v for k, v in (await latest_commit()).items() if k != "fetched"}}
+
+    @app.post("/api/update")
+    def request_update(request: Request):
+        status = update_status()
+        if status["unavailable"]:
+            raise HTTPException(400, status["unavailable"])
+        value = {
+            "state": "requested",
+            "requested": time.time(),
+            "requested_by": request.headers.get("tailscale-user-login", ""),
+            "from": status["current"],
+        }
+        if not updater.transition(store, (None, "succeeded", "failed", "cancelled"), value):
+            raise HTTPException(409, "An update is already pending or running")
+        controller.notify()
+        return update_status()
+
+    @app.delete("/api/update")
+    def cancel_update():
+        state = updater.load(store)
+        if not updater.transition(
+            store, ("requested",), {**state, "state": "cancelled", "finished": time.time()}
+        ):
+            raise HTTPException(409, "Only an update that has not started can be cancelled")
+        controller.notify()
+        return update_status()
 
     @app.get("/api/repos/{owner}/{repo}/workflow")
     async def get_workflow(owner: str, repo: str, path: str, version: int | None = None):

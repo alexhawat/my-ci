@@ -14,6 +14,8 @@ Use a dedicated single-user host. Keep the backend bound to loopback behind the 
 
 Use narrow credentials. Each workflow's secrets file holds only the secrets it references (all of them if it reads secrets dynamically, such as `toJSON(secrets)`) and exists in the worker only while it runs; between workflows of one run, every container of the nested Docker daemon is removed before the next workflow's secrets file is copied in. This limits exposure but is not a sandbox, since jobs of a workflow share it and PR code can read the data volume. GitHub App credentials are not passed to CI or review containers but are stored in that volume. The optional host GitHub login is not permission-narrowed by workflow YAML, and once `login.sh` has run its token file exists on the host whether or not a repository enables it; use a dedicated low-privilege GitHub account. Keep the Docker socket, runtime token, database encryption key, backups, and provider credentials out of public artifacts and logs.
 
+The dashboard's **Update to latest** builds and starts whatever the deployment's `origin` serves on the update branch, with the execution worker's Docker socket, so it trusts that remote as much as a manual `git pull` and rebuild would. Like other dashboard writes, it requires the permitted Tailscale login and a matching `Origin`. It only fast-forwards, refuses a checkout with uncommitted tracked changes, and never starts while a run is active. Set `LOCALCI_SELF_UPDATE=0` to remove it.
+
 ## Supported versions
 
 Security fixes are applied to the latest commit on `main`. Older commits and local forks should be reviewed and upgraded by their operators.
