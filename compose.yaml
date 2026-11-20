@@ -35,6 +35,9 @@ services:
       LOCALCI_HOST_LABEL: ${LOCALCI_HOST_LABEL:-local worker}
       LOCALCI_REVIEW_IMAGE: localci-review:1
       LOCALCI_NESTED_DNS: ${LOCALCI_NESTED_DNS:-}
+      LOCALCI_NESTED_BIP: ${LOCALCI_NESTED_BIP:-}
+      LOCALCI_NESTED_ADDRESS_POOL: ${LOCALCI_NESTED_ADDRESS_POOL:-}
+      LOCALCI_WORKER_RUNTIME: ${LOCALCI_WORKER_RUNTIME:-}
     volumes:
       - localci-data:/data
       - /var/run/docker.sock:/var/run/docker.sock
