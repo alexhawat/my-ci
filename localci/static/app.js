@@ -104,7 +104,7 @@ function filterRuns() {
 function render() {
   const enabled=state.repos.filter(r=>r.enabled), done=state.runs.filter(r=>['success','failure','error','blocked'].includes(r.state));
   $('app-setup').textContent=state.github_app?'✓ GitHub App':'Connect GitHub App';
-  $('host-label').textContent=state.host||'local worker'; document.title=`Local CI · ${state.host||'local worker'}`;
+  $('host-label').textContent=state.host||'local worker'; document.title=`my-ci · ${state.host||'local worker'}`;
   $('repo-count').textContent=state.repos.length; $('enabled').textContent=enabled.length; $('discovered').textContent=`${state.repos.length} repositories available`;
   $('queue').textContent=`${state.runs.filter(r=>r.state==='running').length} / ${state.runs.filter(r=>r.state==='queued').length}`;
   $('parallel-summary').textContent=`${state.execution.max_parallel_runs} parallel run slots${state.execution.paused?' · queue paused':''}`;
