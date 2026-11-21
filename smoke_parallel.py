@@ -11,13 +11,17 @@ from localci.app import Controller
 from localci.github import GitHub
 from localci.runner import Runner
 
+LITERAL_VALUE = "a#b $HOME it's"
 WORKFLOW = """name: Local parallel fixture
 on: pull_request
 jobs:
   first:
     runs-on: ubuntu-latest
     steps:
-      - run: |
+      - env:
+          FIXTURE_LITERAL: ${{ vars.FIXTURE_LITERAL }}
+        run: |
+          echo "LOCALCI_LITERAL=$FIXTURE_LITERAL"
           echo "PARALLEL_START=first:$(date +%s)"
           sleep 20
           echo "PARALLEL_END=first:$(date +%s)"
@@ -84,7 +88,12 @@ async def main():
                 c.store.enqueue(
                     "fixture/localci",
                     pr,
-                    {"workflows": [".github/workflows/ci.yml"], "job_parallelism": 2, "timeout": 1800},
+                    {
+                        "workflows": [".github/workflows/ci.yml"],
+                        "variables": {"FIXTURE_LITERAL": LITERAL_VALUE},
+                        "job_parallelism": 2,
+                        "timeout": 1800,
+                    },
                 )
             )
         # Saving another revision must not mutate the two queued snapshots.
@@ -123,6 +132,8 @@ async def main():
             if run["state"] != "success":
                 print(log[-16000:])
                 raise AssertionError(run["message"])
+            values = re.findall(r"\| LOCALCI_LITERAL=(.*)$", log, re.MULTILINE)
+            assert values == [LITERAL_VALUE], values
             starts = [int(v) for v in re.findall(r"\| PARALLEL_START=(?:first|second):(\d+)", log)]
             ends = [int(v) for v in re.findall(r"\| PARALLEL_END=(?:first|second):(\d+)", log)]
             assert len(starts) == len(ends) == 2 and max(starts) < min(ends), (starts, ends)
@@ -157,7 +168,7 @@ async def main():
             )
             assert await check.wait() != 0
         print(
-            "PASS: two concurrent PR containers; two overlapping jobs each; immutable local workflow v1; timestamps; CPU/memory samples; cleanup",
+            "PASS: two concurrent PR containers; two overlapping jobs each; immutable local workflow v1; literal variables; timestamps; CPU/memory samples; cleanup",
             flush=True,
         )
 

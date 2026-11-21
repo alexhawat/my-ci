@@ -12,6 +12,23 @@ def replace(path, old, new):
     path.write_text(value)
 
 
+def reconcile_final_call(path):
+    anchor = "    def classify(returncode: int, stderr_text: str) -> AgentResult:\n"
+    replace(
+        path,
+        anchor,
+        anchor
+        + """        from mergecraft.localci_compaction import consume
+        consume(
+            accumulator, {},
+            lambda row: _absorb_step_usage(accumulator, row, model=ctx.resolved_model, budget_tracker=ctx.budget_tracker),
+            final=True,
+            unrouted=returncode != 0 and (session or {}).get("error_type") == "provider.no-route",
+        )
+""",
+    )
+
+
 def apply(root):
     path = root / "agents/opencode_config.py"
     replace(
@@ -30,15 +47,7 @@ def apply(root):
 """
         + anchor,
     )
-    anchor = "    def classify(returncode: int, stderr_text: str) -> AgentResult:\n"
-    replace(
-        path,
-        anchor,
-        anchor
-        + """        from mergecraft.localci_compaction import consume
-        consume(accumulator, {}, lambda row: _absorb_step_usage(accumulator, row, model=ctx.resolved_model, budget_tracker=ctx.budget_tracker), final=True)
-""",
-    )
+    reconcile_final_call(path)
 
 
 if __name__ == "__main__":

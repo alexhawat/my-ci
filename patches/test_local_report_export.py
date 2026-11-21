@@ -40,10 +40,10 @@ with tempfile.TemporaryDirectory() as folder:
         context["tool_state"],
         context["markdown_output"],
     )
-    data = json.loads((Path(folder) / "localci-metrics.json").read_text())
+    data = json.loads((Path(folder) / "evidence" / "localci-metrics.json").read_text())
     assert "123 used" in data["tokens"] and "$0.010000" in data["cost"]
     assert data["attempts"] == 1 and data["timing"] == "agent 4s"
-    assert (Path(folder) / "localci-review.md").read_text() == "Authoritative review summary"
+    assert (Path(folder) / "evidence" / "localci-review.md").read_text() == "Authoritative review summary"
     context["tool_state"].terminal_submission = None
 
     context["_localci_usages"] = [None, SimpleNamespace(cost_usd=0.01)]
@@ -55,8 +55,8 @@ with tempfile.TemporaryDirectory() as folder:
         context["tool_state"],
         context["markdown_output"],
     )
-    data = json.loads((Path(folder) / "localci-metrics.json").read_text())
+    data = json.loads((Path(folder) / "evidence" / "localci-metrics.json").read_text())
     assert data["tokens"].startswith("Unavailable") and data["cost"].startswith("Unavailable")
     assert data["attempts"] == 2
-    assert (Path(folder) / "localci-review.md").read_text() == "Transport final output"
+    assert (Path(folder) / "evidence" / "localci-review.md").read_text() == "Transport final output"
 print("Offline review accounting: complete and missing provider usage passed")

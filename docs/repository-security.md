@@ -53,9 +53,10 @@ scope, so these properties matter:
   computed from typed findings, not from what the model says.
 - **Each job holds the least token scope it needs.** The wait job can only
   read check-runs; only the review job can write comments and checks.
-- **Dependabot pull requests are gated by CI only.** GitHub withholds Actions
-  secrets from them, so they cannot be reviewed; the review job passes with a
-  warning for `dependabot[bot]` and fails for everyone else without a review.
+- **Dependabot pull requests are gated by CI only.** When GitHub identifies
+  `dependabot[bot]` as the pull request author, both mergeCraft jobs are
+  skipped. GitHub accepts the skipped `mergeCraft review` job as a required
+  check, and `CI gate` must still pass.
 - **A review that could not finish fails the check.** If the review step
   crashes, times out, or has its key or model rejected, it produces no verdict
   and the `mergeCraft review` job fails. Re-run the job once the cause is

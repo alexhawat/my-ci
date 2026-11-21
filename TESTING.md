@@ -18,7 +18,15 @@ Privacy release tests reject personal paths, non-public commit identities, commo
 
 ## Docker validation
 
-`smoke.py`, `smoke_parallel.py`, and `smoke_artifacts.py` use local fixture repositories to exercise execution, parallelism, intentional failures, and artifacts. Run them inside the execution worker service, which has the Docker socket, on a disposable CI host. `smoke.py` and `smoke_artifacts.py` require `LOCALCI_SMOKE_GH_AUTH=1` and the host token file (`LOCALCI_TOKEN_FILE`, default `/run/secrets/github-token`). They pass that real token to jobs that run third-party actions, so use a dedicated low-privilege account. `smoke_parallel.py` uses a fixture token. No paid model credentials are required.
+`smoke.py`, `smoke_parallel.py`, and `smoke_artifacts.py` use local fixture repositories to exercise execution, parallelism, intentional failures, and artifacts. Run them inside the execution worker service, which has the Docker socket, on a disposable CI host. `smoke.py` and `smoke_artifacts.py` require `LOCALCI_SMOKE_GH_AUTH=1` and the host token file (`LOCALCI_TOKEN_FILE`, default `/run/secrets/github-token`). They pass that real token to jobs that run third-party actions, so use a dedicated low-privilege account. `smoke_parallel.py` uses a fixture token. No paid model credentials are required. The authenticated smoke tests size their run using the Docker daemon's available CPUs and memory, just as the worker scheduler does.
+
+The parallel smoke test also checks that repository variables with shell metacharacters reach jobs unchanged. To pass a value literally, bind it with step-level `env:` and expand the quoted shell variable. GitHub Actions substitutes expressions in `run:` before the shell executes the script.
+
+```yaml
+- env:
+    VALUE: ${{ vars.NAME }}
+  run: printf '%s\n' "$VALUE"
+```
 
 Build the review runtime from its pinned public source with `scripts/build_review.sh`. The script needs network access for source and dependencies, but no private registry login or model-provider credential.
 

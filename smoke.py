@@ -123,6 +123,12 @@ async def main():
         token.write_text(Path(os.environ.get("LOCALCI_TOKEN_FILE", "/run/secrets/github-token")).read_text())
         token.chmod(0o600)
         store = Store(root / "data" / "db")
+        info = json.loads(
+            await asyncio.to_thread(
+                subprocess.check_output, ["docker", "info", "--format", "{{json .}}"], text=True
+            )
+        )
+        execution = store.settings({"cpus": info["NCPU"], "memory_gb": info["MemTotal"] // 2**30})
         runner = Runner(store, GitHub(token), root / "data", lambda *_: {})
         original = runner.command
 
@@ -151,7 +157,7 @@ async def main():
             pr,
             {"workflows": [".github/workflows/ci.yml"], "github_auth": "gh", "timeout": 1800},
         )
-        await runner.execute(store.claim())
+        await runner.execute(store.claim(execution))
         row = store.rows("SELECT state,message,steps FROM runs WHERE id=?", (rid,))[0]
         print(json.dumps(row))
         print((root / "data/logs" / f"{rid}.log").read_text()[-18000:])
@@ -181,7 +187,7 @@ async def main():
             pr,
             {"workflows": [".github/workflows/ci.yml"], "github_auth": "gh", "timeout": 1800},
         )
-        await runner.execute(store.claim())
+        await runner.execute(store.claim(execution))
         row = store.rows("SELECT state,message FROM runs WHERE id=?", (rid,))[0]
         print(json.dumps(row))
         if row["state"] != "failure":

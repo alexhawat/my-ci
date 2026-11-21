@@ -5,7 +5,7 @@ import { Plugin } from "@opencode/plugin";
 export default Plugin.define({
   id: "localci.review-usage",
   async setup(ctx) {
-    const { journal, nonce } = ctx.options;
+    const { journal, nonce, allowRateLimit } = ctx.options;
     if (typeof journal !== "string" || typeof nonce !== "string") {
       throw new Error("Local CI usage journal configuration missing");
     }
@@ -46,7 +46,20 @@ export default Plugin.define({
       write({ kind: "request", session: event.sessionID, request: request.id, request_kind: event.kind });
     });
     await ctx.session.hook("http.response", (event) => {
-      if (!event.response.ok) write({ kind: "error", reason: "Provider request failed; complete usage unavailable" });
+      if (event.response.ok) return;
+      if (allowRateLimit && event.response.status === 429) {
+        const queue = pending.get(event.sessionID) || [];
+        const request = queue[0];
+        // A refusal can settle the only outstanding request for this session.
+        // With concurrent requests, preserve the accounting failure.
+        if (queue.length === 1) {
+          queue.shift();
+          write({ kind: "rejected", session: event.sessionID, request: request.id,
+            request_kind: request.kind, status: 429 });
+          return;
+        }
+      }
+      write({ kind: "error", reason: "Provider request failed; complete usage unavailable" });
     });
     await ctx.session.hook("title", (event) => { event.result = "mergeCraft review"; });
     await ctx.session.hook("compaction", (event) => {
