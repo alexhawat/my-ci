@@ -142,7 +142,8 @@ for case, ceiling, first_tokens, primary_reads in [
                 token_budget_tolerance=0,
                 cost_budget_usd=5,
                 tool_call_budget=100,
-                run_timeout_s=60,
+                # Include cold CLI startup and session resume under ARM64 emulation.
+                run_timeout_s=240,
                 context_retrieval_timeout_s=10,
                 max_diff_lines=10000,
                 external_operation_timeout_s=10,
@@ -152,7 +153,7 @@ for case, ceiling, first_tokens, primary_reads in [
             tmpdir=str(root),
             tool_state=init_tool_state(owner="fixture", name="repo", dir=str(root)),
             budget_tracker=tracker,
-            idle_timeout_s=30,
+            idle_timeout_s=90,
             resolved_model="fixture/fixture",
         )
         with bind(tracker) as live:

@@ -1,9 +1,13 @@
 import asyncio
+import base64
 import json
 import os
+import select
 import subprocess
 import tempfile
 import threading
+import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +18,7 @@ from mergecraft.localci_read_batch import read_batch_tool
 from mergecraft.mcp.tool_state import init_tool_state, primary_repo_state
 from mergecraft.utils.run_bounds import BudgetTracker, RunBounds
 
+assert os.geteuid() != 0, "Source delivery must be tested as the unprivileged reviewer"
 seen = []
 fixture = tempfile.TemporaryDirectory()
 fixture_root = Path(fixture.name)
@@ -188,31 +193,61 @@ with tempfile.TemporaryDirectory() as tmp:
     env = {
         **os.environ,
         "OPENCODE_CONFIG": str(p),
+        "OPENCODE_SERVER_PASSWORD": "disposable-fixture",
         "OPENCODE_DISABLE_MODELS_FETCH": "true",
         "XDG_DATA_HOME": str(root / "data"),
         "XDG_CONFIG_HOME": str(root / "config"),
         "XDG_CACHE_HOME": str(root / "cache"),
         "PWD": str(root),
     }
-    r = subprocess.run(
-        [
-            "opencode",
-            "run",
-            "--standalone",
-            "--format",
-            "json",
-            "--title",
-            "mergecraft",
-            "--model",
-            "fixture/fixture",
-            "Read the fixture using read_batch then finish.",
-        ],
+    # Tool discovery is asynchronous. Start the real server in this fixture's
+    # directory and wait for MCP registration before submitting the first turn.
+    server = subprocess.Popen(
+        ["opencode", "serve", "--hostname", "127.0.0.1", "--port", "0"],
         cwd=root,
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
         text=True,
-        timeout=90,
     )
+    try:
+        assert server.stdout and select.select([server.stdout], [], [], 60)[0], "Server did not start"
+        announcement = server.stdout.readline().strip()
+        url = announcement.removeprefix("server listening on ")
+        assert url.startswith("http://127.0.0.1:") and url.rsplit(":", 1)[1].isdigit(), announcement
+        auth = base64.b64encode(b"opencode:disposable-fixture").decode()
+        status = urllib.request.Request(f"{url}/api/mcp", headers={"Authorization": f"Basic {auth}"})
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            with urllib.request.urlopen(status, timeout=60) as response:
+                connections = json.load(response)["data"]
+            if any(c["name"] == "fixture" and c["status"]["status"] == "connected" for c in connections):
+                break
+            time.sleep(0.25)
+        else:
+            raise AssertionError("OpenCode did not connect to the fixture MCP server")
+        r = subprocess.run(
+            [
+                "opencode",
+                "run",
+                "--server",
+                url,
+                "--format",
+                "json",
+                "--title",
+                "mergecraft",
+                "--model",
+                "fixture/fixture",
+                "Read the fixture using read_batch then finish.",
+            ],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    finally:
+        server.terminate()
+        server.wait(timeout=30)
     assert r.returncode == 0, r.stderr[-1000:]
     assert any(
         row["full_payload"] and row["has_first"] and row["has_last"] and row["has_budget"] for row in seen
