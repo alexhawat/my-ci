@@ -549,3 +549,93 @@ def test_untrusted_text_cannot_forge_markdown_structure(tmp_path, forged):
     forged_starts = ("===", "---", "# Local", "## heading", "> quoted", "    indented", "1. numbered")
     assert not any(line.startswith(forged_starts) for line in body.splitlines())
     assert literal("@team") == "@​team" and literal("[a](b)") == r"\[a\]\(b\)"
+
+
+def test_record_reports_packet_cost_coverage_reading_and_analyzer_reasons(tmp_path):
+    store, run = completed(tmp_path)
+    directory = tmp_path / "artifacts" / run["id"]
+    directory.mkdir(parents=True)
+    finding = {
+        "severity": "Major",
+        "path": "a.py",
+        "start_line": 3,
+        "message": "Broken",
+        "tool": "scanner",
+        "source": "analyzer",
+    }
+    (directory / "mergecraft.json").write_text(json.dumps({"findings": [finding]}))
+    (directory / "mergecraft-evidence.json").write_text(
+        json.dumps(
+            {
+                "findings": [finding],
+                "files_changed": ["a.py", "tests/test_a.py"],
+                "coverage": {"hunks_total": 4, "hunks_covered": 4, "lines_total": 90, "lines_covered": 90},
+                "run_metrics": {
+                    "diff_lines": 100,
+                    "recorded_cost_usd": 0.7129173,
+                    "cost_availability": "available",
+                },
+                "trajectory": {
+                    "files_read": ["a.py", "docs src"],
+                    "tool_calls": [
+                        {"tool": "read", "diff_read_path": "/tmp/review.diff", "diff_read": [1, 40]},
+                        {"tool": "read", "diff_read_path": "/tmp/review.diff", "diff_read": [30, 60]},
+                        {"tool": "read", "paths": ["a.py"], "diff_read": [1, 20]},
+                        {"tool": "git", "paths": ["docs src"]},
+                    ],
+                },
+                "deterministic_checks": [
+                    {"name": "scanner", "status": "failed"},
+                    {"name": "linter", "status": "unavailable"},
+                    {"name": "typer", "status": "unavailable"},
+                    {"name": "maker", "status": "unavailable"},
+                    {"name": "broken", "status": "failed"},
+                ],
+                "run_health": {
+                    "findings": [
+                        {
+                            "severity": "Minor",
+                            "rule_id": "changed-unread-file",
+                            "path": "tests/test_a.py",
+                            "message": "never read",
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    events = (
+        (
+            "info",
+            "skipped linter: runtime 'repo-native' needs repo-provided tooling, withheld under shell: disabled",
+        ),
+        (
+            "info",
+            "skipped typer: runtime 'repo-native' needs repo-provided tooling, withheld under shell: disabled",
+        ),
+        (
+            "error",
+            "maker: provisioning failed on attempt 1/3: no provenance for platform 'linux-amd64' on maker",
+        ),
+        ("error", '{"event": "finding", "protocol_version": "1", "finding": {"message": "Broken"}}'),
+        ("error", '{"event": "finding", "protocol_version": "1", "finding": {"message": "Bro'),
+        ("error", "mergeCraft Major: a.py:3 — Broken"),
+        ("error", "sandbox capabilities unavailable"),
+    )
+    store.append_events([(run["id"], 0.0, "mergeCraft", "", level, message) for level, message in events])
+    report = reports(run, tmp_path, store, [])["review"]
+    body = comment_body(run, "review", report, "https://private.test")
+    assert "Cost: \\$0\\.712917 recorded in the evidence packet" in body
+    assert "60 of 100 diff lines read · 1 source files opened beyond the diff" in body
+    assert "reports 4 of 4 hunks and 90 of 90 changed lines covered" in body
+    assert "run health lists 1 changed files with unread ranges" in body
+    assert "Changed files with unread ranges: tests/test\\_a\\.py" in body
+    assert "hunk coverage was not recorded" not in body
+    assert "Analyzer scanner: **findings reported**" in body
+    assert "Analyzer broken: **failed**" in body
+    assert "Analyzer maker: **provisioning failed**" in body
+    assert "Analyzers not run (2): linter, typer — needs repo\\-provided tooling" in body
+    assert "**unavailable**" not in body
+    assert '"event"' not in body and "mergeCraft Major" not in body
+    assert "sandbox capabilities unavailable" in body
+    assert "Signals behind the outcome: CLI exit code" in body

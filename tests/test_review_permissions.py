@@ -195,3 +195,24 @@ def test_accounting_export_is_allowlisted_and_does_not_copy_session_config(tmp_p
     assert metrics == {"tokens": "123 input", "cost": "Unavailable", "attempts": 2, "timing": "agent 4s"}
     assert not (tmp_path / "opencode.json").exists()
     assert (tmp_path / "mergecraft-review.md").read_text() == "The authoritative terminal review summary"
+
+
+def test_accounting_export_survives_the_review_directory_cleanup(tmp_path):
+    # mergeCraft's exit hook leaves only `evidence/` in its review directory, and
+    # the bootstrap copies the export after that exit.
+    folder = tmp_path / "mergecraft-diff-review-fixture"
+    evidence = folder / "evidence"
+    evidence.mkdir(parents=True)
+    (evidence / "local-review-patch-merge-evidence-packet.json").write_text('{"findings":[]}')
+    (evidence / "localci-metrics.json").write_text(json.dumps({"cost": "$0.010000", "attempts": 1}))
+    (evidence / "localci-review.md").write_text("Kept summary")
+    (folder / "review.diff").write_text("removed at exit")
+    for entry in folder.iterdir():
+        if entry.name != "evidence":
+            entry.unlink()
+    review_bootstrap.preserve_evidence(tmp_path)
+    assert json.loads((tmp_path / "mergecraft-metrics.json").read_text()) == {
+        "cost": "$0.010000",
+        "attempts": 1,
+    }
+    assert (tmp_path / "mergecraft-review.md").read_text() == "Kept summary"

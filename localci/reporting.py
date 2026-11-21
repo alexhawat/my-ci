@@ -133,6 +133,16 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
         result["ci"]["jobs"] = ci_evidence(run, store, lambda value: clean(value, secrets, 1200))
     if "review" in result and result["review"]["state"] not in {"skipped", "not run"}:
         add_review_record(result["review"], root / "artifacts" / run["id"], secrets)
+        if any(a.get("status") == "unavailable" for a in result["review"].get("analyzers", [])):
+            rows = store.rows(
+                """SELECT message FROM run_events WHERE run_id=? AND phase='mergeCraft'
+                AND (message LIKE 'skipped %' OR message LIKE '%: provisioning failed%')
+                ORDER BY id LIMIT 400""",
+                (run["id"],),
+            )
+            explain_analyzers(
+                result["review"]["analyzers"], [clean(e["message"], secrets, 500) for e in rows]
+            )
     for kind, report in result.items():
         report["checks"] = [
             {
@@ -178,7 +188,13 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
                     (run["id"], *phases),
                 )
                 report["diagnostics"].extend(
-                    clean(f"{e['job'] or e['phase']}: {e['message']}", secrets, 1000) for e in reversed(rows)
+                    dict.fromkeys(
+                        clean(f"{e['job'] or e['phase']}: {e['message']}", secrets, 1000)
+                        for e in reversed(rows)
+                        # Findings are rendered once, from the report; their protocol
+                        # events and log echoes would repeat each one as raw text.
+                        if not (kind == "review" and repeats_finding(str(e["message"])))
+                    )
                 )
             if not report["checks"] or (kind == "ci" and (not review or run_level)):
                 report["diagnostics"].append(clean(run.get("message"), secrets))
@@ -312,11 +328,19 @@ def add_review_record(report: dict, directory: Path, secrets: list[str]) -> None
                 blast_radius=clean((packet.get("blast_radius") or {}).get("lane") or "Unavailable", secrets),
                 scope_reason=clean((packet.get("blast_radius") or {}).get("reason"), secrets),
             )
+            reported = {
+                f.get("tool")
+                for f in packet.get("findings") or []
+                if isinstance(f, dict) and f.get("source") == "analyzer"
+            }
             report["analyzers"] = [
                 {k: clean(item.get(k), secrets, 500) for k in ("name", "status", "command")}
+                # An analyzer that "failed" because it reported findings worked.
+                | ({"status": "findings reported"} if analyzer_reported(item, reported) else {})
                 for item in (packet.get("deterministic_checks") or [])[:100]
                 if isinstance(item, dict)
             ]
+            record.update(read_evidence(packet, secrets))
             report["run_health"] = [
                 {k: clean(item.get(k), secrets, 1500) for k in ("severity", "message", "path", "remediation")}
                 for item in (packet.get("run_health") or {}).get("findings", [])[:100]
@@ -329,6 +353,19 @@ def add_review_record(report: dict, directory: Path, secrets: list[str]) -> None
             for key in ("tokens", "cost", "timing", "attempts"):
                 if key in metrics:
                     record[key] = clean(metrics[key], secrets, 2000)
+        if "cost" not in record and isinstance(packet, dict):
+            # The packet carries the provider's cost even when the export is absent.
+            measured = packet.get("run_metrics") or {}
+            cost = measured.get("recorded_cost_usd")
+            if (
+                measured.get("cost_availability") == "available"
+                and isinstance(cost, (int, float))
+                and not isinstance(cost, bool)
+                and 0 <= cost < 1_000_000
+            ):
+                record["cost"] = (
+                    f"${cost:.6f} recorded in the evidence packet; subscription charges may differ"
+                )
         runtime = read_artifact(directory / "mergecraft-runtime.json", 100_000)
         usage = read_artifact(directory / "mergecraft-usage.json", 100_000)
         if isinstance(usage, dict) and usage.get("schema_version") == 1:
@@ -358,6 +395,145 @@ def add_review_record(report: dict, directory: Path, secrets: list[str]) -> None
         report["diagnostics"].append("Detailed review evidence could not be parsed; inspect the artifacts.")
 
 
+def analyzer_reported(item: dict, reported: set) -> bool:
+    return item.get("status") == "failed" and item.get("name") in reported
+
+
+def whole(value) -> int | None:
+    """A non-negative integer from untrusted evidence, or nothing."""
+    return value if type(value) is int and 0 <= value < 10**9 else None
+
+
+def read_evidence(packet: dict, secrets: list[str]) -> dict:
+    """What the reviewer read: diff lines, source files and the packet's own coverage.
+
+    Reads of the supplied diff carry no file path, so a count of files read
+    alone understates the work and hides what was skipped.
+    """
+    result: dict = {}
+    trajectory = packet.get("trajectory") or {}
+    spans, sources = [], set()
+    for call in trajectory.get("tool_calls") or []:
+        if not isinstance(call, dict) or call.get("tool") != "read":
+            continue
+        span = call.get("diff_read")
+        if call.get("diff_read_path"):
+            if isinstance(span, list) and len(span) == 2 and all(whole(v) is not None for v in span):
+                spans.append((span[0], span[1]))
+        else:
+            sources.update(str(path) for path in call.get("paths") or [] if isinstance(path, str))
+    total = whole((packet.get("run_metrics") or {}).get("diff_lines"))
+    if total:
+        covered, end = 0, 0
+        for first, last in sorted(spans):
+            first, last = max(first, end + 1), min(last, total)
+            if last >= first:
+                covered, end = covered + last - first + 1, last
+        result["diff_lines"], result["diff_lines_read"] = total, covered
+        result["source_files_read"] = len(sources)
+    coverage = packet.get("coverage")
+    if isinstance(coverage, dict):
+        numbers = {
+            k: whole(coverage.get(k))
+            for k in ("hunks_total", "hunks_covered", "lines_total", "lines_covered")
+        }
+        if all(v is not None for v in numbers.values()):
+            result["coverage"] = numbers
+    unread = [
+        f.get("path")
+        for f in (packet.get("run_health") or {}).get("findings", [])
+        if isinstance(f, dict) and f.get("rule_id") == "changed-unread-file" and f.get("path")
+    ]
+    if unread:
+        result["unread_files"] = [clean(path, secrets, 500) for path in dict.fromkeys(unread)][:500]
+    return result
+
+
+SKIPPED_ANALYZER = re.compile(r"^skipped ([\w.+-]+): (.+)$")
+UNPROVISIONED_ANALYZER = re.compile(r"^([\w.+-]+): provisioning failed\b")
+
+
+def explain_analyzers(analyzers: list[dict], messages: list[str]) -> None:
+    """Say why an analyzer did not run: withheld by policy is not a broken tool."""
+    skipped, unprovisioned = {}, set()
+    for message in messages:
+        text = str(message).strip()
+        if match := SKIPPED_ANALYZER.match(text):
+            skipped.setdefault(match[1], match[2])
+        elif match := UNPROVISIONED_ANALYZER.match(text):
+            unprovisioned.add(match[1])
+    for analyzer in analyzers:
+        if analyzer.get("status") != "unavailable":
+            continue
+        if analyzer["name"] in skipped:
+            analyzer["status"], analyzer["reason"] = "skipped", skipped[analyzer["name"]][:300]
+        elif analyzer["name"] in unprovisioned:
+            analyzer["status"] = "provisioning failed"
+
+
+def repeats_finding(message: str) -> bool:
+    """A log line that only restates a finding the report already renders."""
+    text = message.strip()
+    if text.startswith("{"):
+        try:
+            return json.loads(text).get("event") in {"finding", "tool_call", "usage_step"}
+        except (ValueError, AttributeError):
+            # Truncated protocol lines are cut mid-JSON by the event store.
+            return bool(re.match(r'^\{"event": ?"(finding|tool_call|usage_step)"', text))
+    return bool(re.match(r"^mergeCraft \w*: .*:\d* — ", text))
+
+
+def reading(record: dict) -> str:
+    if "diff_lines" not in record:
+        return f"{len(record.get('files_read', []))} files read"
+    return (
+        f"{record['diff_lines_read']} of {record['diff_lines']} diff lines read · "
+        f"{record['source_files_read']} source files opened beyond the diff"
+    )
+
+
+def coverage_line(record: dict) -> str:
+    coverage = record.get("coverage")
+    if not coverage:
+        return "- Coverage: file reads listed below; hunk coverage was not recorded. A file read is not proof of complete review."
+    unread = len(record.get("unread_files", []))
+    return (
+        f"- Coverage: the evidence packet reports {coverage['hunks_covered']} of {coverage['hunks_total']} hunks and "
+        f"{coverage['lines_covered']} of {coverage['lines_total']} changed lines covered; "
+        + (
+            f"run health lists {unread} changed files with unread ranges, which takes precedence. "
+            if unread
+            else "run health lists no unread changed files. "
+        )
+        + "A read is not proof of complete review."
+    )
+
+
+def unread_lines(record: dict) -> list[str]:
+    unread = record.get("unread_files", [])
+    if not unread:
+        return []
+    more = f" and {len(unread) - 10} more" if len(unread) > 10 else ""
+    return [f"- Changed files with unread ranges: {', '.join(literal(f) for f in unread[:10])}{more}"]
+
+
+def analyzer_lines(analyzers: list[dict]) -> list[str]:
+    """One line per analyzer that ran or broke; one line per reason for those withheld."""
+    lines, withheld = [], {}
+    for analyzer in analyzers:
+        if analyzer.get("status") == "skipped":
+            withheld.setdefault(analyzer.get("reason", ""), []).append(analyzer["name"])
+        else:
+            lines.append(f"- Analyzer {literal(analyzer['name'])}: **{literal(analyzer['status'])}**")
+    for reason, names in withheld.items():
+        # The reason names the analyzer's own runtime, which differs within a group.
+        reason = re.sub(r"^runtime '[^']*' ", "", reason)
+        lines.append(
+            f"- Analyzers not run ({len(names)}): {', '.join(literal(n) for n in names)} — {literal(reason)}. Not run is not a pass."
+        )
+    return lines
+
+
 def review_body(run: dict, report: dict, url: str) -> str:
     record = report.get("record", {})
     lines = [
@@ -366,8 +542,7 @@ def review_body(run: dict, report: dict, url: str) -> str:
         "",
         f"- Outcome: **{literal(report.get('result_label', report['state']))}**",
         f"- Failure threshold: {literal(report.get('failure_threshold', 'Legacy exit-code policy'))}",
-        f"- CLI exit code: {literal(record.get('exit_code', 'Not recorded'))}",
-        f"- Verdict diagnostic: {literal(record.get('verdict', 'Unavailable'))} (agent signal; the outcome above applies the local-ci failure threshold)",
+        f"- Signals behind the outcome: CLI exit code {literal(record.get('exit_code', 'Not recorded'))} · agent verdict {literal(record.get('verdict', 'Unavailable'))} (diagnostic only; the outcome above applies the local-ci failure threshold)",
         f"- Change: {literal(run['repo'])}#{run['pr']}",
         f"- Reviewed commit: `{run['head']}` · base `{run.get('base', 'unavailable')}`",
         f"- Blast radius: {literal(record.get('blast_radius', 'Unavailable'))} — {literal(record.get('scope_reason', ''))}",
@@ -377,8 +552,9 @@ def review_body(run: dict, report: dict, url: str) -> str:
         f"- Tokens: {literal(record.get('tokens', 'Not recorded by this run'))}",
         f"- Cost: {literal(record.get('cost', 'Not recorded by this run'))}",
         f"- Timing: {literal(record.get('timing', 'Not recorded by this run'))}",
-        f"- Review work: {record.get('tool_calls', 'unknown')} tool calls · {len(record.get('files_read', []))} files read · {record.get('tool_retries', 'unknown')} tool retries",
-        "- Coverage: file reads listed below; hunk coverage was not recorded. A file read is not proof of complete review.",
+        f"- Review work: {record.get('tool_calls', 'unknown')} tool calls · {reading(record)} · {record.get('tool_retries', 'unknown')} tool retries",
+        coverage_line(record),
+        *unread_lines(record),
         f"- Run: `{run['id']}` · [Full run, logs and artifacts — Tailscale access required]({url})",
         f"- Review image: {literal(record.get('image') or 'Not recorded by this run')}",
         f"- Container wall time: {literal(record.get('container_seconds', 'Not recorded'))} seconds · deadline {literal(record.get('timeout_seconds', 'Not recorded'))} seconds · model attempt cap {literal(record.get('model_attempt_limit', 'Not recorded'))}",
@@ -393,9 +569,7 @@ def review_body(run: dict, report: dict, url: str) -> str:
         f"- {literal(c['name'])}: **{literal(c['state'])}** — {literal(c['message'])}"
         for c in report["checks"]
     ]
-    lines += [
-        f"- Analyzer {literal(c['name'])}: **{literal(c['status'])}**" for c in report.get("analyzers", [])
-    ]
+    lines += analyzer_lines(report.get("analyzers", []))
     lines += ["", "<details><summary>Review scope and files read</summary>", "", "Changed files:"]
     lines += [f"- {literal(f)}" for f in record.get("files_changed", [])]
     lines += ["", "Files recorded as read:"]

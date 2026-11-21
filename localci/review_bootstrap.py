@@ -40,6 +40,15 @@ def prepare() -> None:
     os.environ.update(HOME=account.pw_dir, USER=account.pw_name, LOGNAME=account.pw_name, TMPDIR="/tmp")
 
 
+def exported(packet: Path, name: str) -> Path | None:
+    """Find an accounting export next to the evidence packet, or one level up."""
+    for folder in (packet.parent, packet.parent.parent):
+        path = folder / name
+        if path.is_file() and not path.is_symlink():
+            return path
+    return None
+
+
 def preserve_evidence(root: Path) -> None:
     """Keep the evidence packet even when the CLI cannot produce its final report."""
     packets = sorted(
@@ -59,11 +68,13 @@ def preserve_evidence(root: Path) -> None:
             shutil.copyfile(packet, root / "mergecraft-evidence.json")
         except (ValueError, OSError):
             continue
-        narrative = packet.parent.parent / "localci-review.md"
-        if narrative.is_file() and not narrative.is_symlink() and narrative.stat().st_size <= 1_000_000:
+        # The export sits beside the packet, where the CLI's exit cleanup keeps
+        # it; the review directory itself is the location older images used.
+        narrative = exported(packet, "localci-review.md")
+        if narrative and narrative.stat().st_size <= 1_000_000:
             shutil.copyfile(narrative, root / "mergecraft-review.md")
-        metrics = packet.parent.parent / "localci-metrics.json"
-        if metrics.is_file() and not metrics.is_symlink() and metrics.stat().st_size < 100_000:
+        metrics = exported(packet, "localci-metrics.json")
+        if metrics and metrics.stat().st_size < 100_000:
             try:
                 data = json.loads(metrics.read_text())
                 allowed = {key: data[key] for key in ("tokens", "cost", "timing", "attempts") if key in data}
