@@ -639,3 +639,26 @@ def test_record_reports_packet_cost_coverage_reading_and_analyzer_reasons(tmp_pa
     assert '"event"' not in body and "mergeCraft Major" not in body
     assert "sandbox capabilities unavailable" in body
     assert "Signals behind the outcome: CLI exit code" in body
+
+
+def test_finding_echoes_do_not_crowd_real_review_errors_out_of_diagnostics(tmp_path):
+    store, run = completed(tmp_path)
+    directory = tmp_path / "artifacts" / run["id"]
+    directory.mkdir(parents=True)
+    (directory / "mergecraft.json").write_text('{"findings":[]}')
+    echoes = [
+        message
+        for index in range(15)
+        for message in (
+            json.dumps({"event": "finding", "protocol_version": "1", "finding": {"message": str(index)}}),
+            f"mergeCraft Major: a.py:{index} — Broken",
+        )
+    ]
+    messages = ["provider connection reset", *echoes, "mergeCraft timeout: step 3: — gave up"]
+    store.append_events([(run["id"], 0.0, "mergeCraft", "", "error", m) for m in messages])
+    report = reports(run, tmp_path, store, [])["review"]
+    assert report["diagnostics"][-2:] == [
+        "mergeCraft: provider connection reset",
+        "mergeCraft: mergeCraft timeout: step 3: — gave up",
+    ]
+    assert not any("Broken" in line or '"event"' in line for line in report["diagnostics"])

@@ -184,16 +184,18 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
             if phases and not has_step_output:
                 placeholders = ",".join("?" for _ in phases)
                 rows = store.rows(
-                    f"SELECT phase,job,message FROM run_events WHERE run_id=? AND level='error' AND phase IN ({placeholders}) ORDER BY id DESC LIMIT 20",
-                    (run["id"], *phases),
+                    f"SELECT phase,job,message FROM run_events WHERE run_id=? AND level='error' AND phase IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+                    # A review logs two error rows per finding, so read past them:
+                    # filtering after a 20-row limit would leave no real diagnostics.
+                    (run["id"], *phases, 400 if kind == "review" else 20),
                 )
+                # Findings are rendered once, from the report; their protocol
+                # events and log echoes would repeat each one as raw text.
+                kept = [e for e in rows if not (kind == "review" and repeats_finding(str(e["message"])))][:20]
                 report["diagnostics"].extend(
                     dict.fromkeys(
                         clean(f"{e['job'] or e['phase']}: {e['message']}", secrets, 1000)
-                        for e in reversed(rows)
-                        # Findings are rendered once, from the report; their protocol
-                        # events and log echoes would repeat each one as raw text.
-                        if not (kind == "review" and repeats_finding(str(e["message"])))
+                        for e in reversed(kept)
                     )
                 )
             if not report["checks"] or (kind == "ci" and (not review or run_level)):
@@ -480,7 +482,8 @@ def repeats_finding(message: str) -> bool:
         except (ValueError, AttributeError):
             # Truncated protocol lines are cut mid-JSON by the event store.
             return bool(re.match(r'^\{"event": ?"(finding|tool_call|usage_step)"', text))
-    return bool(re.match(r"^mergeCraft \w*: .*:\d* — ", text))
+    # The runner's own echo of a finding: "mergeCraft <severity>: <path>:<line> — …".
+    return bool(re.match(r"^mergeCraft (Critical|Major|Minor|Info|Nit)?: .*:\d* — ", text, re.I))
 
 
 def reading(record: dict) -> str:
