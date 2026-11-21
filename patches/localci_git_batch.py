@@ -37,7 +37,7 @@ def git_batch_tool(ctx):
     return tool(
         name="git_batch",
         tool_class=ToolClass.REPOSITORY_READ,
-        description="Run 1–8 independent read-only Git commands in one model turn. Same guards as git. Use for grouped diffs/searches across related files; use native read on returned outputPath for full contents.",
+        description="Run 1–8 independent read-only Git commands in one model turn. Same guards as git. Use for grouped diffs/searches across related files; use read_batch on returned outputPath for full contents.",
         input_schema={
             "type": "object",
             "properties": {

@@ -31,6 +31,9 @@ def read_batch_tool(ctx):
                 raise ValueError("Use a positive line start and a limit of 1–2000")
             if not isinstance(name, str) or not name or len(name) > 1000:
                 raise ValueError("A bounded repository-relative path or @diff is required")
+            path = PurePosixPath(name)
+            if ".." in path.parts or any(ord(c) < 32 or 127 <= ord(c) <= 159 or c in "\\:" for c in name):
+                raise ValueError("Invalid read path")
             charge_tool_call_budget(ctx)
             if name == "@diff":
                 if not repo.diff_path:
@@ -41,13 +44,14 @@ def read_batch_tool(ctx):
                 # Only outputs already produced by guarded Git calls are readable.
                 # Config/auth/session directories remain outside this boundary.
                 source = Path(name).resolve()
-                if not source.is_relative_to(run_export_directory(ctx.tmpdir).resolve()):
+                if (
+                    name not in ctx.tool_state.git_export_paths
+                    or str(source) != name
+                    or source.parent != run_export_directory(ctx.tmpdir).resolve()
+                ):
                     raise ValueError("Only guarded Git export paths may be absolute")
                 evidence_path = str(source)
             else:
-                path = PurePosixPath(name)
-                if path.is_absolute() or ".." in path.parts or any(c in name for c in "\n\r\x00\\:"):
-                    raise ValueError("Read paths must stay inside the checkout")
                 result = await git.execute({"command": "show", "args": [f"HEAD:{name}"]})
                 if result.is_error:
                     results.append({"path": name, "error": "Upstream Git read refused or file unavailable"})
@@ -71,10 +75,14 @@ def read_batch_tool(ctx):
                 lines.pop()
             lines = [line.removesuffix("\r") for line in lines]
             shown, used = [], 0
+            oversized = False
             for number, line in enumerate(lines[start - 1 : start - 1 + limit], start):
                 rendered = f"{number}: {line}"
                 size = len(rendered.encode("utf-8")) + 1
-                if size > 2000 or used + size > remaining or len(shown) >= remaining_lines:
+                if size > 2000:
+                    oversized = True
+                    break
+                if used + size > remaining or len(shown) >= remaining_lines:
                     break
                 shown.append(rendered)
                 used += size
@@ -93,6 +101,10 @@ def read_batch_tool(ctx):
                     "next_line": end + 1 if end < len(lines) else None,
                 }
             )
+            if oversized:
+                results[-1]["note"] = (
+                    f"Line {end + 1} exceeds the display limit. Use guarded Git searches to inspect it."
+                )
         tracker = ctx.budget_tracker
         checkpoint = ""
         if tracker and tracker.tokens_used >= tracker.bounds.token_ceiling // 2:

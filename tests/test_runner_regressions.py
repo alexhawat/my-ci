@@ -1701,6 +1701,24 @@ async def test_command_streams_files_through_stdin_and_stdout(tmp_path):
     assert copy.read_bytes() == data
 
 
+async def test_unavailable_sysbox_fails_without_privileged_retry(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_WORKER_RUNTIME", "sysbox-runc")
+    flow = ReviewFlow(tmp_path, monkeypatch)
+    starts = []
+
+    async def command(*args, **kwargs):
+        if args[:2] == ("docker", "run"):
+            starts.append(args)
+            raise RuntimeError("runtime unavailable")
+        return await flow.command(*args, **kwargs)
+
+    flow.runner.command = command
+    row = await flow.execute({"review": False, "workflows": [".github/workflows/ci.yml"]})
+    assert row["state"] == "error" and "runtime unavailable" in row["message"]
+    (worker,) = starts
+    assert "--runtime=sysbox-runc" in worker and "--privileged" not in worker
+
+
 async def test_sysbox_worker_streams_files_instead_of_docker_cp(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALCI_WORKER_RUNTIME", "sysbox-runc")
     monkeypatch.setenv("LOCALCI_NESTED_BIP", "192.0.2.1/24")
