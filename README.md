@@ -120,6 +120,27 @@ Failed runs are not retried automatically, and manual retries share the configur
 
 A workflow in which no job ran is reported as skipped and named in the run summary rather than counted as passed. If CI workflows are selected and none of them runs any job, the run ends blocked, even when the review passes. A run with neither a CI workflow nor a review to run also ends blocked.
 
+### Updating from the dashboard
+
+**Execution settings → my-ci version** shows the commit the running images were built from and the latest commit on `alexhawat/my-ci@main`. **Update to latest** does what you would otherwise do by hand. New runs pause, and active runs finish first; an update that has not started yet can be cancelled. Then the execution worker starts a short-lived helper container from its own image. The helper:
+
+1. fast-forwards the deployment's git checkout to the upstream branch;
+2. rebuilds the `app` and `worker` images with `LOCALCI_VERSION` set to the new commit;
+3. recreates both services.
+
+The dashboard is unavailable for about a minute. The new worker records the result and the helper's log, which the panel shows. Runs resume after the update, and also after a failed one.
+
+The update needs:
+
+- a Compose deployment from a git checkout, with every Compose file inside the project directory;
+- an `origin` remote the host can fetch without a prompt;
+- no uncommitted changes to tracked files. Untracked files such as `.env` and `runtime/` are left alone.
+
+Git runs as the checkout's owner. The update fast-forwards only; a checkout with local commits is refused rather than merged. It rebuilds only the dashboard and execution worker images. When a release changes `Dockerfile.worker`, `Dockerfile.jobs` or the review build, rebuild those by hand as in the quick start; the release notes say when. Images built by hand show an unrecorded version until the first dashboard update, unless built with `--build-arg LOCALCI_VERSION=$(git rev-parse HEAD)`.
+
+- `LOCALCI_UPDATE_REPO` and `LOCALCI_UPDATE_BRANCH` (optional): the repository whose latest commit is shown, default `alexhawat/my-ci`, and the branch to fetch from `origin`, default `main`.
+- `LOCALCI_SELF_UPDATE=0` turns the button off.
+
 ### Workflow overrides
 
 **Repositories → Configure** includes a workflow editor. Saving creates a new local version that replaces the base-revision workflow file for that repository in later runs; the file must keep its `pull_request` trigger. Earlier versions stay viewable, each run records which version it used, and reverting returns to the file from the PR's base revision.
