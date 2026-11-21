@@ -323,6 +323,11 @@ def _secret_forms(secrets: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(sorted(forms, key=len, reverse=True))
 
 
+def redaction_values(ci: dict[str, str], review: dict[str, str]) -> list[str]:
+    """Indexed review-provider names are public metadata. Their credentials remain secret."""
+    return [*ci.values(), *(v for k, v in review.items() if not re.fullmatch(r"LLM_PROVIDER_[0-9]+", k))]
+
+
 def redact(text: str, secrets: list[str]) -> str:
     key = tuple(secrets)
     for form in _secret_forms(key):
@@ -1034,7 +1039,7 @@ class Runner:
             review_secrets = self.secret_reader(run["repo"], "review") if run_review else {}
             if config.get("github_auth") == "gh":
                 secrets = {**secrets, "GITHUB_TOKEN": token, "GH_TOKEN": token}
-            self.sensitive = [token, *secrets.values(), *review_secrets.values()]
+            self.sensitive = [token, *redaction_values(secrets, review_secrets)]
             metrics = asyncio.create_task(sample_resources(self.store, run["id"], {name, review_name}))
             if skip_review:
                 await asyncio.to_thread(

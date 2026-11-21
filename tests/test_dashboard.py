@@ -52,6 +52,24 @@ def client(tmp_path, monkeypatch):
         yield http, controller
 
 
+@pytest.mark.parametrize(
+    ("step", "review"),
+    [
+        ("run: echo mergeCraft", False),
+        ("uses: actions/checkout@v6", False),
+        ("uses: alexhawat/mergeCraft@main", True),
+        ("uses: ./.github/actions/mergecraft", True),
+    ],
+)
+def test_workflow_picker_recognizes_review_action_steps(client, step, review):
+    http, controller = client
+    content = "name: CI with mergeCraft mentioned\n# mergeCraft is a separate toggle\n" + WORKFLOW
+    controller.github.content = AsyncMock(return_value=content.replace("run: echo hello", step))
+    controller.github.request = AsyncMock(return_value=[{"type": "file", "path": PATH, "name": "ci.yml"}])
+    (item,) = http.get("/api/repos/o/r/workflows").json()
+    assert item["pr"] and item["review"] is review
+
+
 def test_workflow_versions_are_local_immutable_snapshots(client):
     http, c = client
     c.github.request = AsyncMock(return_value={"sha": "c" * 40})

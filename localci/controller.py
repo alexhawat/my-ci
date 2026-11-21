@@ -14,7 +14,7 @@ from localci.github import GitHub
 from localci.policy import BOT_HOLD, bot_pr, eligible
 from localci.reporting import comment_body, reports
 from localci.review_reconcile import reconcile_legacy_reviews
-from localci.runner import Runner
+from localci.runner import Runner, redaction_values
 from localci.store import Store
 
 PUBLISH_ATTEMPTS = 3  # Only permanent failures of a final publication count toward abandonment.
@@ -183,7 +183,7 @@ class Controller:
     def reports(self, run):
         if run["end_reason"] == "awaiting_approval":
             return {}  # Nothing ran; the commit status alone explains the hold.
-        values = [*self.secrets(run["repo"], "ci").values(), *self.secrets(run["repo"], "review").values()]
+        values = redaction_values(self.secrets(run["repo"], "ci"), self.secrets(run["repo"], "review"))
         if self.github.token_path.is_file():
             values.append(self.github.token())
         return reports(run, self.root, self.store, values)
