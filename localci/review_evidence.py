@@ -117,6 +117,10 @@ def classify_review(
             "infra_error": ("error", "Review provider/infrastructure failure"),
             "timed_out": ("error", "Review timed out"),
         }[outcome]
+    if outcome == "passed":
+        # "passed" is the CLI saying the review ran to completion, not that the
+        # change passed review; printing it beside a failure reads as a contradiction.
+        return state, f"{detail} (review ran to completion; CLI exit {code})"
     return state, f"{detail} (CLI outcome {outcome}; exit {code})"
 
 
