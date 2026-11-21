@@ -29,6 +29,20 @@ def workflow(text: str) -> dict:
     return data
 
 
+def is_review_action(uses: object) -> bool:
+    return isinstance(uses, str) and "mergecraft" in uses.lower()
+
+
+def uses_review_action(data: dict) -> bool:
+    for job in data["jobs"].values():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        if isinstance(steps, list) and any(
+            isinstance(step, dict) and is_review_action(step.get("uses")) for step in steps
+        ):
+            return True
+    return False
+
+
 def is_pr_workflow(data: dict) -> bool:
     events = data.get("on") or {}
     return events == "pull_request" if isinstance(events, str) else "pull_request" in events
@@ -180,7 +194,7 @@ def plan(text: str, available_secrets: set[str], variables: dict[str, str]) -> t
             raise Blocked(f"{jid}: GitHub OIDC is unavailable locally")
         for step in job.get("steps", []):
             uses = step.get("uses", "")
-            if "mergecraft" in uses.lower():
+            if is_review_action(uses):
                 raise Blocked(
                     "Use the separate mergeCraft review toggle instead of its GitHub Action workflow"
                 )

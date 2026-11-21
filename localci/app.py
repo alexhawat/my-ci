@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 from localci.controller import Controller
 from localci.dashboard import enrich_run, register_dashboard
 from localci.github import app_jwt
-from localci.policy import BOT_HOLD, bot_pr, eligible, is_pr_workflow, workflow
+from localci.policy import BOT_HOLD, bot_pr, eligible, is_pr_workflow, uses_review_action, workflow
 from localci.store import RetryLimitReached, RevisionChanged
 
 ROOT = Path(os.environ.get("LOCALCI_DATA", "/data"))
@@ -209,13 +209,12 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
             text = overrides[0]["content"] if overrides else upstream
             try:
                 parsed = workflow(text)
-                review = "mergecraft" in text.lower()
                 result.append(
                     {
                         "path": entry["path"],
                         "name": parsed.get("name", entry["name"]),
                         "pr": is_pr_workflow(parsed),
-                        "review": review,
+                        "review": uses_review_action(parsed),
                         "local_version": overrides[0]["version"] if overrides else None,
                         "variables": sorted(set(re.findall(r"vars\.([A-Za-z_][A-Za-z0-9_]*)", text))),
                         "secrets": sorted(
