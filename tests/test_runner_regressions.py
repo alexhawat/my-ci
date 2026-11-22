@@ -163,6 +163,20 @@ def test_short_secret_fragments_do_not_wreck_logs():
     assert clean("x fixture-long-fragment", [secret]) == "x [redacted]"
 
 
+async def test_review_provider_remains_visible_in_findings(tmp_path, monkeypatch):
+    flow = ReviewFlow(tmp_path, monkeypatch)
+    flow.runner.secret_reader = lambda _, scope: (
+        {"LLM_PROVIDER_2": "anthropic", "LLM_PROVIDER_2_API_KEY": "fixture-review-key"}
+        if scope == "review"
+        else {}
+    )
+    flow.review_json = json.dumps(
+        {"findings": [{"severity": "Minor", "message": "anthropic fixture-review-key"}]}
+    )
+    await flow.execute()
+    assert "anthropic [redacted]" in flow.runner.log_path.read_text()
+
+
 async def test_review_finding_log_redacts_before_truncating(tmp_path, monkeypatch):
     secret = "fixture-review-secret"
     message = "m" * (3000 - len(secret) // 2) + secret
