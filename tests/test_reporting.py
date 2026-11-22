@@ -11,8 +11,9 @@ from localci.reporting import comment_body, reports
 from localci.store import Store
 
 
-def completed(tmp_path, *, review_state="failure"):
-    store = Store(tmp_path / "db")
+def completed(tmp_path, *, review_state="failure", store=None):
+    if store is None:
+        store = Store(tmp_path / "db")
     rid = store.enqueue("owner/repo", pr(), {"workflows": [".github/workflows/ci.yml"], "review": True})
     store.claim()
     steps = [
@@ -208,6 +209,34 @@ async def test_native_review_ambiguous_post_is_recovered_without_duplicate(tmp_p
     await github.comment(run, "review", "expanded evidence")
     assert [w[0] for w in writes] == ["POST", "PUT"]
     assert len(saved) == 2 and saved[0]["body"].endswith("foreign")
+
+
+def test_published_review_preserves_provider_and_masks_all_credentials(tmp_path, monkeypatch):
+    controller = Controller(tmp_path)
+    _, run = completed(tmp_path, store=controller.store)
+    monkeypatch.setattr(controller.github, "token_path", tmp_path / "absent")
+    credentials = {
+        "review": {
+            "LLM_PROVIDER_10": "anthropic",
+            "LLM_PROVIDER_10_API_KEY": "fixture-review-key",
+            "LLM_PROVIDER_2_EXTRA": "fixture-extra",
+        },
+        "ci": {"LLM_PROVIDER_10": "fixture-ci-secret"},
+    }
+    monkeypatch.setattr(controller, "secrets", lambda repo, scope: credentials[scope])
+    directory = tmp_path / "artifacts" / run["id"]
+    directory.mkdir(parents=True)
+    (directory / "mergecraft.json").write_text('{"findings":[]}')
+    (directory / "mergecraft-evidence.json").write_text(
+        json.dumps({"agent": {"provider": "anthropic", "model": "anthropic/fixture"}})
+    )
+    (directory / "mergecraft-review.md").write_text(
+        "anthropic fixture-review-key fixture-extra fixture-ci-secret"
+    )
+    report = controller.reports(run)["review"]
+    assert report["narrative"] == "anthropic [redacted] [redacted] [redacted]"
+    body = comment_body(run, "review", report, "https://example.com")
+    assert "- Provider: anthropic" in body and "- Model: anthropic/fixture" in body
 
 
 def test_native_record_preserves_failure_and_run_health_without_fabricated_metrics(tmp_path):
