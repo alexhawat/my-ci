@@ -11,6 +11,8 @@ services:
       LOCALCI_URL: ${LOCALCI_URL:-http://localhost:8787}
       LOCALCI_HOST_LABEL: ${LOCALCI_HOST_LABEL:-local worker}
       LOCALCI_TAILSCALE_LOGIN: ${LOCALCI_TAILSCALE_LOGIN:?Set the permitted Tailscale login}
+      LOCALCI_UPDATE_REPO: ${LOCALCI_UPDATE_REPO:-}
+      LOCALCI_UPDATE_BRANCH: ${LOCALCI_UPDATE_BRANCH:-}
     volumes:
       - localci-data:/data
       - ./runtime/github-token:/run/secrets/github-token:ro
@@ -35,6 +37,12 @@ services:
       LOCALCI_HOST_LABEL: ${LOCALCI_HOST_LABEL:-local worker}
       LOCALCI_REVIEW_IMAGE: localci-review:1
       LOCALCI_NESTED_DNS: ${LOCALCI_NESTED_DNS:-}
+      LOCALCI_NESTED_BIP: ${LOCALCI_NESTED_BIP:-}
+      LOCALCI_NESTED_ADDRESS_POOL: ${LOCALCI_NESTED_ADDRESS_POOL:-}
+      LOCALCI_WORKER_IMAGE: ${LOCALCI_WORKER_IMAGE:-localci-worker:1}
+      LOCALCI_WORKER_RUNTIME: ${LOCALCI_WORKER_RUNTIME:-}
+      LOCALCI_UPDATE_BRANCH: ${LOCALCI_UPDATE_BRANCH:-}
+      LOCALCI_SELF_UPDATE: ${LOCALCI_SELF_UPDATE:-}
     volumes:
       - localci-data:/data
       - /var/run/docker.sock:/var/run/docker.sock

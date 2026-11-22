@@ -9,11 +9,12 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
+from localci import updater
 from localci.github import GitHub
 from localci.policy import BOT_HOLD, bot_pr, eligible
 from localci.reporting import comment_body, reports
 from localci.review_reconcile import reconcile_legacy_reviews
-from localci.runner import Runner
+from localci.runner import Runner, redaction_values
 from localci.store import Store
 
 PUBLISH_ATTEMPTS = 3  # Only permanent failures of a final publication count toward abandonment.
@@ -50,6 +51,9 @@ class Controller:
         self.wake = asyncio.Event()
         self.base_url = os.environ.get("LOCALCI_URL", "http://localhost:8787").rstrip("/")
         self.host_label = os.environ.get("LOCALCI_HOST_LABEL", "local worker")
+        # Set by the execution worker once it has inspected its own container.
+        self.deployment: dict | None = None
+        self.update_unavailable = "The execution worker has not started yet."
 
     @property
     def error(self) -> str:
@@ -115,6 +119,8 @@ class Controller:
                             "error": self.error,
                             "last_poll": self.last_poll,
                             "capacity": self.capacity,
+                            "version": updater.version(),
+                            "update_unavailable": self.update_unavailable,
                             "heartbeat": time.time(),
                         }
                     ),
@@ -177,7 +183,7 @@ class Controller:
     def reports(self, run):
         if run["end_reason"] == "awaiting_approval":
             return {}  # Nothing ran; the commit status alone explains the hold.
-        values = [*self.secrets(run["repo"], "ci").values(), *self.secrets(run["repo"], "review").values()]
+        values = redaction_values(self.secrets(run["repo"], "ci"), self.secrets(run["repo"], "review"))
         if self.github.token_path.is_file():
             values.append(self.github.token())
         return reports(run, self.root, self.store, values)
@@ -328,6 +334,8 @@ class Controller:
         for name in output.decode().split():
             await runner.cleanup(name)
         await runner.cleanup_networks()  # Per-run networks whose containers are already gone.
+        self.deployment, self.update_unavailable = await updater.detect()
+        await updater.reconcile(self.store)  # The helper that replaced the previous worker.
         # A crash cannot leave decrypted CI/provider credentials in the data volume.
         await asyncio.to_thread(shutil.rmtree, self.root / "work", ignore_errors=True)
         for row in await asyncio.to_thread(self.store.rows, "SELECT id FROM runs WHERE state='running'"):
@@ -354,7 +362,7 @@ class Controller:
 
     async def schedule(self):
         active = {}
-        swept = time.monotonic()
+        swept = checked = time.monotonic()
         sweep: asyncio.Future = asyncio.get_running_loop().create_future()
         sweep.set_result(None)
         try:
@@ -377,9 +385,16 @@ class Controller:
                         Runner(self.store, self.github, self.root, self.secrets).cleanup_networks()
                     )
                 settings = await asyncio.to_thread(self.store.settings, self.capacity)
+                update = await asyncio.to_thread(updater.load, self.store)
+                if update.get("state") == "requested" and not active:
+                    await updater.start(self.store, self.deployment, self.update_unavailable)
+                elif update.get("state") == "running" and time.monotonic() - checked > 5:
+                    checked = time.monotonic()
+                    await updater.reconcile(self.store)
                 unfit = False
-                # Lowering the limit drains existing runs; it never kills them.
-                while not settings["paused"] and len(active) < settings["max_parallel_runs"]:
+                # Lowering the limit drains existing runs; it never kills them. A requested
+                # update drains them the same way before it restarts the services.
+                while updater.admits_runs(settings, update) and len(active) < settings["max_parallel_runs"]:
                     # In-flight runs retain their old limits after a settings change.
                     if sum(v["cpus_per_run"] for v in active.values()) + settings["cpus_per_run"] > max(
                         1, self.capacity["cpus"] - 2

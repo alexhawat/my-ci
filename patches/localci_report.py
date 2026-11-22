@@ -18,8 +18,12 @@ def export(tmpdir, tracker, usages, timing, state, markdown):
     }
     summary = getattr(state.terminal_submission, "summary", "") or markdown or ""
     try:
-        (tmpdir / "localci-review.md").write_text(summary)
-        (tmpdir / "localci-metrics.json").write_text(json.dumps(metrics))
+        # mergeCraft removes everything in its review directory at exit except
+        # `evidence/`; the bootstrap copies these files only after that exit.
+        folder = tmpdir / "evidence"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "localci-review.md").write_text(summary)
+        (folder / "localci-metrics.json").write_text(json.dumps(metrics))
     except OSError:
         from loguru import logger
 

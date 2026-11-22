@@ -2,8 +2,8 @@
 #
 # Adapted from examples/workflows/mergecraft-hardened.yml at mergeCraft v0.1.0a6.
 # Local changes: the Action pin, the reviewer model (Claude Sonnet 5.5 on
-# ANTHROPIC_API_KEY, pinned), CI_JOB_PREFIX, the Dependabot exemption on
-# SKIPPED_REVIEW, and a gate that fails closed when a review produced no result.
+# ANTHROPIC_API_KEY, pinned), CI_JOB_PREFIX, job-level skips for Dependabot,
+# and a gate that fails closed when a review produced no result.
 # Repository access rules are in docs/repository-security.md.
 #
 # Auto-reviews PRs on open / ready / new commits, posting inline comments plus a
@@ -123,7 +123,10 @@ jobs:
   # block. Timing out just means the review proceeds without CI context.
   wait-for-ci:
     name: mergeCraft wait for CI
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+         github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -211,11 +214,13 @@ jobs:
     name: mergeCraft review
     needs: wait-for-ci
     # `always()` keeps the required check reporting even if the (fail-open) wait
-    # job errors out on a runner fault; a skipped wait job still skips the review,
-    # because the draft/dispatch condition below is the same one it uses.
+    # job errors out on a runner fault. GitHub accepts a skipped job for the
+    # required check, so Dependabot PRs can proceed once the CI gate passes.
     if: >-
       always() &&
-      (github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false)
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.draft == false &&
+         github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -232,9 +237,8 @@ jobs:
       # Same-repo guard: fork PRs must never receive repository secrets under
       # pull_request_target.
       IS_SAME_REPO: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
-      # The review runs on one credential only: the Anthropic API key. A fork
-      # PR never reaches it (same-repo guard), and neither does a Dependabot PR
-      # (GitHub withholds Actions secrets from Dependabot-triggered runs).
+      # The review runs on one credential only: the Anthropic API key. The
+      # same-repo guard keeps the credential out of fork PR reviews.
       HAS_AUTH: ${{ secrets.ANTHROPIC_API_KEY != '' && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
       # What this job concludes when HAS_AUTH is false and no review runs (fork
       # PR, or no provider credential). `fail` (default): the job fails, so a
@@ -242,11 +246,7 @@ jobs:
       # review and a bypass to merge. `pass`: the job passes with a warning —
       # only for repos that do not require this job, or that accept merging
       # fork PRs without a mergeCraft review. Any other value fails.
-      #
-      # This repository: `fail`, except for Dependabot PRs, which can never
-      # receive the API key and are gated by CI alone. `pull_request.user.login`
-      # is set by GitHub, not by the PR author.
-      SKIPPED_REVIEW: ${{ github.event.pull_request.user.login == 'dependabot[bot]' && 'pass' || 'fail' }}
+      SKIPPED_REVIEW: fail
       # Forward wait-for-ci outputs for action-side SARIF ingest (D9). Dual
       # MERGECRAFT_* / CI_* aliases match dogfood mergecraft.yml for older templates.
       MERGECRAFT_CI_WAIT_STATE: ${{ needs.wait-for-ci.outputs.state }}
@@ -300,7 +300,7 @@ jobs:
           if [ "${IS_SAME_REPO}" != "true" ]; then
             reason="Fork PR — secrets are withheld, so no review ran."
           else
-            reason="No provider credential is set, so no review ran. Set the ANTHROPIC_API_KEY Actions secret (unavailable to Dependabot PRs)."
+            reason="No provider credential is set, so no review ran. Set the ANTHROPIC_API_KEY Actions secret."
           fi
           if [ "${SKIPPED_REVIEW:-fail}" = "pass" ]; then
             echo "::warning title=mergeCraft skipped::${reason} SKIPPED_REVIEW=pass, so this job passes without a review."

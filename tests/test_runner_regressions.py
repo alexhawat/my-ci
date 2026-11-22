@@ -3,10 +3,12 @@
 import asyncio
 import base64
 import contextlib
+import io
 import json
 import os
 import re
 import sys
+import tarfile
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -16,7 +18,15 @@ import pytest
 from localci.github import GitHub
 from localci.policy import Blocked, github_token_referenced, plan, secret_references
 from localci.reporting import clean
-from localci.runner import Runner, nested_dns_arguments, read_export, redact, remove_agent_configuration
+from localci.runner import (
+    Runner,
+    nested_dns_arguments,
+    nested_network_arguments,
+    read_export,
+    redact,
+    remove_agent_configuration,
+    worker_runtime,
+)
 from localci.store import Store
 from tests.test_service import pr
 
@@ -151,6 +161,20 @@ def test_short_secret_fragments_do_not_wreck_logs():
     secret = "ab\nfixture-long-fragment"
     assert clean("about cabs", [secret]) == "about cabs"
     assert clean("x fixture-long-fragment", [secret]) == "x [redacted]"
+
+
+async def test_review_provider_remains_visible_in_findings(tmp_path, monkeypatch):
+    flow = ReviewFlow(tmp_path, monkeypatch)
+    flow.runner.secret_reader = lambda _, scope: (
+        {"LLM_PROVIDER_2": "anthropic", "LLM_PROVIDER_2_API_KEY": "fixture-review-key"}
+        if scope == "review"
+        else {}
+    )
+    flow.review_json = json.dumps(
+        {"findings": [{"severity": "Minor", "message": "anthropic fixture-review-key"}]}
+    )
+    await flow.execute()
+    assert "anthropic [redacted]" in flow.runner.log_path.read_text()
 
 
 async def test_review_finding_log_redacts_before_truncating(tmp_path, monkeypatch):
@@ -1641,3 +1665,161 @@ def test_code_scan_is_linear_in_the_number_of_literals():
     assert secret_references({"if": expression, "env": {"A": expression}}) == (set(), False)
     assert not github_token_referenced({"run": expression})
     assert time.monotonic() - started < 2  # Quadratic rescans took 13.5 s for one traversal.
+
+
+# Sysbox CI workers and nested daemon addressing --------------------------------------------------
+
+
+def test_worker_runtime_setting_is_validated(monkeypatch):
+    monkeypatch.delenv("LOCALCI_WORKER_RUNTIME", raising=False)
+    assert worker_runtime() == "privileged"
+    monkeypatch.setenv("LOCALCI_WORKER_RUNTIME", "sysbox-runc")
+    assert worker_runtime() == "sysbox-runc"
+    monkeypatch.setenv("LOCALCI_WORKER_RUNTIME", "runc --privileged")
+    with pytest.raises(RuntimeError, match="LOCALCI_WORKER_RUNTIME"):
+        worker_runtime()
+
+
+def test_nested_daemon_addresses_are_opt_in_and_validated(monkeypatch):
+    # A nested docker0 on the host resolver's address captures every lookup the worker
+    # forwards; operators move the nested daemon to unused ranges with these settings.
+    monkeypatch.delenv("LOCALCI_NESTED_BIP", raising=False)
+    monkeypatch.delenv("LOCALCI_NESTED_ADDRESS_POOL", raising=False)
+    assert nested_network_arguments() == []
+    monkeypatch.setenv("LOCALCI_NESTED_BIP", "192.0.2.1/24")
+    assert nested_network_arguments() == ["--bip=192.0.2.1/24"]
+    monkeypatch.setenv("LOCALCI_NESTED_ADDRESS_POOL", "198.18.0.0/16")
+    assert nested_network_arguments() == [
+        "--bip=192.0.2.1/24",
+        "--default-address-pool=base=198.18.0.0/16,size=24",
+    ]
+    for bip, pool in (
+        ("192.0.2.1/24 --privileged", "198.18.0.0/16"),
+        ("192.0.2.1/24", "192.0.2.0/23"),
+        ("2001:db8::1/64", "198.18.0.0/16"),
+        ("192.0.2.1/24", "198.18.0.0/25"),
+    ):
+        monkeypatch.setenv("LOCALCI_NESTED_BIP", bip)
+        monkeypatch.setenv("LOCALCI_NESTED_ADDRESS_POOL", pool)
+        with pytest.raises(RuntimeError, match="LOCALCI_NESTED"):
+            nested_network_arguments()
+
+
+async def test_command_streams_files_through_stdin_and_stdout(tmp_path):
+    runner = log_runner(tmp_path)
+    source, copy = tmp_path / "in.bin", tmp_path / "out.bin"
+    data = os.urandom(3 * 1024 * 1024)  # Larger than the 2 MB capture limit.
+    source.write_bytes(data)
+    code, text = await runner.command("cat", stdin_file=source, stdout_file=copy)
+    assert (code, text) == (0, "")
+    assert copy.read_bytes() == data
+
+
+async def test_unavailable_sysbox_fails_without_privileged_retry(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_WORKER_RUNTIME", "sysbox-runc")
+    flow = ReviewFlow(tmp_path, monkeypatch)
+    starts = []
+
+    async def command(*args, **kwargs):
+        if args[:2] == ("docker", "run"):
+            starts.append(args)
+            raise RuntimeError("runtime unavailable")
+        return await flow.command(*args, **kwargs)
+
+    flow.runner.command = command
+    row = await flow.execute({"review": False, "workflows": [".github/workflows/ci.yml"]})
+    assert row["state"] == "error" and "runtime unavailable" in row["message"]
+    (worker,) = starts
+    assert "--runtime=sysbox-runc" in worker and "--privileged" not in worker
+
+
+async def test_sysbox_worker_streams_files_instead_of_docker_cp(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_WORKER_RUNTIME", "sysbox-runc")
+    monkeypatch.setenv("LOCALCI_NESTED_BIP", "192.0.2.1/24")
+    (tmp_path / "token").write_text("fixture-github-token")
+    store = Store(tmp_path / "data/db")
+    runner = Runner(store, GitHub(tmp_path / "token"), tmp_path / "data", lambda *_: {"A_SECRET": "a-value"})
+    worker: dict[str, str] = {}
+    calls = []
+    run_args: list[str] = []
+
+    async def command(*args, stdin_file=None, stdout_file=None, **kwargs):
+        calls.append(args)
+        if args[:2] == ("git", "clone"):
+            Path(args[-1]).mkdir(parents=True)
+            (Path(args[-1]) / "README.md").write_text("fixture")
+        if args[:2] == ("git", "show"):
+            return 0, WORKFLOWS["a.yml"]
+        if args[:2] == ("docker", "run") and "localci.worker=true" in args:
+            run_args.extend(args)
+        if args[:3] == ("docker", "exec", "-i") and args[4:6] == ("tar", "-xf"):
+            with tarfile.open(stdin_file) as bundle:
+                for member in bundle.getmembers():
+                    if member.isfile():
+                        path = posixpath_join(args[-1], member.name)
+                        worker[path] = bundle.extractfile(member).read().decode()
+        if args[:2] == ("docker", "exec") and args[3:5] == ("rm", "-f"):
+            worker.pop(args[-1], None)
+        if args[:2] == ("docker", "exec") and "/artifacts" in args and stdout_file is not None:
+            with tarfile.open(stdout_file, "w") as bundle:
+                report = tmp_path / "report.txt"
+                report.write_text("artifact")
+                bundle.add(report, arcname="./report.txt")
+        if "act" in args:
+            assert worker["/control/a.yml.secrets"].count("a-value") == 1
+            runner.completed_jobs = 1
+        return 0, ""
+
+    runner.command = command
+    runner.cleanup = AsyncMock()
+    rid = store.enqueue("owner/repo", pr(), {"review": False, "workflows": [".github/workflows/a.yml"]})
+    await runner.execute(store.claim())
+    assert store.rows("SELECT state FROM runs WHERE id=?", (rid,))[0]["state"] == "success"
+    assert "--runtime=sysbox-runc" in run_args and "--privileged" not in run_args
+    assert "--bip=192.0.2.1/24" in run_args
+    assert not any(call[:2] == ("docker", "cp") for call in calls)
+    assert worker["/workspace/README.md"] == "fixture"
+    assert any(call[-1] == "load" for call in calls)
+    assert "/control/a.yml.secrets" not in worker  # Removed after its workflow ran.
+    assert (runner.root / "artifacts" / rid / "ci" / "report.txt").read_text() == "artifact"
+
+
+def posixpath_join(directory: str, member: str) -> str:
+    return "/" + "/".join(part for part in f"{directory}/{member}".split("/") if part not in ("", "."))
+
+
+async def test_sysbox_artifact_copy_keeps_only_regular_files_inside_the_destination(tmp_path):
+    runner = log_runner(tmp_path)
+    dest = tmp_path / "artifacts" / "ci"
+    dest.mkdir(parents=True)
+    (tmp_path / "outside.txt").write_text("host file")
+
+    async def command(*args, stdout_file=None, **kwargs):
+        with tarfile.open(stdout_file, "w") as bundle:
+            for name, kind, target in (
+                ("./ok.txt", tarfile.REGTYPE, ""),
+                ("./link", tarfile.SYMTYPE, "../../outside.txt"),
+            ):
+                info = tarfile.TarInfo(name)
+                info.type, info.linkname = kind, target
+                payload = b"ok" if kind == tarfile.REGTYPE else b""
+                info.size = len(payload)
+                bundle.addfile(info, io.BytesIO(payload))
+        return 0, ""
+
+    runner.command = command
+    await runner.copy_artifacts_from_worker("worker", dest, sysbox=True)
+    assert (dest / "ok.txt").read_text() == "ok"
+    assert not (dest / "link").exists() and not (dest / "link").is_symlink()
+
+    async def escaping(*args, stdout_file=None, **kwargs):
+        with tarfile.open(stdout_file, "w") as bundle:
+            info = tarfile.TarInfo("../escaped.txt")
+            info.size = 2
+            bundle.addfile(info, io.BytesIO(b"no"))
+        return 0, ""
+
+    runner.command = escaping
+    await runner.copy_artifacts_from_worker("worker", dest, sysbox=True)
+    assert not (tmp_path / "artifacts" / "escaped.txt").exists()
+    assert "Could not copy CI artifacts" in runner.log_path.read_text()

@@ -22,7 +22,7 @@ This is not universal GitHub Actions compatibility. Windows and macOS jobs, reus
 
 The FastAPI dashboard and execution worker share a versioned SQLite database and durable queue. Each run receives fresh outer containers. The run's privileged CI worker is on its own Docker bridge network, so the CI workers of concurrent runs cannot reach each other over the network. The run's review container is not attached to that network: it uses Docker's default bridge and needs only outbound access to the model provider, so PR code in the CI worker has no direct network path to it. CI jobs use a disposable inner Docker daemon; optional review runs in a separate container with separate credentials and artifact namespaces.
 
-The dashboard has no Docker socket, but the execution worker has host Docker access and starts `--privileged` Docker-in-Docker workers. Per-run networks are not a host boundary and do not change this: **PR code is effectively root on the host.** It can access the host data volume and every stored credential, regardless of which values a job references. Enable only repositories and contributors you would trust with host-root access.
+The dashboard has no Docker socket, but the execution worker has host Docker access and starts `--privileged` Docker-in-Docker workers (or, with `LOCALCI_WORKER_RUNTIME=sysbox-runc`, Sysbox system containers). Per-run networks are not a host boundary and do not change this: **PR code is effectively root on the host.** It can access the host data volume and every stored credential, regardless of which values a job references. Enable only repositories and contributors you would trust with host-root access.
 
 Bot-authored PRs (GitHub user type `Bot` or a login ending in `[bot]`, such as Dependabot) do not run automatically. Local CI records a blocked run, "awaiting operator approval"; after reviewing the change, start it from the dashboard with **Retry latest PR** or **Run selected as new runs**. The approval applies to the exact revision of that held run: if the PR's head or base commit has changed since (the bot pushed, or the base branch moved), the retry is refused and the new revision's own held run must be reviewed and started. An approval counts as one attempt in the retry budget. A system-ended run of a bot-authored PR is re-queued automatically only if an operator had started that revision or the repository allows automatic bot runs; otherwise a new held run awaits approval (see [Execution limits](#execution-limits)). The per-repository setting `run_bot_prs` (off by default) restores automatic runs for that repository and starts PRs that are currently held.
 
@@ -71,11 +71,14 @@ Open the configured dashboard URL, select **Repositories → Configure**, choose
 - `LOCALCI_TAILSCALE_LOGIN`: exact identity allowed by the dashboard.
 - `LOCALCI_NESTED_DNS` (optional): comma-separated DNS server IP addresses, passed as the nested Docker daemon's `--dns`, so they apply to every container that daemon starts, including all CI job steps. When it is unset, steps of jobs without `services:` use the worker's own resolver; containers on the nested daemon's user-defined networks (jobs that declare `services:`, `docker compose`, `docker network create`) resolve through its embedded resolver, which forwards to the worker's resolver; only containers on its default bridge (plain `docker run`, `docker build`) fall back to public DNS. Set it if such containers must resolve internal names or public DNS is unreachable.
 
+- `LOCALCI_NESTED_BIP` and `LOCALCI_NESTED_ADDRESS_POOL` (optional): the nested Docker daemon's `--bip` (an IPv4 address with prefix) and `--default-address-pool` base (an IPv4 network of /24 or larger, split into /24 networks). When unset, the nested daemon uses Docker's default bridge range. Set both to ranges unused on the host and its networks when the host's Docker daemon sends container DNS to a resolver on the host's own `docker0` (its `daemon.json` `"dns"` set to the `docker0` address): the nested `docker0` otherwise takes that same address, the worker's lookups reach its own bridge, and every image pull inside CI fails with `lookup … on 127.0.0.11:53: server misbehaving`.
+- `LOCALCI_WORKER_RUNTIME` (optional): `privileged` (default) runs CI workers as `--privileged` Docker-in-Docker; `sysbox-runc` runs them as [Sysbox](https://github.com/nestybox/sysbox) system containers, which the host must have installed and registered as a Docker runtime. Sysbox workers run in a user namespace without `--privileged`. `docker cp` cannot write into them, so the controller streams files with tar instead. [SECURITY.md](SECURITY.md) says what this does and does not change.
+
 These are read from `.env`. The following are internal container paths and image names. `compose.yaml` sets only `LOCALCI_REVIEW_IMAGE`; the others use the defaults built into the code, so they matter only when running the services outside Compose:
 
 - `LOCALCI_DATA`: data directory, default `/data`.
 - `LOCALCI_TOKEN_FILE`: GitHub token file, default `/run/secrets/github-token`.
-- `LOCALCI_WORKER_IMAGE`: disposable CI worker image, default `localci-worker:1`.
+- `LOCALCI_WORKER_IMAGE`: disposable CI worker image, default `localci-worker:1`. Set this alongside `LOCALCI_WORKER_RUNTIME` to select a custom Sysbox-compatible image and runtime pair.
 - `LOCALCI_REVIEW_IMAGE`: review image. Compose sets `localci-review:1`; outside Compose it is required when review is enabled.
 
 `LOCALCI_SMOKE_GH_AUTH=1` is required to run `smoke.py` and `smoke_artifacts.py`; see [TESTING.md](TESTING.md).
@@ -99,6 +102,16 @@ The optional host GitHub login grants CI jobs all permissions of that login; wor
 
 For repository-scoped Check Runs, connect a GitHub App with Checks read/write permission and an RSA private key. App credentials are not passed to CI or review containers, but they are stored in the data volume, which host-root-equivalent PR code can read.
 
+Each provider in a trusted review roster needs its own review-scoped credential binding, using the provider's configured environment index or documented credential name. Credential changes apply to the next execution. A confirmed free-tier HTTP 429 rejection is recorded against its single pending request with zero charged tokens and can proceed to the next configured model with the same shared budget. Completed requests retain their usage; incomplete or ambiguous accounting still stops the review.
+
+Which failures move on to the next model:
+
+- A rate limit (HTTP 429) falls back only on the free model `opencode/deepseek-v4.1-flash-free`, and only when the rejected request is that session's only outstanding request. It is then recorded with zero charged tokens.
+- The typed `provider.free-limit` and `provider.no-route` errors also fall back when the failing model is that free model.
+- Any other error ends the review without trying the next model. That includes a 429 from any other model, paid or free, and a 429 that arrives while several requests are outstanding: both are incomplete accounting and stop the review.
+
+A roster that starts with a free model sends the review content to that provider's free endpoint first: the diff, the source ranges the reviewer reads, and CI excerpts, for every enabled repository, private ones included. Free tiers often have different data-retention and training terms from paid API access. Check the provider's terms before putting a free model first for private repositories.
+
 ### Execution limits
 
 Repository settings control per-workflow job parallelism and time limits; selected workflow files run sequentially. Execution settings control simultaneous runs, CPU/memory reservations, and retry budgets. Defaults adapt to detected capacity, and queued runs report when they cannot fit.
@@ -106,6 +119,27 @@ Repository settings control per-workflow job parallelism and time limits; select
 Failed runs are not retried automatically, and manual retries share the configured per-revision budget. An operator's **Cancel** is final for that PR revision until the operator retries it. Runs ended by the system are re-queued automatically as new runs without consuming the retry budget, at most 3 times per PR revision; the original run stays in history. This covers a PR that became a draft or was closed and later returns and a repository that was disabled and re-enabled (both shown as cancelled), and an execution worker that stopped, restarted, or crashed mid-run (shown as an error, or as a failure if a check had already failed). These normally need no manual retry. Automatic re-queueing never bypasses the bot-PR approval gate: a system-ended run of a bot-authored PR is re-queued automatically only if an operator had started that revision or the repository allows automatic bot runs (`run_bot_prs`); otherwise a new held run awaits approval. This also applies after upgrading from a release that ran bot PRs automatically.
 
 A workflow in which no job ran is reported as skipped and named in the run summary rather than counted as passed. If CI workflows are selected and none of them runs any job, the run ends blocked, even when the review passes. A run with neither a CI workflow nor a review to run also ends blocked.
+
+### Updating from the dashboard
+
+**Execution settings → my-ci version** shows the commit the running images were built from and the latest commit on `alexhawat/my-ci@main`. **Update to latest** does what you would otherwise do by hand. New runs pause, and active runs finish first; an update that has not started yet can be cancelled. Then the execution worker starts a short-lived helper container from its own image. The helper:
+
+1. fast-forwards the deployment's git checkout to the upstream branch;
+2. rebuilds the `app` and `worker` images with `LOCALCI_VERSION` set to the new commit;
+3. recreates both services.
+
+The dashboard is unavailable for about a minute. The new worker records the result and the helper's log, which the panel shows. Runs resume after the update, and also after a failed one.
+
+The update needs:
+
+- a Compose deployment from a git checkout, with every Compose file inside the project directory;
+- an `origin` remote the host can fetch without a prompt;
+- no uncommitted changes to tracked files. Untracked files such as `.env` and `runtime/` are left alone.
+
+Git runs as the checkout's owner. The update fast-forwards only; a checkout with local commits is refused rather than merged. It rebuilds only the dashboard and execution worker images. When a release changes `Dockerfile.worker`, `Dockerfile.jobs` or the review build, rebuild those by hand as in the quick start; the release notes say when. Images built by hand show an unrecorded version until the first dashboard update, unless built with `--build-arg LOCALCI_VERSION=$(git rev-parse HEAD)`.
+
+- `LOCALCI_UPDATE_REPO` and `LOCALCI_UPDATE_BRANCH` (optional): the repository whose latest commit is shown, default `alexhawat/my-ci`, and the branch to fetch from `origin`, default `main`.
+- `LOCALCI_SELF_UPDATE=0` turns the button off.
 
 ### Workflow overrides
 
@@ -121,7 +155,7 @@ Review configuration comes from the trusted base revision. PR-authored mergeCraf
 
 Each review has a fixed USD 5 provider budget and a per-repository timeout of at most 50 minutes (the default). Model calls use your configured provider and its charges/limits. CI and review use separate containers and credential namespaces, but host-root-equivalent PR code can defeat that separation. Findings below the configured severity threshold remain visible without failing an otherwise completed review; execution failures and blocking findings still fail closed.
 
-`scripts/build_review.sh` builds the review image for `linux/amd64` or `linux/arm64` from mergeCraft source `6dc67ab3ce873a4b313553d5e1ac9e469295eb03` and applies and tests the local compatibility patches. For `linux/amd64` it starts from the published mergeCraft image, pinned by digest. The digest fixes the image's exact content. The build does not verify a signature or attestation, and the revision it checks is the one the image reports about itself, so verify the publisher separately if you need that assurance. That image is published for `linux/amd64` only, so for `linux/arm64` the script first builds the same revision from the public mergeCraft repository and uses the result as the base. No private registry authentication or provider credential is required.
+`scripts/build_review.sh` builds the review image for `linux/amd64` or `linux/arm64` from mergeCraft source `6dc67ab3ce873a4b313553d5e1ac9e469295eb03` and applies and tests the local compatibility patches. For `linux/amd64` it starts from the published mergeCraft image, pinned by digest. Before building, the script runs a digest-pinned Cosign verifier and requires a signature from the upstream main-branch release workflow at the pinned commit. That image is published for `linux/amd64` only, so for `linux/arm64` the script first builds the same revision from the public mergeCraft repository and uses the result as the base. No private registry authentication or provider credential is required.
 
 The script uses the Docker server's platform by default, honors `DOCKER_DEFAULT_PLATFORM`, and lets `REVIEW_PLATFORM` take precedence for an explicit cross-build. A build for the Docker server's own architecture is tagged `localci-review:1`, the tag `compose.yaml` runs. A cross-build is tagged `localci-review:1-<arch>` instead, so it cannot replace the image the worker uses. Set `REVIEW_IMAGE` to choose the tag yourself.
 
