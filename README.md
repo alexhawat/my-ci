@@ -78,7 +78,7 @@ These are read from `.env`. The following are internal container paths and image
 
 - `LOCALCI_DATA`: data directory, default `/data`.
 - `LOCALCI_TOKEN_FILE`: GitHub token file, default `/run/secrets/github-token`.
-- `LOCALCI_WORKER_IMAGE`: disposable CI worker image, default `localci-worker:1`.
+- `LOCALCI_WORKER_IMAGE`: disposable CI worker image, default `localci-worker:1`. Set this alongside `LOCALCI_WORKER_RUNTIME` to select a custom Sysbox-compatible image and runtime pair.
 - `LOCALCI_REVIEW_IMAGE`: review image. Compose sets `localci-review:1`; outside Compose it is required when review is enabled.
 
 `LOCALCI_SMOKE_GH_AUTH=1` is required to run `smoke.py` and `smoke_artifacts.py`; see [TESTING.md](TESTING.md).
@@ -155,7 +155,7 @@ Review configuration comes from the trusted base revision. PR-authored mergeCraf
 
 Each review has a fixed USD 5 provider budget and a per-repository timeout of at most 50 minutes (the default). Model calls use your configured provider and its charges/limits. CI and review use separate containers and credential namespaces, but host-root-equivalent PR code can defeat that separation. Findings below the configured severity threshold remain visible without failing an otherwise completed review; execution failures and blocking findings still fail closed.
 
-`scripts/build_review.sh` builds the review image for `linux/amd64` or `linux/arm64` from mergeCraft source `6dc67ab3ce873a4b313553d5e1ac9e469295eb03` and applies and tests the local compatibility patches. For `linux/amd64` it starts from the published mergeCraft image, pinned by digest. The digest fixes the image's exact content. The build does not verify a signature or attestation, and the revision it checks is the one the image reports about itself, so verify the publisher separately if you need that assurance. That image is published for `linux/amd64` only, so for `linux/arm64` the script first builds the same revision from the public mergeCraft repository and uses the result as the base. No private registry authentication or provider credential is required.
+`scripts/build_review.sh` builds the review image for `linux/amd64` or `linux/arm64` from mergeCraft source `6dc67ab3ce873a4b313553d5e1ac9e469295eb03` and applies and tests the local compatibility patches. For `linux/amd64` it starts from the published mergeCraft image, pinned by digest. Before building, the script runs a digest-pinned Cosign verifier and requires a signature from the upstream main-branch release workflow at the pinned commit. That image is published for `linux/amd64` only, so for `linux/arm64` the script first builds the same revision from the public mergeCraft repository and uses the result as the base. No private registry authentication or provider credential is required.
 
 The script uses the Docker server's platform by default, honors `DOCKER_DEFAULT_PLATFORM`, and lets `REVIEW_PLATFORM` take precedence for an explicit cross-build. A build for the Docker server's own architecture is tagged `localci-review:1`, the tag `compose.yaml` runs. A cross-build is tagged `localci-review:1-<arch>` instead, so it cannot replace the image the worker uses. Set `REVIEW_IMAGE` to choose the tag yourself.
 

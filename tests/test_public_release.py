@@ -231,6 +231,46 @@ def test_public_deployment_defaults():
     assert "sha256:8403a146bd7b6debc778652731a31df2af0280db0bdb8f68b41dd335ac9d8ddc" in review
 
 
+def test_amd64_review_build_requires_verified_base(tmp_path):
+    docker = tmp_path / "docker"
+    docker.write_text("""#!/bin/sh
+echo "$*" >> "$CALLS"
+case "$1" in
+  version) echo linux/amd64 ;;
+  run) exit "$VERIFY_STATUS" ;;
+  build) exit 0 ;;
+  *) exit 1 ;;
+esac
+""")
+    docker.chmod(0o755)
+    calls = tmp_path / "calls"
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "CALLS": str(calls),
+        "REVIEW_PLATFORM": "linux/amd64",
+    }
+    for status in (1, 0):
+        calls.write_text("")
+        result = subprocess.run(
+            ["bash", "scripts/build_review.sh"], cwd=ROOT, env={**env, "VERIFY_STATUS": str(status)}
+        )
+        assert result.returncode == status
+        _, verification, *build = calls.read_text().splitlines()
+        assert "--certificate-oidc-issuer https://token.actions.githubusercontent.com" in verification
+        assert (
+            "--certificate-identity https://github.com/alexhawat/mergeCraft/.github/workflows/ci-cd.yml@refs/heads/main"
+            in verification
+        )
+        assert "--certificate-github-workflow-sha 6dc67ab3ce873a4b313553d5e1ac9e469295eb03" in verification
+        digest = verification.split()[-1]
+        assert digest.startswith("ghcr.io/alexhawat/mergecraft@sha256:")
+        if status:
+            assert not build
+        else:
+            assert len(build) == 1 and f"--build-arg BASE_IMAGE={digest} " in build[0]
+
+
 def test_host_label_is_configurable(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALCI_HOST_LABEL", "build-worker")
     monkeypatch.setenv("LOCALCI_URL", "https://ci.example.com/")

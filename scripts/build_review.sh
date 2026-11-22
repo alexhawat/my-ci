@@ -37,8 +37,15 @@ else
 fi
 
 if [ "$platform" = linux/amd64 ]; then
+  base_image=$(sed -n 's/^ARG BASE_IMAGE=//p' "$root/Dockerfile.review")
+  [[ $base_image =~ ^ghcr\.io/alexhawat/mergecraft@sha256:[0-9a-f]{64}$ ]]
+  docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.3@sha256:9e5c2f2edc34351160407ca3416c61855bdf9403c3c5936e0f0be7fc261611b8 \
+    verify --certificate-identity 'https://github.com/alexhawat/mergeCraft/.github/workflows/ci-cd.yml@refs/heads/main' \
+    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+    --certificate-github-workflow-sha "$revision" "$base_image" >/dev/null
   docker build \
     --platform "$platform" \
+    --build-arg "BASE_IMAGE=$base_image" \
     --file "$root/Dockerfile.review" \
     --tag "$review_image" \
     "$root"

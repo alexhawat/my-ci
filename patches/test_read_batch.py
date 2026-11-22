@@ -85,6 +85,7 @@ async def main():
         data = await read([{"path": "long.txt", "limit": 20}])
         assert data["results"][0]["text"] == "1: shown"
         assert data["results"][0]["end"] == 1 and data["results"][0]["next_line"] == 2
+        assert "Line 2" in data["results"][0]["note"] and "guarded Git" in data["results"][0]["note"]
         for requests in [
             [{"path": "../outside"}],
             [{"path": "/etc/passwd"}],
@@ -96,6 +97,12 @@ async def main():
             assert (await tool.execute({"requests": requests})).is_error
         exported = await git_tool(ctx).execute({"command": "show", "args": ["HEAD:sample.txt"]})
         export_path = json.loads(exported.content[0]["text"])["outputPath"]
+        other = Path(export_path).with_name("unregistered.txt")
+        other.write_text("fixture")
+        before = len(state.tool_calls)
+        for denied in (str(other), "sample\tfile", str(other.parent / ".." / other.parent.name / other.name)):
+            result = await tool.execute({"requests": [{"path": "@diff"}, {"path": denied}]})
+            assert result.is_error and len(state.tool_calls) == before
         data = await read([{"path": export_path, "start": 498, "limit": 3}])
         assert data["results"][0]["text"] == "498: line 497\n499: line 498\n500: line 499"
         # Form feed, U+2028, NEL and a bare carriage return inside a line do not start a new

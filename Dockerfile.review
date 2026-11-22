@@ -46,7 +46,7 @@ RUN --network=none python /opt/localci/test_profile_reads.py
 COPY patches/test_read_batch.py /opt/localci/test_read_batch.py
 RUN --network=none python /opt/localci/test_read_batch.py
 COPY patches/test_read_visibility.py /opt/localci/test_read_visibility.py
-RUN --network=none python /opt/localci/test_read_visibility.py
+RUN --network=none su -s /bin/sh mergecraft -c "python /opt/localci/test_read_visibility.py"
 # Validate the current upstream schema and our consumer contract.
 COPY patches/test_review_config.py /opt/localci/test_review_config.py
 RUN --network=none python /opt/localci/test_review_config.py

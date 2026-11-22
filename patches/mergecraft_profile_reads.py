@@ -13,6 +13,20 @@ def replace(path, old, new):
 
 
 def apply(root):
+    cache = "    git_show_cache: dict[str, str] = field(default_factory=dict)"
+    replace(
+        root / "mcp/tool_state.py",
+        cache,
+        cache + "\n    git_export_paths: set[str] = field(default_factory=set)",
+    )
+    # Both the show path and the large-output path belong to the same run.
+    write = '            Path(path).write_text(output, encoding="utf-8")\n'
+    for following in ("            if cache_key is not None:", "            preview, total, _ ="):
+        replace(
+            root / "mcp/git.py",
+            write + following,
+            write + "            ctx.tool_state.git_export_paths.add(path)\n" + following,
+        )
     path = root / "mcp/server.py"
     replace(
         path,

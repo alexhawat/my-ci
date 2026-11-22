@@ -10,7 +10,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 COPY localci ./localci
-COPY smoke.py smoke_parallel.py smoke_artifacts.py ./
+COPY smoke.py smoke_parallel.py smoke_artifacts.py smoke_sysbox.py ./
 COPY backup.py ./backup.py
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
 # The commit this image was built from, shown on the dashboard; the self-update helper sets it.
