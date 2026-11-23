@@ -31,6 +31,10 @@ updates:
 
   - package-ecosystem: docker
     directory: /
+    ignore:
+      # Revisit Python 3.15 when the service needs it.
+      - dependency-name: python
+        versions: [">= 3.15, < 3.16"]
     schedule:
       interval: weekly
     # Skip releases younger than a week: most malicious releases are pulled
