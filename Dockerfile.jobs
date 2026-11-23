@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 ghcr.io/catthehacker/ubuntu:act-26.04@sha256:a69bc68d691e9e9afd294dbb9ea7a71e38207c2f0a7b689b5dc6a4cacf06f5e6
+FROM --platform=linux/amd64 ghcr.io/catthehacker/ubuntu:act-26.04@sha256:beea02d9454a21c06de0104bb1f8c1542b88dd88f33022f9d36b52b48e022bd7
 USER root
 ARG GO_VERSION=1.27.4
 ARG GO_SHA256=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
