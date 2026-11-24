@@ -55,7 +55,9 @@ def apply(root):
         "        except Exception:\n"
         '            accumulator.halt_reason = "Live usage evidence failed; review stopped"\n'
         "            return\n"
-        "    if stop:\n        accumulator.halt_reason = stop\n        return\n    accumulator.absorb_usage(payload)",
+        "    if stop:\n        accumulator.halt_reason = stop\n        return\n    accumulator.absorb_usage(payload)\n"
+        "    if live_budget is not None and live_budget.loops.reason:\n"
+        "        accumulator.halt_reason = live_budget.loops.reason",
     )
     replace(
         "review/offline_agent.py",

@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 _lock = threading.Lock()
@@ -25,13 +26,25 @@ def event(kind, **fields):
         pass
 
 
+def loop_note(tool, arguments, result):
+    """Append a note to the result of a call the model keeps repeating."""
+    from mergecraft.localci_live_budget import active
+    from mergecraft.mcp.shared import ToolResult
+
+    live = active()
+    note = live.record_call(tool.name, arguments) if live is not None else ""
+    if not note or not isinstance(result, ToolResult):
+        return result
+    return replace(result, content=[*result.content, {"type": "text", "text": note}])
+
+
 async def invoke(tool, arguments):
     start = time.monotonic()
     failed = True
     try:
         result = await tool.execute(arguments)
         failed = bool(getattr(result, "is_error", False))
-        return result
+        return loop_note(tool, arguments, result)
     finally:
         event(
             "mcp",

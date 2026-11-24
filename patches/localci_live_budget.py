@@ -8,10 +8,14 @@ from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path
 
+from mergecraft.localci_loop_guard import LoopGuard
 from mergecraft.localci_profile import event
 from mergecraft.utils.run_bounds import BudgetExhausted
 
 _current = ContextVar("localci_live_budget", default=None)
+# The MCP server starts before an attempt binds its budget, so its handlers do not
+# inherit the context variable. One attempt runs at a time.
+_active = None
 
 
 def _counter(value):
@@ -47,6 +51,11 @@ class LiveBudget:
         self.journal_error_detail = ""
         self.journal_partial = False
         self.unreported_step = False
+        self.loops = LoopGuard()
+
+    def record_call(self, name, arguments):
+        """Count one MCP call; return a note for a model that repeats itself."""
+        return self.loops.record(name, arguments, self.journal.compactions if self.journal else 0)
 
     def reported_usage(self, usage):
         if self.mistral and usage is not None:
@@ -118,6 +127,10 @@ class LiveBudget:
             self.totals[key] += number
         if stop:
             self.error = BudgetExhausted("token", stop)
+        elif self.loops.reason and self.error is None:
+            # The step above is charged first. Upstream maps the exhaustion to inconclusive.
+            self.error = BudgetExhausted("tool_call", self.loops.reason)
+            self.tracker.last_exhausted = self.error
         event("usage_step", step=self.steps, **fields, total=sum(self.totals.values()))
         self.save()
 
@@ -161,13 +174,21 @@ class LiveBudget:
 
 @contextmanager
 def bind(tracker):
+    global _active
     budget = LiveBudget(tracker)
     token = _current.set(budget)
+    previous, _active = _active, budget
     try:
         yield budget
     finally:
+        _active = previous
         _current.reset(token)
 
 
 def current():
     return _current.get()
+
+
+def active():
+    """The bound budget, from any thread."""
+    return _active
