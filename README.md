@@ -112,6 +112,8 @@ Which failures move on to the next model:
 - The typed `provider.free-limit` and `provider.no-route` errors also fall back when the failing model is that free model.
 - Any other error ends the review without trying the next model. That includes a 429 from any other model, paid or free, and a 429 that arrives while several requests are outstanding: both are incomplete accounting and stop the review.
 
+When accounting stops a review, its run record names the cause after "Complete model usage unavailable", for example "Provider request failed; complete usage unavailable (HTTP 429)". Only fixed texts and the HTTP status code are recorded, never the provider's response.
+
 A roster that starts with a free model sends the review content to that provider's free endpoint first: the diff, the source ranges the reviewer reads, and CI excerpts, for every enabled repository, private ones included. Free tiers often have different data-retention and training terms from paid API access. Check the provider's terms before putting a free model first for private repositories.
 
 ### Execution limits

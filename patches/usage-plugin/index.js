@@ -59,7 +59,9 @@ export default Plugin.define({
           return;
         }
       }
-      write({ kind: "error", reason: "Provider request failed; complete usage unavailable" });
+      // The status is a number; nothing else from the response is recorded.
+      write({ kind: "error", reason: "Provider request failed; complete usage unavailable",
+        status: event.response.status });
     });
     await ctx.session.hook("title", (event) => { event.result = "mergeCraft review"; });
     await ctx.session.hook("compaction", (event) => {

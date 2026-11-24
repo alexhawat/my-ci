@@ -115,3 +115,89 @@ def test_native_primary_usage_must_reconcile(tmp_path):
     journal.note_native(event)
     with pytest.raises(ValueError, match="reconcile"):
         journal.finish()
+
+
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        (
+            {"reason": "Provider request failed; complete usage unavailable", "status": 429},
+            "Provider request failed; complete usage unavailable (HTTP 429)",
+        ),
+        (
+            {"reason": "Provider request failed; complete usage unavailable"},
+            "Provider request failed; complete usage unavailable",
+        ),
+        (
+            {"reason": "Usage arrived without a metered request"},
+            "Usage arrived without a metered request",
+        ),
+        # A status that is not an HTTP status code is left out.
+        (
+            {"reason": "Usage event subscription failed", "status": "429 fixture-text"},
+            "Usage event subscription failed",
+        ),
+        # A reason the plugin does not write is never copied into the evidence.
+        (
+            {"reason": "fixture-provider-text", "status": 500},
+            "Usage journal reported an incomplete provider request",
+        ),
+        ({}, "Usage journal reported an incomplete provider request"),
+    ],
+)
+def test_plugin_failure_names_the_cause_without_copying_provider_text(tmp_path, row, message):
+    journal = UsageJournal(tmp_path)
+    write(journal, kind="ready")
+    write(journal, kind="error", **row)
+    with pytest.raises(ValueError) as raised:
+        journal.drain(lambda row: None)
+    assert str(raised.value) == message
+
+
+def test_unknown_row_kind_is_not_described_by_its_own_reason(tmp_path):
+    journal = UsageJournal(tmp_path)
+    write(journal, kind="fixture", reason="Usage event subscription failed", status=429)
+    with pytest.raises(ValueError) as raised:
+        journal.drain(lambda row: None)
+    assert str(raised.value) == "Usage journal reported an incomplete provider request"
+
+
+def test_consume_records_the_cause_in_the_halt_reason_and_the_saved_usage(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from patches import localci_compaction
+
+    saved = []
+    journal = UsageJournal(tmp_path)
+    write(journal, kind="ready")
+    write(journal, kind="request", session="fixture", request=1, request_kind="primary")
+    write(
+        journal,
+        kind="error",
+        reason="Provider request failed; complete usage unavailable",
+        status=429,
+    )
+    live = types.SimpleNamespace(journal=journal, save=lambda: saved.append(True))
+    package = types.ModuleType("mergecraft")
+    module = types.ModuleType("mergecraft.localci_live_budget")
+    module.current = lambda: live  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mergecraft", package)
+    monkeypatch.setitem(sys.modules, "mergecraft.localci_live_budget", module)
+    accumulator = types.SimpleNamespace(halt_reason=None)
+
+    assert localci_compaction.consume(accumulator, {}, lambda row: None)
+
+    detail = "Provider request failed; complete usage unavailable (HTTP 429)"
+    assert accumulator.halt_reason == f"Complete model usage unavailable ({detail}); review stopped"
+    assert live.journal_error_detail == detail
+    assert live.journal_error_type == "ValueError"
+    assert saved == [True]
+
+    # A failure this module did not raise is named by its type only.
+    journal.path.write_text("not json\n")
+    journal.offset = 0
+    accumulator.halt_reason = None
+    assert localci_compaction.consume(accumulator, {}, lambda row: None)
+    assert live.journal_error_detail == "JSONDecodeError"
+    assert accumulator.halt_reason == "Complete model usage unavailable (JSONDecodeError); review stopped"

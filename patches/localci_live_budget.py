@@ -42,6 +42,7 @@ class LiveBudget:
         self.error = None
         self.journal = None
         self.journal_error_type = ""
+        self.journal_error_detail = ""
 
     @staticmethod
     def _fields(tokens):
@@ -128,9 +129,11 @@ class LiveBudget:
             "reason": str(self.error)
             if self.error
             else "Complete model usage unavailable"
+            + (f": {self.journal_error_detail}" if self.journal_error_detail else "")
             if self.journal_error_type
             else "",
             "accounting_error_type": self.journal_error_type,
+            "accounting_error": self.journal_error_detail,
         }
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(data))

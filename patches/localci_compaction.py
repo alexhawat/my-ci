@@ -4,6 +4,27 @@ import json
 import secrets
 from pathlib import Path
 
+# Failures the usage plugin reports. Only these fixed texts and an HTTP status are
+# copied into the evidence, so nothing a provider sent can reach it.
+_PLUGIN_FAILURES = frozenset(
+    {
+        "Provider request failed; complete usage unavailable",
+        "Usage arrived without a metered request",
+        "Usage event subscription failed",
+    }
+)
+
+
+def plugin_failure(row):
+    """Describe a journal row that is not a known accounting record."""
+    reason = row.get("reason")
+    if row.get("kind") != "error" or reason not in _PLUGIN_FAILURES:
+        return "Usage journal reported an incomplete provider request"
+    status = row.get("status")
+    if type(status) is int and 100 <= status <= 599:
+        return f"{reason} (HTTP {status})"
+    return reason
+
 
 class UsageJournal:
     def __init__(self, root):
@@ -109,7 +130,7 @@ class UsageJournal:
                         }
                     )
                 else:
-                    raise ValueError("Usage journal reported an incomplete provider request")
+                    raise ValueError(plugin_failure(row))
         finally:
             self.draining = False
 
@@ -169,8 +190,12 @@ def consume(accumulator, event, absorb, *, final=False, unrouted=False):
     except Exception as exc:
         live.journal_error = str(exc)
         live.journal_error_type = type(exc).__name__
+        # Every ValueError raised by this module carries a fixed text (plus, at most,
+        # an HTTP status), so it is safe to show. Any other failure is named by type.
+        detail = str(exc) if type(exc) is ValueError else type(exc).__name__
+        live.journal_error_detail = detail
         accumulator.halt_reason = (
-            accumulator.halt_reason or "Complete model usage unavailable; review stopped"
+            accumulator.halt_reason or f"Complete model usage unavailable ({detail}); review stopped"
         )
         live.save()
     return True
