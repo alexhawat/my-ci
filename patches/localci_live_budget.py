@@ -44,6 +44,7 @@ class LiveBudget:
         self.mistral = False
         self.journal = None
         self.journal_error_type = ""
+        self.journal_error_detail = ""
         self.journal_partial = False
         self.unreported_step = False
 
@@ -141,9 +142,11 @@ class LiveBudget:
             "reason": str(self.error)
             if self.error
             else "Complete model usage unavailable"
+            + (f": {self.journal_error_detail}" if self.journal_error_detail else "")
             if journal_stop
             else "",
             "accounting_error_type": self.journal_error_type,
+            "accounting_error": self.journal_error_detail,
         }
         if self.mistral:
             data.update(

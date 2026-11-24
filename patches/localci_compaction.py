@@ -18,6 +18,42 @@ class JournalGap(ValueError):
     """
 
 
+# Failures the usage plugin reports. Only these fixed texts and an HTTP status are
+# copied into the evidence, so nothing a provider sent can reach it.
+_PLUGIN_FAILURES = frozenset(
+    {
+        "Provider request failed; complete usage unavailable",
+        "Usage arrived without a metered request",
+        "Usage event subscription failed",
+    }
+)
+_NOT_INITIALIZED = "Usage plugin did not initialize"
+
+
+def plugin_failure(row):
+    """Describe an ``error`` row the plugin wrote."""
+    reason = row.get("reason")
+    if reason not in _PLUGIN_FAILURES:
+        return "Usage journal reported an incomplete provider request"
+    status = row.get("status")
+    if type(status) is int and 100 <= status <= 599:
+        return f"{reason} (HTTP {status})"
+    return reason
+
+
+def failure_detail(exc):
+    """Name an accounting failure without copying text this module did not write.
+
+    The journal's own errors carry fixed texts (plus, at most, an HTTP status). Any
+    other exception, a ``ValueError`` from the upstream usage callback included, is
+    named by its type only.
+    """
+    own = type(exc) in (JournalGap, JournalIntegrityError)
+    if own or (type(exc) is ValueError and str(exc) == _NOT_INITIALIZED):
+        return str(exc)
+    return type(exc).__name__
+
+
 class UsageJournal:
     def __init__(self, root):
         directory = Path(root) / "opencode-xdg-config"
@@ -133,7 +169,7 @@ class UsageJournal:
                         }
                     )
                 elif kind == "error":
-                    raise JournalGap("Usage journal reported an incomplete provider request")
+                    raise JournalGap(plugin_failure(row))
                 else:
                     raise JournalIntegrityError("Usage journal row of an unknown kind")
         finally:
@@ -203,7 +239,7 @@ def consume(accumulator, event, absorb, *, final=False, unrouted=False):
         needs_ready = final or event.get("type") == "step_finish"
         no_request = unrouted and not journal.request_seen and not journal.native_seen
         if needs_ready and not journal.ready and not no_request:
-            raise ValueError("Usage plugin did not initialize")
+            raise ValueError(_NOT_INITIALIZED)
         if final:
             journal.finish()
     except Exception as exc:
@@ -212,9 +248,11 @@ def consume(accumulator, event, absorb, *, final=False, unrouted=False):
         # An allowlist: only a reported gap is advisory. A line that does not parse, a
         # row with a missing field or any other failure stops the review.
         live.journal_partial = live.mistral and isinstance(exc, JournalGap)
+        detail = failure_detail(exc)
+        live.journal_error_detail = detail
         if not live.journal_partial:
             accumulator.halt_reason = (
-                accumulator.halt_reason or "Complete model usage unavailable; review stopped"
+                accumulator.halt_reason or f"Complete model usage unavailable ({detail}); review stopped"
             )
         live.save()
     return not live.mistral or bool(accumulator.halt_reason)
