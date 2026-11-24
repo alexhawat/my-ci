@@ -251,3 +251,27 @@ def test_token_ceiling_leaves_config_alone_when_unset_and_fills_missing_sections
         "runBounds": {"tokenBudget": 1000, "tokenBudgetTolerance": 0},
         "review": {"roundBudgets": {"multipliers": [1.0]}},
     }
+
+
+@pytest.mark.parametrize("steps", [0, 2])
+def test_unpriced_subscription_overrides_estimate_even_on_partial_review(tmp_path, steps):
+    from localci.reporting import add_review_record
+
+    (tmp_path / "mergecraft-metrics.json").write_text(json.dumps({"cost": "$0.123 estimate"}))
+    (tmp_path / "mergecraft-usage.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "usage_partial": True,
+                "cost_availability": "unknown_subscription_charge",
+                "total_tokens": steps * 100,
+                "steps": steps,
+                "stopped": False,
+            }
+        )
+    )
+    report = {"diagnostics": [], "findings_source": "unavailable"}
+    add_review_record(report, tmp_path, [])
+    assert report["record"]["cost"] == "NA"
+    assert ("partial usage" if steps else "Unavailable") in report["record"]["tokens"]
+    assert any("Only measured tokens" in text for text in report["diagnostics"])

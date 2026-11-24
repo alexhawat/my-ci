@@ -19,8 +19,16 @@ def apply(root):
         "                from mergecraft.localci_live_budget import bind\n"
         "                budget_tracker.stream_tokens_charged = 0\n"
         "                budget_tracker.stream_cost_charged = 0.0\n"
-        "                with bind(budget_tracker):\n"
+        "                with bind(budget_tracker) as live_budget:\n"
         "                    result = await attempt_agent.run(attempt_ctx)",
+    )
+    # Enforce the existing cost ceiling on estimates before exporting billed usage.
+    charge = '        record_agent_usage(budget_tracker, result.usage, phase="reviewer_dispatch")'
+    replace(
+        "review/offline_agent.py",
+        "        _localci_usages.append(result.usage)\n" + charge,
+        charge + "\n        result.usage = live_budget.reported_usage(result.usage)\n"
+        "        _localci_usages.append(result.usage)",
     )
     replace(
         "agents/opencode.py",

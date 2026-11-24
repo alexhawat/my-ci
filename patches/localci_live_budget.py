@@ -5,6 +5,7 @@ import math
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from pathlib import Path
 
 from mergecraft.localci_profile import event
@@ -40,8 +41,16 @@ class LiveBudget:
         self.duplicates = 0
         self.totals = dict(input=0, output=0, reasoning=0, cache_read=0, cache_write=0)
         self.error = None
+        self.mistral = False
         self.journal = None
         self.journal_error_type = ""
+        self.journal_partial = False
+        self.unreported_step = False
+
+    def reported_usage(self, usage):
+        if self.mistral and usage is not None:
+            return replace(usage, cost_usd=None, cost_note="Subscription charge unavailable")
+        return usage
 
     @staticmethod
     def _fields(tokens):
@@ -100,6 +109,9 @@ class LiveBudget:
             raise ValueError("Invalid provider token counters")
         if not _valid_cost(value["part"].get("cost")):
             raise ValueError("Invalid provider cost")
+        if self.mistral and not any(fields.values()):
+            # A completion with no provider usage reaches OpenCode as zero counters.
+            self.unreported_step = True
         self.steps += 1
         for key, number in fields.items():
             self.totals[key] += number
@@ -113,6 +125,7 @@ class LiveBudget:
         if not profile:
             return
         path = Path(profile).with_name("mergecraft-usage.json")
+        journal_stop = bool(self.journal_error_type) and not self.journal_partial
         data = {
             "schema_version": 1,
             "steps": self.steps,
@@ -124,14 +137,20 @@ class LiveBudget:
             "prior_attempt_tokens": self.prior_tokens,
             "target": self.tracker.bounds.token_budget,
             "ceiling": self.tracker.bounds.token_ceiling,
-            "stopped": self.error is not None or bool(self.journal_error_type),
+            "stopped": self.error is not None or journal_stop,
             "reason": str(self.error)
             if self.error
             else "Complete model usage unavailable"
-            if self.journal_error_type
+            if journal_stop
             else "",
             "accounting_error_type": self.journal_error_type,
         }
+        if self.mistral:
+            data.update(
+                usage_source="cli_primary_and_journal_compaction",
+                cost_availability="unknown_subscription_charge",
+                usage_partial=self.journal_partial or self.unreported_step,
+            )
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(data))
         temporary.replace(path)

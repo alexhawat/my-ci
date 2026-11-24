@@ -115,3 +115,19 @@ def test_native_primary_usage_must_reconcile(tmp_path):
     journal.note_native(event)
     with pytest.raises(ValueError, match="reconcile"):
         journal.finish()
+
+
+def test_native_primary_keeps_compaction_with_missing_subscription_price(tmp_path):
+    journal = UsageJournal(tmp_path)
+    usage(journal, 1, 100)
+    usage(journal, 2, 130, kind="compaction")
+    usage(journal, 3, 200)
+    rows = [json.loads(line) for line in journal.path.read_text().splitlines()]
+    for row in rows:
+        if row["kind"] == "usage":
+            row["cost"] = None
+    journal.path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    measured = []
+    journal.drain(measured.append, native_primary=True)
+    assert [event["part"]["tokens"]["input"] for event in measured] == [30]
+    assert journal.compactions == 1

@@ -381,6 +381,16 @@ def add_review_record(report: dict, directory: Path, secrets: list[str]) -> None
                 secrets,
                 2000,
             )
+            if usage.get("cost_availability") == "unknown_subscription_charge":
+                record["cost"] = "NA"
+                if not usage.get("total_tokens"):
+                    record["tokens"] = "Unavailable: no reported token counts"
+                elif usage.get("usage_partial"):
+                    record["tokens"] += " (partial usage)"
+                if usage.get("usage_partial"):
+                    report["diagnostics"].append(
+                        "Session usage was incomplete. Only measured tokens are included."
+                    )
             if usage.get("stopped"):
                 report["diagnostics"].insert(0, clean(usage.get("reason"), secrets, 2000))
         if isinstance(runtime, dict):
