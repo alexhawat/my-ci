@@ -15,6 +15,8 @@ const memory = n => n ? fixed(n / 2**30)+' GiB' : '—';
 function elapsed(seconds) { if(seconds == null) return '—'; const s=Math.max(0,Math.floor(seconds)); return `${Math.floor(s/60)}m ${s%60}s`; }
 function duration(r) {return r.started ? elapsed((r.finished||Date.now()/1000)-r.started) : '—';}
 let workerError='';
+let mergeTarget=null;
+const openChecks=new Set();
 function notice(message) {if($('settings').open) $('settings-error').textContent=message; $('notice').textContent=message; $('notice').hidden=!message;}
 async function api(path, options={}) {
   const response=await fetch('/api'+path,{...options,headers:{'Content-Type':'application/json',...options.headers}});
@@ -39,17 +41,47 @@ async function loadPRs() {
     openPRs=data.prs;
     if(mode==='open')$('pr-count').textContent=openPRs.length;
     $('pr-summary').textContent=`${openPRs.length} ${mode==='closed'?'closed / merged':'open'} · ${data.last_poll?'synced '+date(data.last_poll):'waiting for first sync'}`;
-    $('pr-errors').textContent=(data.errors||[]).map(r=>`${r.name}: sync failed; the list may be incomplete. ${r.error}`).join(' · ');
+    $('pr-errors').textContent=[...(data.errors||[]).map(r=>`${r.name}: sync failed; the list may be incomplete. ${r.error}`),...(data.github_errors||[]).map(r=>`${r.name}: GitHub checks unavailable. ${r.error}`)].join(' · ');
     filterPRs();
   } catch(e) {if(request===prRequest){$('pr-errors').textContent=e.message;$('pr-summary').textContent='Unable to load PRs';}}
+}
+function githubCell(p) {
+  const g=p.github;
+  if(p.state!=='open')return '—';
+  if(!g)return '<span class="muted">Unavailable</span>';
+  const merge={CONFLICTING:'Merge conflicts'}[g.mergeable]||{BLOCKED:'Merge blocked by branch rules',BEHIND:'Behind base branch',UNSTABLE:'Mergeable; checks not green',CLEAN:'Ready to merge',DRAFT:'Draft',HAS_HOOKS:'Ready to merge'}[g.merge_state]||'';
+  const review={APPROVED:'Approved',CHANGES_REQUESTED:'Changes requested',REVIEW_REQUIRED:'Review required'}[g.review_decision]||'';
+  const list=g.checks.length?`<details class="check-list" data-checks="${esc(p.repo)}#${p.number}" ${openChecks.has(`${p.repo}#${p.number}`)?'open':''}><summary>${esc(g.summary)}${g.truncated?' (first 100)':''}</summary><ul>${g.checks.map(c=>`<li>${badge(c.state)} ${c.url?`<a class="text-button" href="${esc(c.url)}" target="_blank" rel="noopener noreferrer">${esc(c.name)} ↗</a>`:esc(c.name)}</li>`).join('')}</ul></details>`:'';
+  return `${g.state==='none'?'<span class="muted">No GitHub checks</span>':badge(g.state)}${g.current?'':'<small>Newer commit on GitHub</small>'}${list}${[merge,review].filter(Boolean).map(t=>`<small>${esc(t)}</small>`).join('')}`;
+}
+function mergeButton(p) {
+  if(p.state!=='open')return '';
+  const g=p.github,reason=p.draft?'Draft pull requests cannot be merged':!g?'GitHub status unavailable':!g.current?'Waiting for the next GitHub sync':g.mergeable==='CONFLICTING'?'Resolve merge conflicts first':!p.merge_methods.length?'No merge method available':'';
+  return `<button class="button primary" data-merge="${esc(p.repo)}#${p.number}" ${reason?`disabled title="${esc(reason)}"`:''}>Merge</button>`;
+}
+function openMerge(key) {
+  const p=openPRs.find(x=>`${x.repo}#${x.number}`===key); if(!p)return;
+  mergeTarget=p; const g=p.github,r=p.latest_run;
+  $('merge-title').textContent=`${p.repo} #${p.number}`;
+  $('merge-summary').innerHTML=`<strong>${esc(p.title)}</strong><br>${esc(p.branch)} → ${esc(p.base_branch)} · <code>${esc(p.head.slice(0,8))}</code>`;
+  const local=!r?'not run':r.current?r.state:'outdated';
+  const warnings=[];
+  if(local!=='success')warnings.push(`Local CI for this commit: ${local}.`);
+  if(!['success','none'].includes(g.state))warnings.push(`GitHub CI: ${g.summary||g.state}.`);
+  if(g.merge_state==='BLOCKED')warnings.push('GitHub reports this merge as blocked by branch rules; it will probably be refused.');
+  if(g.review_decision==='CHANGES_REQUESTED'||g.review_decision==='REVIEW_REQUIRED')warnings.push(g.review_decision==='REVIEW_REQUIRED'?'A required review is missing.':'Changes were requested.');
+  $('merge-warnings').innerHTML=warnings.length?warnings.map(w=>`<div>⚠ ${esc(w)}</div>`).join(''):'Local CI and GitHub checks are green.';
+  $('merge-method').innerHTML=p.merge_methods.map(m=>`<option value="${esc(m)}">${esc({merge:'Create a merge commit',squash:'Squash and merge',rebase:'Rebase and merge'}[m]||m)}</option>`).join('');
+  $('merge-result').textContent='';$('merge-confirm').disabled=false;
+  $('merge-dialog').showModal();
 }
 function filterPRs() {
   const q=$('pr-search').value.toLowerCase();
   const prs=openPRs.filter(p=>[p.repo,`#${p.number}`,p.title,p.author,p.branch,p.state==='closed'?(p.merged?'merged':'closed'):(p.draft?'draft':'open'),p.latest_run?.state].join(' ').toLowerCase().includes(q));
   const iso=t=>t?date(Date.parse(t)/1000):'—';
-  $('pr-list').innerHTML=prs.length?`<div class="table-wrap"><table class="pr-table"><thead><tr><th>Repository / PR</th><th>Title</th><th>Author / state</th><th>Branch → base</th><th>Local CI</th><th>Checks</th><th>Updated</th><th>Opened</th><th></th></tr></thead><tbody>${prs.map(p=>{
+  $('pr-list').innerHTML=prs.length?`<div class="table-wrap"><table class="pr-table"><thead><tr><th>Repository / PR</th><th>Title</th><th>Author / state</th><th>Branch → base</th><th>Local CI</th><th>Checks</th><th>GitHub CI</th><th>Updated</th><th>Opened</th><th></th></tr></thead><tbody>${prs.map(p=>{
     const r=p.latest_run,current=r?.current,status=r?(current?badge(r.state):badge('outdated')):'<span class="muted">Not run</span>';
-    return `<tr><td><a class="text-button" href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.repo)} #${p.number} ↗</a></td><td><strong>${esc(p.title)}</strong></td><td>${esc(p.author)}<small>${p.state==='closed'?(p.merged?'Merged':'Closed'):(p.draft?'Draft':'Open')}${p.fork?' · Fork':''}</small></td><td>${esc(p.branch)} → ${esc(p.base_branch)}<small><code>${esc(p.head.slice(0,8))}</code></small></td><td>${status}<small>${esc(p.ci_eligibility)}</small>${p.sync_error?'<small>Sync needs attention</small>':''}</td><td>${r?`${current?'':'Previous revision: '}${esc(r.checks_summary||r.state)}`:'—'}</td><td>${iso(p.updated)}</td><td>${iso(p.created)}</td><td>${r?`<button class="button" data-run="${esc(r.id)}">View run ↗</button>`:'—'}</td></tr>`;
+    return `<tr><td><a class="text-button" href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.repo)} #${p.number} ↗</a></td><td><strong>${esc(p.title)}</strong></td><td>${esc(p.author)}<small>${p.state==='closed'?(p.merged?'Merged':'Closed'):(p.draft?'Draft':'Open')}${p.fork?' · Fork':''}</small></td><td>${esc(p.branch)} → ${esc(p.base_branch)}<small><code>${esc(p.head.slice(0,8))}</code></small></td><td>${status}<small>${esc(p.ci_eligibility)}</small>${p.sync_error?'<small>Sync needs attention</small>':''}</td><td>${r?`${current?'':'Previous revision: '}${esc(r.checks_summary||r.state)}`:'—'}</td><td>${githubCell(p)}</td><td>${iso(p.updated)}</td><td>${iso(p.created)}</td><td><div class="button-row">${r?`<button class="button" data-run="${esc(r.id)}">View run ↗</button>`:''}${mergeButton(p)}</div></td></tr>`;
   }).join('')}</tbody></table></div>`:`<div class="empty"><strong>No matching ${prMode} pull requests.</strong>Only enabled repositories appear here.</div>`;
 }
 function selectionRuns() {return [...new Map([...state.runs,...(state.latest_runs||[])].map(r=>[r.id,r])).values()].sort((a,b)=>b.created-a.created);}
@@ -283,6 +315,16 @@ for(const mode of ['open','closed'])$('prs-'+mode).addEventListener('click',asyn
   $('pr-title').textContent=mode==='open'?'Open pull requests':'Closed & merged pull requests';
   $('pr-summary').textContent='Loading…';$('pr-errors').textContent='';$('pr-list').innerHTML='';
   await loadPRs();
+});
+$('pr-list').addEventListener('click',e=>{const button=e.target.closest('[data-merge]');if(button&&!button.disabled)openMerge(button.dataset.merge);});
+$('pr-list').addEventListener('toggle',e=>{const key=e.target.dataset?.checks;if(key)openChecks[e.target.open?'add':'delete'](key);},true);
+$('merge-confirm').addEventListener('click',async()=>{
+  const p=mergeTarget;if(!p)return;
+  $('merge-confirm').disabled=true;$('merge-result').textContent='Merging…';
+  try{
+    await api(`/repos/${p.repo}/prs/${p.number}/merge`,{method:'POST',body:JSON.stringify({sha:p.head,method:$('merge-method').value})});
+    $('merge-dialog').close();notice(`Merged ${p.repo} #${p.number}.`);await loadPRs();
+  }catch(e){$('merge-result').textContent=e.message;$('merge-confirm').disabled=false;}
 });
 $('search').addEventListener('input',filterRepos);$('run-search').addEventListener('input',filterRuns);$('pr-search').addEventListener('input',filterPRs);
 $('add-variable').addEventListener('click',()=>addVariable());

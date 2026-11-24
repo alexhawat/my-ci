@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from localci.app import Controller, create_app
+from localci.github import GitHub, GitHubError
 from localci.runner import Runner
 from localci.store import Store
 from localci.telemetry import memory_bytes
@@ -492,3 +493,167 @@ def test_operator_token_ceiling_validation_and_run_snapshot(client):
         ]
         == 5_000_000
     )
+
+
+def remote_pr(number=1, head="a" * 40, contexts=(), **extra):
+    return {
+        "number": number,
+        "headRefOid": head,
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "reviewDecision": None,
+        "commits": {
+            "nodes": [
+                {
+                    "commit": {
+                        "statusCheckRollup": {
+                            "contexts": {"totalCount": len(contexts), "nodes": list(contexts)}
+                        }
+                    }
+                }
+            ]
+        },
+        **extra,
+    }
+
+
+def check_run(name, status="COMPLETED", conclusion="SUCCESS", workflow_name="CI"):
+    return {
+        "__typename": "CheckRun",
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "detailsUrl": f"https://github.com/o/r/actions/runs/1/job/{name}",
+        "checkSuite": {"workflowRun": {"workflow": {"name": workflow_name}}},
+    }
+
+
+def test_open_prs_show_github_checks_without_the_local_ci_status(client):
+    http, c = client
+    assert http.put("/api/repos/o/r", json={"enabled": True, "review": True}).status_code == 200
+    draft = pr(2)
+    draft["draft"] = True
+    c.store.replace_prs("o/r", [pr(1), draft, pr(3)])
+    c.github.pull_request_checks = AsyncMock(
+        return_value={
+            "merge_methods": ["squash", "merge"],
+            "prs": {
+                1: remote_pr(
+                    1,
+                    contexts=[
+                        check_run("test"),
+                        check_run("lint", conclusion="FAILURE"),
+                        check_run("deploy", status="IN_PROGRESS", conclusion=None),
+                        check_run("local-ci", workflow_name=None),
+                        {
+                            "__typename": "StatusContext",
+                            "context": "local-ci",
+                            "state": "SUCCESS",
+                            "targetUrl": "https://ci.example.com/?run=1",
+                        },
+                        {
+                            "__typename": "StatusContext",
+                            "context": "coverage",
+                            "state": "PENDING",
+                            "targetUrl": "javascript:alert(1)",
+                        },
+                    ],
+                ),
+                # GitHub CI is reported for PRs that never run locally, such as drafts.
+                2: remote_pr(2, head="c" * 40, contexts=[check_run("test")], mergeable="CONFLICTING"),
+            },
+        }
+    )
+    data = http.get("/api/prs").json()
+    by_number = {p["number"]: p for p in data["prs"]}
+    github = by_number[1]["github"]
+    assert github["state"] == "failure" and github["current"]
+    assert github["summary"] == "1 failed · 2 running · 1 passed"
+    assert [(check["name"], check["state"]) for check in github["checks"]] == [
+        ("CI / lint", "failure"),
+        ("CI / deploy", "running"),
+        ("coverage", "running"),
+        ("CI / test", "success"),
+    ]
+    assert github["checks"][2]["url"] == ""
+    assert by_number[1]["merge_methods"] == ["squash", "merge"]
+    assert by_number[2]["github"]["state"] == "success"
+    assert by_number[2]["github"]["mergeable"] == "CONFLICTING"
+    assert not by_number[2]["github"]["current"]
+    assert by_number[3]["github"] is None
+    assert data["github_errors"] == []
+    # Cached: the dashboard refreshes far more often than GitHub is asked.
+    http.get("/api/prs")
+    c.github.pull_request_checks.assert_awaited_once_with("o/r")
+
+
+def test_github_check_failure_is_reported_and_leaves_local_prs_visible(client):
+    http, c = client
+    assert http.put("/api/repos/o/r", json={"enabled": True, "review": True}).status_code == 200
+    c.store.replace_prs("o/r", [pr(1)])
+    c.github.pull_request_checks = AsyncMock(side_effect=GitHubError(502, "POST", "graphql"))
+    data = http.get("/api/prs").json()
+    assert [p["github"] for p in data["prs"]] == [None]
+    assert data["github_errors"] == [{"name": "o/r", "error": "GitHub returned HTTP 502 for POST graphql"}]
+    assert data["errors"] == []
+
+
+async def test_pull_request_checks_pages_and_orders_merge_methods(tmp_path):
+    github = GitHub(tmp_path / "token")
+    pages = [
+        {
+            "repository": {
+                "mergeCommitAllowed": True,
+                "squashMergeAllowed": True,
+                "rebaseMergeAllowed": False,
+                "viewerDefaultMergeMethod": "SQUASH",
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": page == 1, "endCursor": "next"},
+                    "nodes": [{"number": page}],
+                },
+            }
+        }
+        for page in (1, 2)
+    ]
+    github.graphql = AsyncMock(side_effect=pages)
+    result = await github.pull_request_checks("o/r")
+    assert result == {"merge_methods": ["squash", "merge"], "prs": {1: {"number": 1}, 2: {"number": 2}}}
+    assert [call.args[1]["cursor"] for call in github.graphql.await_args_list] == [None, "next"]
+    github.request = AsyncMock(return_value={"errors": [{"message": "private detail"}]})
+    del github.graphql
+    with pytest.raises(RuntimeError, match="^GitHub GraphQL query failed$"):
+        await github.graphql("query", {})
+
+
+def test_merge_button_merges_the_reviewed_commit_and_reports_refusals(client):
+    http, c = client
+    body = {"sha": "a" * 40, "method": "squash"}
+    c.github.merge = AsyncMock(return_value={"merged": True, "sha": "d" * 40})
+    assert http.post("/api/repos/o/r/prs/1/merge", json=body).status_code == 400  # Not enabled.
+    assert http.put("/api/repos/o/r", json={"enabled": True, "review": True}).status_code == 200
+    c.store.replace_prs("o/r", [pr(1), pr(2)])
+    c.github.pull_request_checks = AsyncMock(return_value={"merge_methods": ["squash"], "prs": {}})
+    assert len(http.get("/api/prs").json()["prs"]) == 2
+    assert http.post("/api/repos/o/r/prs/1/merge", json={**body, "sha": "main"}).status_code == 422
+    assert http.post("/api/repos/o/r/prs/1/merge", json={**body, "method": "force"}).status_code == 422
+    assert http.post("/api/repos/o/unknown/prs/1/merge", json=body).status_code == 404
+    forged = http.post(
+        "/api/repos/o/r/prs/1/merge", json=body, headers={"Origin": "https://evil.example.com"}
+    )
+    assert forged.status_code == 403
+    c.github.merge.assert_not_awaited()
+
+    response = http.post("/api/repos/o/r/prs/1/merge", json=body)
+    assert response.status_code == 200 and response.json() == {"merged": True, "sha": "d" * 40}
+    c.github.merge.assert_awaited_once_with("o/r", 1, "a" * 40, "squash")
+    # The merged PR leaves the list at once and GitHub is asked again for the rest.
+    assert [p["number"] for p in http.get("/api/prs").json()["prs"]] == [2]
+    assert c.github.pull_request_checks.await_count == 2
+
+    for status, expected in ((405, 409), (409, 409), (403, 502), (500, 502)):
+        c.github.merge = AsyncMock(side_effect=GitHubError(status, "PUT", "repos/o/r/pulls/2/merge"))
+        refused = http.post("/api/repos/o/r/prs/2/merge", json=body)
+        assert refused.status_code == expected and refused.json()["detail"]
+    c.github.merge = AsyncMock(return_value={"merged": False})
+    assert http.post("/api/repos/o/r/prs/2/merge", json=body).status_code == 502
+    assert [p["number"] for p in http.get("/api/prs").json()["prs"]] == [2]

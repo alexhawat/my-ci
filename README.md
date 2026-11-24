@@ -7,6 +7,8 @@ Self-hosted pull-request CI, optional mergeCraft reviews, and a private web dash
 ## Features
 
 - Polls open, non-draft, same-repository pull requests.
+- Shows the checks and statuses GitHub itself reports for every open PR (GitHub Actions and other integrations) next to the local result, including draft and fork PRs that do not run locally.
+- Merges a PR from the dashboard through GitHub, bound to the commit you reviewed.
 - Runs selected Linux GitHub Actions workflows with pinned `act` compatibility fixes.
 - Supports matrices, parallel jobs, PostgreSQL services, browser tests, and artifacts.
 - Runs CI and mergeCraft review independently and in parallel.
@@ -148,6 +150,12 @@ Git runs as the checkout's owner. The update fast-forwards only; a checkout with
 ### Images
 
 Base images are pinned by digest. The job image installs Chrome from Google's signed apt repository, authenticated by a pinned signing-key fingerprint; the Chrome version is not pinned by default (set the `CHROME_VERSION` build argument to pin one; such a pin builds only while Google's repository still serves that version). Alpine packages in the Docker-in-Docker worker image are not version-pinned. Runner images for the `ubuntu-22.04` and `ubuntu-20.04` labels are pulled by tag at run time; `ubuntu-latest` and `ubuntu-24.04` use the locally built job image.
+
+## GitHub CI and merging
+
+The **PRs** view shows two results for each open pull request. **Local CI** is the run on your worker. **GitHub CI** is what GitHub reports for the PR's head commit: GitHub Actions check runs and commit statuses from other integrations, with a link to each. The `local-ci` result this service publishes is left out of that column. GitHub CI is display only: it never starts, cancels or changes a local run. It is read with the worker's GitHub login (one GraphQL request per enabled repository, cached for 20 seconds) and covers the 200 most recently updated open PRs of a repository and the first 100 checks of each.
+
+**Merge** asks GitHub to merge the pull request as the worker's GitHub login, using the merge method you choose from those the repository allows. The request names the head commit shown in the dashboard, so GitHub refuses it if the PR has changed since. Local CI does not gate the button: the confirmation lists a local or GitHub result that is not green, and GitHub's branch protection, required checks and required reviews decide whether the merge is accepted. Draft PRs and PRs with merge conflicts cannot be merged from the dashboard. The login needs write access to the repository; anyone who can reach the dashboard can merge with it.
 
 ## Review behavior
 
