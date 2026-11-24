@@ -131,3 +131,157 @@ def test_native_primary_keeps_compaction_with_missing_subscription_price(tmp_pat
     journal.drain(measured.append, native_primary=True)
     assert [event["part"]["tokens"]["input"] for event in measured] == [30]
     assert journal.compactions == 1
+
+
+def bind_live(monkeypatch, journal, *, mistral):
+    """Give ``consume`` a live budget without importing the patched mergeCraft tree."""
+    import sys
+    import types
+
+    live = types.SimpleNamespace(
+        journal=journal,
+        mistral=mistral,
+        journal_error_type="",
+        journal_partial=False,
+        saves=0,
+    )
+    live.save = lambda: setattr(live, "saves", live.saves + 1)
+    module = types.ModuleType("mergecraft.localci_live_budget")
+    module.current = lambda: live  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mergecraft", types.ModuleType("mergecraft"))
+    monkeypatch.setitem(sys.modules, "mergecraft.localci_live_budget", module)
+    return live, types.SimpleNamespace(halt_reason=None)
+
+
+def corrupt(journal, failure):
+    if failure == "not-json":
+        with journal.path.open("a") as stream:
+            stream.write("not json\n")
+    elif failure == "missing-session":
+        write(journal, kind="request", request=2, request_kind="primary")
+    elif failure == "usage-without-request":
+        write(journal, kind="usage", session="fixture", request=9, request_kind="primary")
+    elif failure == "tokens-not-a-mapping":
+        write(journal, kind="request", session="fixture", request=2, request_kind="primary")
+        write(journal, kind="usage", session="fixture", request=2, request_kind="primary", tokens=[1])
+    elif failure == "cache-not-a-mapping":
+        write(journal, kind="request", session="fixture", request=2, request_kind="primary")
+        write(
+            journal,
+            kind="usage",
+            session="fixture",
+            request=2,
+            request_kind="primary",
+            tokens={"input": 1, "output": 1, "reasoning": 1, "cache": 5},
+        )
+    elif failure == "unknown-kind":
+        write(journal, kind="fixture")
+    elif failure == "nonce":
+        write(journal, kind="error", nonce="incorrect")
+    else:
+        raise AssertionError(failure)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "not-json",
+        "missing-session",
+        "usage-without-request",
+        "tokens-not-a-mapping",
+        "cache-not-a-mapping",
+        "unknown-kind",
+        "nonce",
+    ],
+)
+@pytest.mark.parametrize("mistral", [True, False])
+def test_consume_stops_the_review_on_a_malformed_journal(tmp_path, monkeypatch, failure, mistral):
+    from patches import localci_compaction
+
+    journal = UsageJournal(tmp_path)
+    write(journal, kind="ready")
+    corrupt(journal, failure)
+    live, accumulator = bind_live(monkeypatch, journal, mistral=mistral)
+
+    assert localci_compaction.consume(accumulator, {}, lambda row: None)
+
+    assert accumulator.halt_reason == "Complete model usage unavailable; review stopped"
+    assert live.journal_partial is False
+    assert live.journal_error_type and live.saves == 1
+
+
+def report_gap(journal, gap):
+    if gap == "plugin-error":
+        write(journal, kind="error")
+    elif gap == "usage-without-tokens":
+        write(journal, kind="request", session="fixture", request=2, request_kind="primary")
+        write(journal, kind="usage", session="fixture", request=2, request_kind="primary")
+    elif gap == "usage-with-null-counter":
+        write(journal, kind="request", session="fixture", request=2, request_kind="primary")
+        write(
+            journal,
+            kind="usage",
+            session="fixture",
+            request=2,
+            request_kind="primary",
+            tokens={"input": None, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        )
+    else:
+        raise AssertionError(gap)
+
+
+@pytest.mark.parametrize("gap", ["plugin-error", "usage-without-tokens", "usage-with-null-counter"])
+def test_consume_keeps_a_mistral_review_running_across_a_reported_gap(tmp_path, monkeypatch, gap):
+    from patches import localci_compaction
+
+    journal = UsageJournal(tmp_path)
+    write(journal, kind="ready")
+    report_gap(journal, gap)
+    live, accumulator = bind_live(monkeypatch, journal, mistral=True)
+
+    # False hands the event back to the CLI's own step metering.
+    assert localci_compaction.consume(accumulator, {}, lambda row: None) is False
+
+    assert accumulator.halt_reason is None
+    assert live.journal_partial is True
+    assert live.journal_error_type == "JournalGap"
+    # The gap is remembered: later events also fall back to the CLI's metering.
+    assert localci_compaction.consume(accumulator, {}, lambda row: None) is False
+    assert accumulator.halt_reason is None
+
+
+@pytest.mark.parametrize("gap", ["plugin-error", "usage-without-tokens", "usage-with-null-counter"])
+def test_consume_stops_other_providers_on_the_same_gap(tmp_path, monkeypatch, gap):
+    from patches import localci_compaction
+
+    journal = UsageJournal(tmp_path)
+    write(journal, kind="ready")
+    report_gap(journal, gap)
+    live, accumulator = bind_live(monkeypatch, journal, mistral=False)
+
+    assert localci_compaction.consume(accumulator, {}, lambda row: None)
+
+    assert accumulator.halt_reason == "Complete model usage unavailable; review stopped"
+    assert live.journal_partial is False
+
+
+def test_mistral_completion_gaps_are_advisory_but_a_torn_journal_is_not(tmp_path, monkeypatch):
+    from patches import localci_compaction
+
+    # A request that never reported usage is a gap.
+    journal = UsageJournal(tmp_path / "pending")
+    write(journal, kind="ready")
+    write(journal, kind="request", session="fixture", request=1, request_kind="primary")
+    live, accumulator = bind_live(monkeypatch, journal, mistral=True)
+    assert localci_compaction.consume(accumulator, {}, lambda row: None, final=True) is False
+    assert (accumulator.halt_reason, live.journal_partial) == (None, True)
+
+    # An unterminated last line is not: the journal cannot be trusted to be whole.
+    journal = UsageJournal(tmp_path / "torn")
+    write(journal, kind="ready")
+    with journal.path.open("a") as stream:
+        stream.write('{"nonce": "')
+    live, accumulator = bind_live(monkeypatch, journal, mistral=True)
+    assert localci_compaction.consume(accumulator, {}, lambda row: None, final=True)
+    assert accumulator.halt_reason == "Complete model usage unavailable; review stopped"
+    assert live.journal_partial is False

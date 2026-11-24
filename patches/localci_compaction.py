@@ -9,6 +9,15 @@ class JournalIntegrityError(ValueError):
     """Usage evidence violated its provenance, numeric constraints, or size bound."""
 
 
+class JournalGap(ValueError):
+    """The provider or the plugin left usage unreported; what was measured stays valid.
+
+    Only this failure may be treated as advisory. Anything else that goes wrong while
+    the journal is read, a line that does not parse or a row with a missing field
+    included, stops the review: the journal sits in a directory the agent can write.
+    """
+
+
 class UsageJournal:
     def __init__(self, root):
         directory = Path(root) / "opencode-xdg-config"
@@ -29,14 +38,19 @@ class UsageJournal:
 
     @staticmethod
     def counters(tokens):
-        if not isinstance(tokens, dict) or not isinstance(tokens.get("cache"), dict):
-            raise ValueError("Usage counters missing")
+        if tokens is None:
+            raise JournalGap("Usage counters missing")
+        if not isinstance(tokens, dict):
+            raise JournalIntegrityError("Usage counters invalid")
+        cache = tokens.get("cache")
+        if cache is not None and not isinstance(cache, dict):
+            raise JournalIntegrityError("Usage counters invalid")
         values = [tokens.get(k) for k in ("input", "output", "reasoning")]
-        values += [tokens["cache"].get(k) for k in ("read", "write")]
+        values += [(cache or {}).get(k) for k in ("read", "write")]
         if any(v is not None and (type(v) is not int or v < 0) for v in values):
             raise JournalIntegrityError("Usage counters invalid")
         if None in values:
-            raise ValueError("Usage counters missing")
+            raise JournalGap("Usage counters missing")
         return values
 
     def note_native(self, event):
@@ -84,7 +98,7 @@ class UsageJournal:
                     request_kind = self.pending.pop(key)
                     if row["request_kind"] != request_kind:
                         raise JournalIntegrityError("Usage request kind mismatch")
-                    values = self.counters(row["tokens"])
+                    values = self.counters(row.get("tokens"))
                     before, before_cost = self.previous.get(row["session"], ([0] * 5, 0))
                     cost = row.get("cost", 0)
                     if native_primary and row.get("cost") is None:
@@ -118,16 +132,21 @@ class UsageJournal:
                             },
                         }
                     )
+                elif kind == "error":
+                    raise JournalGap("Usage journal reported an incomplete provider request")
                 else:
-                    raise ValueError("Usage journal reported an incomplete provider request")
+                    raise JournalIntegrityError("Usage journal row of an unknown kind")
         finally:
             self.draining = False
 
     def finish(self):
-        if self.pending or self.offset != self.path.stat().st_size:
-            raise ValueError("Provider usage incomplete at review completion")
+        if self.offset != self.path.stat().st_size:
+            raise JournalIntegrityError("Usage journal incomplete at review completion")
+        if self.pending:
+            raise JournalGap("Provider usage incomplete at review completion")
         if self.native != {key: value for key, value in self.primary.items() if key in self.native}:
-            raise ValueError("Native primary usage does not reconcile with the journal")
+            # Raised only once the review has finished, so no later spend goes unmetered.
+            raise JournalGap("Native primary usage does not reconcile with the journal")
 
 
 def configure(ctx, model, config):
@@ -190,7 +209,9 @@ def consume(accumulator, event, absorb, *, final=False, unrouted=False):
     except Exception as exc:
         live.journal_error = str(exc)
         live.journal_error_type = type(exc).__name__
-        live.journal_partial = live.mistral and not isinstance(exc, JournalIntegrityError)
+        # An allowlist: only a reported gap is advisory. A line that does not parse, a
+        # row with a missing field or any other failure stops the review.
+        live.journal_partial = live.mistral and isinstance(exc, JournalGap)
         if not live.journal_partial:
             accumulator.halt_reason = (
                 accumulator.halt_reason or "Complete model usage unavailable; review stopped"
