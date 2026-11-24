@@ -399,6 +399,7 @@ def test_saved_usage_names_the_accounting_failure(tmp_path, monkeypatch, partial
     for name, module in {
         "mergecraft": types.ModuleType("mergecraft"),
         "mergecraft.utils": types.ModuleType("mergecraft.utils"),
+        "mergecraft.localci_loop_guard": importlib.import_module("patches.localci_loop_guard"),
         "mergecraft.localci_profile": profile,
         "mergecraft.utils.run_bounds": bounds,
     }.items():
