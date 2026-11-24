@@ -185,9 +185,29 @@ class UsageJournal:
             raise JournalGap("Native primary usage does not reconcile with the journal")
 
 
+def use_native_mistral(config):
+    """Send requests for Mistral's own endpoint through OpenCode's Mistral adapter.
+
+    mergeCraft registers every custom endpoint with the generic OpenAI-compatible
+    adapter. For any model ID containing "deepseek" that adapter adds an empty
+    ``reasoning_content`` to each assistant message, and it cannot parse Mistral's
+    thinking parts. Mistral rejects the extra field with HTTP 422 from the second
+    model step on.
+    """
+    for block in config.get("provider", {}).values():
+        endpoint = block.get("options", {}).get("baseURL")
+        if (
+            block.get("npm") == "@ai-sdk/openai-compatible"
+            and isinstance(endpoint, str)
+            and endpoint.rstrip("/") == "https://api.mistral.ai/v1"
+        ):
+            block["npm"] = "@ai-sdk/mistral"
+
+
 def configure(ctx, model, config):
     from mergecraft.localci_live_budget import current
 
+    use_native_mistral(config)
     live = current()
     if live is None:
         return

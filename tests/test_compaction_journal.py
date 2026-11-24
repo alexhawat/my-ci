@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from patches.localci_compaction import UsageJournal
+from patches.localci_compaction import UsageJournal, use_native_mistral
 
 
 def write(journal, **row):
@@ -422,3 +422,28 @@ def test_saved_usage_names_the_accounting_failure(tmp_path, monkeypatch, partial
     assert saved["reason"] == reason
     assert saved["accounting_error"] == live.journal_error_detail
     assert saved["accounting_error_type"] == live.journal_error_type
+
+
+@pytest.mark.parametrize(
+    ("npm", "endpoint", "expected"),
+    [
+        ("@ai-sdk/openai-compatible", "https://api.mistral.ai/v1", "@ai-sdk/mistral"),
+        ("@ai-sdk/openai-compatible", "https://api.mistral.ai/v1/", "@ai-sdk/mistral"),
+        ("@ai-sdk/openai-compatible", "https://api.mistral.ai/openai/v1", "@ai-sdk/openai-compatible"),
+        ("@ai-sdk/openai-compatible", "https://api.mistral.ai.example.com/v1", "@ai-sdk/openai-compatible"),
+        ("@ai-sdk/openai-compatible", None, "@ai-sdk/openai-compatible"),
+        ("@ai-sdk/anthropic", "https://api.mistral.ai/v1", "@ai-sdk/anthropic"),
+    ],
+)
+def test_only_mistrals_own_endpoint_uses_its_native_adapter(npm, endpoint, expected):
+    other = {"npm": "@ai-sdk/openai-compatible", "options": {"baseURL": "https://llm.example.com/v1"}}
+    config = {"provider": {"custom": {"npm": npm, "options": {"baseURL": endpoint}}, "other": dict(other)}}
+    use_native_mistral(config)
+    assert config["provider"]["custom"] == {"npm": expected, "options": {"baseURL": endpoint}}
+    assert config["provider"]["other"] == other
+
+
+def test_native_mistral_ignores_a_config_without_custom_providers():
+    config = {"permission": {}}
+    use_native_mistral(config)
+    assert config == {"permission": {}}

@@ -14,6 +14,7 @@ from mergecraft.mcp.tool_state import init_tool_state
 from mergecraft.utils.run_bounds import BudgetTracker, RunBounds, record_agent_usage
 
 requests = []
+rejected = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -22,6 +23,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        # Mistral forbids unknown message fields; OpenCode's generic adapter adds
+        # reasoning_content to assistant messages of any "deepseek" model.
+        if case.startswith("mistral") and any("reasoning_content" in m for m in body["messages"]):
+            rejected.append(body["messages"])
+            self.send_error(422)
+            return
         last = str(body["messages"][-1].get("content", ""))
         compact = "Do not continue the task or call tools." in last
         requests.append({"kind": "compaction" if compact else "primary"})
@@ -72,6 +79,9 @@ class Handler(BaseHTTPRequestHandler):
                 ),
                 ({}, "stop"),
             ]
+        if case.startswith("mistral"):
+            thinking = {"type": "thinking", "thinking": [{"type": "text", "text": "Fixture thought."}]}
+            chunks.insert(0, ({"role": "assistant", "content": [thinking]}, None))
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -130,6 +140,8 @@ for case, ceiling, first_tokens, primary_reads in [
     assert first_tokens > 0 and primary_reads > 0
     with tempfile.TemporaryDirectory() as tmp:
         requests.clear()
+        rejected.clear()
+        model_id = "deepseek-fixture" if case.startswith("mistral") else "fixture"
         root = Path(tmp)
         (root / "source.txt").write_text("fixture source\n")
         config = {
@@ -141,7 +153,7 @@ for case, ceiling, first_tokens, primary_reads in [
                         "baseURL": f"http://127.0.0.1:{s.server_port}/v1",
                         "apiKey": "disposable-fixture",
                     },
-                    "models": {"fixture": {"name": "Fixture", "limit": {"context": 10000, "output": 1000}}},
+                    "models": {model_id: {"name": "Fixture", "limit": {"context": 10000, "output": 1000}}},
                 }
             },
             "enabled_providers": ["fixture"],
@@ -166,7 +178,7 @@ for case, ceiling, first_tokens, primary_reads in [
             tool_state=init_tool_state(owner="fixture", name="repo", dir=str(root)),
             budget_tracker=tracker,
             idle_timeout_s=90,
-            resolved_model="fixture/fixture",
+            resolved_model=f"fixture/{model_id}",
         )
         with bind(tracker) as live:
             os.environ["LOCALCI_PROFILE_PATH"] = str(root / "profile.jsonl")
@@ -174,8 +186,10 @@ for case, ceiling, first_tokens, primary_reads in [
             fixture_endpoint = options["baseURL"]
             if case.startswith("mistral"):
                 options["baseURL"] = "https://api.mistral.ai/v1"
-            configure(ctx, "fixture/fixture", config)
+            configure(ctx, f"fixture/{model_id}", config)
             options["baseURL"] = fixture_endpoint
+            adapter = "mistral" if case.startswith("mistral") else "openai-compatible"
+            assert config["provider"]["fixture"]["npm"] == f"@ai-sdk/{adapter}"
             config["compaction"] = {
                 "auto": True,
                 "background": False,
@@ -220,7 +234,7 @@ for case, ceiling, first_tokens, primary_reads in [
                 "--title",
                 "mergecraft",
                 "--model",
-                "fixture/fixture",
+                f"fixture/{model_id}",
                 "Read source.txt then deliver a short verdict.",
             ]
             result = opencode._run_opencode_cli_streaming(
@@ -229,6 +243,7 @@ for case, ceiling, first_tokens, primary_reads in [
                 env=env,
                 session=session,
             )
+            assert not rejected, rejected
             if case.startswith("mistral"):
                 saved = json.loads((root / "mergecraft-usage.json").read_text())
                 assert saved["cost_availability"] == "unknown_subscription_charge"
