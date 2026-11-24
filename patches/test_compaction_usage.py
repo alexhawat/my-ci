@@ -26,6 +26,10 @@ class Handler(BaseHTTPRequestHandler):
         compact = "Do not continue the task or call tools." in last
         requests.append({"kind": "compaction" if compact else "primary"})
         count = len(requests)
+        # Reproduce a journal error between a measured tool call and the reply.
+        if case.startswith("mistral-gap") and count == 2:
+            with live.journal.path.open("a") as journal:
+                journal.write(json.dumps({"nonce": live.journal.nonce, "kind": "error"}) + "\n")
         primary = sum(r["kind"] == "primary" for r in requests)
         headings = re.findall(r"^## .+$", last, re.M) if compact else []
         if count > 5:
@@ -81,6 +85,9 @@ class Handler(BaseHTTPRequestHandler):
             }
             self.wfile.write(("data: " + json.dumps(data) + "\n\n").encode())
             self.wfile.flush()
+        if case == "mistral-no-usage" or (case == "mistral-partial" and count == 2):
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
         tokens = 1000 if compact or primary > primary_reads else (first_tokens if primary == 1 else 90000)
         self.wfile.write(
             (
@@ -114,6 +121,11 @@ for case, ceiling, first_tokens, primary_reads in [
     ("ceiling", 6000, 5000, 1),
     ("threshold", 200000, 50000, 2),
     ("missing-plugin", 10000, 5000, 1),
+    ("mistral-partial", 10000, 5000, 1),
+    ("mistral-no-usage", 10000, 5000, 1),
+    ("mistral-complete", 10000, 5000, 1),
+    ("mistral-gap", 10000, 5000, 1),
+    ("mistral-gap-ceiling", 6000, 5000, 1),
 ]:
     assert first_tokens > 0 and primary_reads > 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -157,7 +169,13 @@ for case, ceiling, first_tokens, primary_reads in [
             resolved_model="fixture/fixture",
         )
         with bind(tracker) as live:
+            os.environ["LOCALCI_PROFILE_PATH"] = str(root / "profile.jsonl")
+            options = config["provider"]["fixture"]["options"]
+            fixture_endpoint = options["baseURL"]
+            if case.startswith("mistral"):
+                options["baseURL"] = "https://api.mistral.ai/v1"
             configure(ctx, "fixture/fixture", config)
+            options["baseURL"] = fixture_endpoint
             config["compaction"] = {
                 "auto": True,
                 "background": False,
@@ -172,7 +190,8 @@ for case, ceiling, first_tokens, primary_reads in [
                 config["compaction"]["buffer"] = "92%"
             if case == "missing-plugin":
                 config["plugins"] = []
-            os.environ["LOCALCI_PROFILE_PATH"] = str(root / "profile.jsonl")
+            if case.startswith("mistral-gap") or case == "mistral-partial":
+                config["compaction"]["auto"] = False
             p = root / "opencode.json"
             p.write_text(json.dumps(config))
             env = {
@@ -210,6 +229,31 @@ for case, ceiling, first_tokens, primary_reads in [
                 env=env,
                 session=session,
             )
+            if case.startswith("mistral"):
+                saved = json.loads((root / "mergecraft-usage.json").read_text())
+                assert saved["cost_availability"] == "unknown_subscription_charge"
+                usage = live.reported_usage(result.usage)
+                assert usage is None or usage.cost_usd is None
+                if case in {"mistral-no-usage", "mistral-partial"}:
+                    assert result.success and len(requests) == 2 and not saved["stopped"]
+                    assert saved["usage_partial"]
+                    assert saved["total_tokens"] == (5010 if case == "mistral-partial" else 0), saved
+                    print("PASS:", case, "completes without inventing token counts")
+                    continue
+                if case.startswith("mistral-gap"):
+                    assert len(requests) == 2 and saved["total_tokens"] == 6020, (requests, saved)
+                    assert saved["usage_partial"] and saved["steps"] == 2
+                    if case == "mistral-gap-ceiling":
+                        assert saved["stopped"] and result.metadata.get("budget_exhausted")
+                    else:
+                        assert (
+                            not saved["stopped"]
+                            and result.success
+                            and "Fixture review complete" in result.output
+                        )
+                    print("PASS:", case, "meters native usage through journal loss")
+                    continue
+                assert not saved["usage_partial"]
             if case in {"ceiling", "missing-plugin"}:
                 assert not result.success and result.metadata.get("budget_exhausted"), result
                 if case == "ceiling":
@@ -225,10 +269,10 @@ for case, ceiling, first_tokens, primary_reads in [
                 getattr(live, "journal_error", None),
                 live.journal.path.read_text(),
             )
-            expected = 7030 if case == "complete" else 142040
+            expected = 142040 if case == "threshold" else 7030
             assert [r["kind"] for r in requests] == (
                 ["primary", "compaction", "primary"]
-                if case == "complete"
+                if case != "threshold"
                 else ["primary", "primary", "compaction", "primary"]
             ), requests
             assert live.journal.compactions == 1

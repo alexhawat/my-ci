@@ -16,6 +16,8 @@ def export(tmpdir, tracker, usages, timing, state, markdown):
         "timing": (timing or {}).get("line") or "Unavailable",
         "attempts": len(usages),
     }
+    if any(getattr(u, "cost_note", None) == "Subscription charge unavailable" for u in usages):
+        metrics["cost"] = "NA"
     summary = getattr(state.terminal_submission, "summary", "") or markdown or ""
     try:
         # mergeCraft removes everything in its review directory at exit except
