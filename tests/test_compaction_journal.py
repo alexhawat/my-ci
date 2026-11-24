@@ -117,6 +117,196 @@ def test_native_primary_usage_must_reconcile(tmp_path):
         journal.finish()
 
 
+def test_native_primary_keeps_compaction_with_missing_subscription_price(tmp_path):
+    journal = UsageJournal(tmp_path)
+    usage(journal, 1, 100)
+    usage(journal, 2, 130, kind="compaction")
+    usage(journal, 3, 200)
+    rows = [json.loads(line) for line in journal.path.read_text().splitlines()]
+    for row in rows:
+        if row["kind"] == "usage":
+            row["cost"] = None
+    journal.path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    measured = []
+    journal.drain(measured.append, native_primary=True)
+    assert [event["part"]["tokens"]["input"] for event in measured] == [30]
+    assert journal.compactions == 1
+
+
+def bind_live(monkeypatch, journal, *, mistral):
+    """Give ``consume`` a live budget without importing the patched mergeCraft tree."""
+    import sys
+    import types
+
+    live = types.SimpleNamespace(
+        journal=journal,
+        mistral=mistral,
+        journal_error_type="",
+        journal_partial=False,
+        saves=0,
+    )
+    live.save = lambda: setattr(live, "saves", live.saves + 1)
+    module = types.ModuleType("mergecraft.localci_live_budget")
+    module.current = lambda: live  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mergecraft", types.ModuleType("mergecraft"))
+    monkeypatch.setitem(sys.modules, "mergecraft.localci_live_budget", module)
+    return live, types.SimpleNamespace(halt_reason=None)
+
+
+STOP_DETAIL = {
+    "not-json": "JSONDecodeError",
+    "missing-session": "KeyError",
+    "usage-without-request": "KeyError",
+    "tokens-not-a-mapping": "Usage counters invalid",
+    "cache-not-a-mapping": "Usage counters invalid",
+    "unknown-kind": "Usage journal row of an unknown kind",
+    "nonce": "Usage journal provenance mismatch",
+    "plugin-error": "Usage journal reported an incomplete provider request",
+    "usage-without-tokens": "Usage counters missing",
+    "usage-with-null-counter": "Usage counters missing",
+}
+
+
+def stopped(detail):
+    return f"Complete model usage unavailable ({detail}); review stopped"
+
+
+def corrupt(journal, failure):
+    if failure == "not-json":
+        with journal.path.open("a") as stream:
+            stream.write("not json\n")
+    elif failure == "missing-session":
+        write(journal, kind="request", request=2, request_kind="primary")
+    elif failure == "usage-without-request":
+        write(journal, kind="usage", session="fixture", request=9, request_kind="primary")
+    elif failure == "tokens-not-a-mapping":
+        write(journal, kind="request", session="fixture", request=2, request_kind="primary")
+        write(journal, kind="usage", session="fixture", request=2, request_kind="primary", tokens=[1])
+    elif failure == "cache-not-a-mapping":
+        write(journal, kind="request", session="fixture", request=2, request_kind="primary")
+        write(
+            journal,
+            kind="usage",
+            session="fixture",
+            request=2,
+            request_kind="primary",
+            tokens={"input": 1, "output": 1, "reasoning": 1, "cache": 5},
+        )
+    elif failure == "unknown-kind":
+        write(journal, kind="fixture")
+    elif failure == "nonce":
+        write(journal, kind="error", nonce="incorrect")
+    else:
+        raise AssertionError(failure)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "not-json",
+        "missing-session",
+        "usage-without-request",
+        "tokens-not-a-mapping",
+        "cache-not-a-mapping",
+        "unknown-kind",
+        "nonce",
+    ],
+)
+@pytest.mark.parametrize("mistral", [True, False])
+def test_consume_stops_the_review_on_a_malformed_journal(tmp_path, monkeypatch, failure, mistral):
+    from patches import localci_compaction
+
+    journal = UsageJournal(tmp_path)
+    write(journal, kind="ready")
+    corrupt(journal, failure)
+    live, accumulator = bind_live(monkeypatch, journal, mistral=mistral)
+
+    assert localci_compaction.consume(accumulator, {}, lambda row: None)
+
+    assert accumulator.halt_reason == stopped(STOP_DETAIL[failure])
+    assert live.journal_error_detail == STOP_DETAIL[failure]
+    assert live.journal_partial is False
+    assert live.journal_error_type and live.saves == 1
+
+
+def report_gap(journal, gap):
+    if gap == "plugin-error":
+        write(journal, kind="error")
+    elif gap == "usage-without-tokens":
+        write(journal, kind="request", session="fixture", request=2, request_kind="primary")
+        write(journal, kind="usage", session="fixture", request=2, request_kind="primary")
+    elif gap == "usage-with-null-counter":
+        write(journal, kind="request", session="fixture", request=2, request_kind="primary")
+        write(
+            journal,
+            kind="usage",
+            session="fixture",
+            request=2,
+            request_kind="primary",
+            tokens={"input": None, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        )
+    else:
+        raise AssertionError(gap)
+
+
+@pytest.mark.parametrize("gap", ["plugin-error", "usage-without-tokens", "usage-with-null-counter"])
+def test_consume_keeps_a_mistral_review_running_across_a_reported_gap(tmp_path, monkeypatch, gap):
+    from patches import localci_compaction
+
+    journal = UsageJournal(tmp_path)
+    write(journal, kind="ready")
+    report_gap(journal, gap)
+    live, accumulator = bind_live(monkeypatch, journal, mistral=True)
+
+    # False hands the event back to the CLI's own step metering.
+    assert localci_compaction.consume(accumulator, {}, lambda row: None) is False
+
+    assert accumulator.halt_reason is None
+    assert live.journal_partial is True
+    assert live.journal_error_type == "JournalGap"
+    assert live.journal_error_detail == STOP_DETAIL[gap]
+    # The gap is remembered: later events also fall back to the CLI's metering.
+    assert localci_compaction.consume(accumulator, {}, lambda row: None) is False
+    assert accumulator.halt_reason is None
+
+
+@pytest.mark.parametrize("gap", ["plugin-error", "usage-without-tokens", "usage-with-null-counter"])
+def test_consume_stops_other_providers_on_the_same_gap(tmp_path, monkeypatch, gap):
+    from patches import localci_compaction
+
+    journal = UsageJournal(tmp_path)
+    write(journal, kind="ready")
+    report_gap(journal, gap)
+    live, accumulator = bind_live(monkeypatch, journal, mistral=False)
+
+    assert localci_compaction.consume(accumulator, {}, lambda row: None)
+
+    assert accumulator.halt_reason == stopped(STOP_DETAIL[gap])
+    assert live.journal_partial is False
+
+
+def test_mistral_completion_gaps_are_advisory_but_a_torn_journal_is_not(tmp_path, monkeypatch):
+    from patches import localci_compaction
+
+    # A request that never reported usage is a gap.
+    journal = UsageJournal(tmp_path / "pending")
+    write(journal, kind="ready")
+    write(journal, kind="request", session="fixture", request=1, request_kind="primary")
+    live, accumulator = bind_live(monkeypatch, journal, mistral=True)
+    assert localci_compaction.consume(accumulator, {}, lambda row: None, final=True) is False
+    assert (accumulator.halt_reason, live.journal_partial) == (None, True)
+
+    # An unterminated last line is not: the journal cannot be trusted to be whole.
+    journal = UsageJournal(tmp_path / "torn")
+    write(journal, kind="ready")
+    with journal.path.open("a") as stream:
+        stream.write('{"nonce": "')
+    live, accumulator = bind_live(monkeypatch, journal, mistral=True)
+    assert localci_compaction.consume(accumulator, {}, lambda row: None, final=True)
+    assert accumulator.halt_reason == stopped("Usage journal incomplete at review completion")
+    assert live.journal_partial is False
+
+
 @pytest.mark.parametrize(
     ("row", "message"),
     [
@@ -128,10 +318,7 @@ def test_native_primary_usage_must_reconcile(tmp_path):
             {"reason": "Provider request failed; complete usage unavailable"},
             "Provider request failed; complete usage unavailable",
         ),
-        (
-            {"reason": "Usage arrived without a metered request"},
-            "Usage arrived without a metered request",
-        ),
+        ({"reason": "Usage arrived without a metered request"}, "Usage arrived without a metered request"),
         # A status that is not an HTTP status code is left out.
         (
             {"reason": "Usage event subscription failed", "status": "429 fixture-text"},
@@ -145,59 +332,93 @@ def test_native_primary_usage_must_reconcile(tmp_path):
         ({}, "Usage journal reported an incomplete provider request"),
     ],
 )
-def test_plugin_failure_names_the_cause_without_copying_provider_text(tmp_path, row, message):
+def test_plugin_error_row_names_its_cause_without_copying_provider_text(tmp_path, monkeypatch, row, message):
+    from patches import localci_compaction
+    from patches.localci_compaction import JournalGap
+
     journal = UsageJournal(tmp_path)
     write(journal, kind="ready")
     write(journal, kind="error", **row)
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(JournalGap) as raised:
         journal.drain(lambda row: None)
     assert str(raised.value) == message
 
+    # The same text reaches the halt reason of a provider that stops on a gap.
+    journal = UsageJournal(tmp_path / "halt")
+    write(journal, kind="ready")
+    write(journal, kind="error", **row)
+    live, accumulator = bind_live(monkeypatch, journal, mistral=False)
+    assert localci_compaction.consume(accumulator, {}, lambda row: None)
+    assert accumulator.halt_reason == stopped(message)
 
-def test_unknown_row_kind_is_not_described_by_its_own_reason(tmp_path):
+
+@pytest.mark.parametrize("mistral", [True, False])
+def test_a_value_error_from_the_usage_callback_is_named_by_type_only(tmp_path, monkeypatch, mistral):
+    from patches import localci_compaction
+
     journal = UsageJournal(tmp_path)
-    write(journal, kind="fixture", reason="Usage event subscription failed", status=429)
-    with pytest.raises(ValueError) as raised:
-        journal.drain(lambda row: None)
-    assert str(raised.value) == "Usage journal reported an incomplete provider request"
+    write(journal, kind="ready")
+    usage(journal, 1, 100, kind="compaction")
+    live, accumulator = bind_live(monkeypatch, journal, mistral=mistral)
+
+    def absorb(row):
+        raise ValueError("fixture-upstream-text")
+
+    assert localci_compaction.consume(accumulator, {}, absorb)
+    assert live.journal_error_detail == "ValueError"
+    assert accumulator.halt_reason == stopped("ValueError")
+    assert "fixture-upstream-text" not in accumulator.halt_reason
 
 
-def test_consume_records_the_cause_in_the_halt_reason_and_the_saved_usage(tmp_path, monkeypatch):
+def test_a_missing_plugin_is_named(tmp_path, monkeypatch):
+    from patches import localci_compaction
+
+    journal = UsageJournal(tmp_path)
+    live, accumulator = bind_live(monkeypatch, journal, mistral=False)
+    assert localci_compaction.consume(accumulator, {"type": "step_finish"}, lambda row: None)
+    assert accumulator.halt_reason == stopped("Usage plugin did not initialize")
+    assert live.journal_error_type == "ValueError"
+
+
+@pytest.mark.parametrize(
+    ("partial", "stopped_flag", "reason"),
+    [
+        (False, True, "Complete model usage unavailable: Usage counters invalid"),
+        (True, False, ""),
+    ],
+)
+def test_saved_usage_names_the_accounting_failure(tmp_path, monkeypatch, partial, stopped_flag, reason):
+    import importlib
     import sys
     import types
 
-    from patches import localci_compaction
+    profile = types.ModuleType("mergecraft.localci_profile")
+    profile.event = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    bounds = types.ModuleType("mergecraft.utils.run_bounds")
+    bounds.BudgetExhausted = type("BudgetExhausted", (Exception,), {})  # type: ignore[attr-defined]
+    for name, module in {
+        "mergecraft": types.ModuleType("mergecraft"),
+        "mergecraft.utils": types.ModuleType("mergecraft.utils"),
+        "mergecraft.localci_profile": profile,
+        "mergecraft.utils.run_bounds": bounds,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.delitem(sys.modules, "patches.localci_live_budget", raising=False)
+    live_budget = importlib.import_module("patches.localci_live_budget")
+    monkeypatch.setenv("LOCALCI_PROFILE_PATH", str(tmp_path / "profile.jsonl"))
 
-    saved = []
-    journal = UsageJournal(tmp_path)
-    write(journal, kind="ready")
-    write(journal, kind="request", session="fixture", request=1, request_kind="primary")
-    write(
-        journal,
-        kind="error",
-        reason="Provider request failed; complete usage unavailable",
-        status=429,
+    tracker = types.SimpleNamespace(
+        tokens_used=0, bounds=types.SimpleNamespace(token_budget=100, token_ceiling=110)
     )
-    live = types.SimpleNamespace(journal=journal, save=lambda: saved.append(True))
-    package = types.ModuleType("mergecraft")
-    module = types.ModuleType("mergecraft.localci_live_budget")
-    module.current = lambda: live  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "mergecraft", package)
-    monkeypatch.setitem(sys.modules, "mergecraft.localci_live_budget", module)
-    accumulator = types.SimpleNamespace(halt_reason=None)
+    live = live_budget.LiveBudget(tracker)
+    live.mistral = partial
+    live.journal_error_type = "JournalIntegrityError" if not partial else "JournalGap"
+    live.journal_error_detail = "Usage counters invalid" if not partial else "Usage counters missing"
+    live.journal_partial = partial
+    live.save()
 
-    assert localci_compaction.consume(accumulator, {}, lambda row: None)
-
-    detail = "Provider request failed; complete usage unavailable (HTTP 429)"
-    assert accumulator.halt_reason == f"Complete model usage unavailable ({detail}); review stopped"
-    assert live.journal_error_detail == detail
-    assert live.journal_error_type == "ValueError"
-    assert saved == [True]
-
-    # A failure this module did not raise is named by its type only.
-    journal.path.write_text("not json\n")
-    journal.offset = 0
-    accumulator.halt_reason = None
-    assert localci_compaction.consume(accumulator, {}, lambda row: None)
-    assert live.journal_error_detail == "JSONDecodeError"
-    assert accumulator.halt_reason == "Complete model usage unavailable (JSONDecodeError); review stopped"
+    saved = json.loads((tmp_path / "mergecraft-usage.json").read_text())
+    assert saved["stopped"] is stopped_flag
+    assert saved["reason"] == reason
+    assert saved["accounting_error"] == live.journal_error_detail
+    assert saved["accounting_error_type"] == live.journal_error_type
