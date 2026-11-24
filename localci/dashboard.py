@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from localci import updater
+from localci.github import GitHubError
 from localci.policy import is_pr_workflow, workflow
 from localci.results import check_summary
 
@@ -32,6 +33,65 @@ class WorkflowEdit(BaseModel):
     content: str = Field(min_length=1, max_length=200000)
     source_ref: str = Field(max_length=200)
     expected_version: int = Field(default=0, ge=0)
+
+
+class MergeRequest(BaseModel):
+    # The head commit the operator was shown; GitHub refuses the merge if it has changed.
+    sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    method: Literal["merge", "squash", "rebase"]
+
+
+CHECK_CONCLUSIONS = {
+    "SUCCESS": "success",
+    "FAILURE": "failure",
+    "TIMED_OUT": "failure",
+    "STARTUP_FAILURE": "failure",
+    "CANCELLED": "cancelled",
+    "ACTION_REQUIRED": "blocked",
+}
+STATUS_STATES = {"SUCCESS": "success", "FAILURE": "failure", "ERROR": "failure"}
+CHECK_ORDER = ["failure", "running", "queued", "blocked", "cancelled", "success", "skipped"]
+CHECK_LABELS = {"success": "passed", "failure": "failed"}
+
+
+def github_checks(node: dict) -> dict:
+    """Summarize GitHub's checks for one PR head, leaving out the ``local-ci`` result
+    this service publishes itself (the Local CI column already shows it)."""
+    commits = (node.get("commits") or {}).get("nodes") or []
+    rollup = ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") if commits else None
+    contexts = (rollup or {}).get("contexts") or {}
+    checks = []
+    for item in contexts.get("nodes") or []:
+        if not item:
+            continue
+        if item.get("__typename") == "CheckRun":
+            name, url = item.get("name") or "", item.get("detailsUrl") or ""
+            workflow_run = (item.get("checkSuite") or {}).get("workflowRun") or {}
+            workflow_name = (workflow_run.get("workflow") or {}).get("name")
+            if item.get("status") == "COMPLETED":
+                state = CHECK_CONCLUSIONS.get(item.get("conclusion") or "", "skipped")
+            else:
+                state = "running" if item.get("status") == "IN_PROGRESS" else "queued"
+            label = f"{workflow_name} / {name}" if workflow_name else name
+        else:
+            name, url = item.get("context") or "", item.get("targetUrl") or ""
+            state, label = STATUS_STATES.get(item.get("state") or "", "running"), name
+        if name == "local-ci":
+            continue
+        checks.append({"name": label, "state": state, "url": url if url.startswith("https://") else ""})
+    counts = {state: sum(c["state"] == state for c in checks) for state in CHECK_ORDER}
+    checks.sort(key=lambda c: (CHECK_ORDER.index(c["state"]), c["name"].casefold()))
+    return {
+        "head": node.get("headRefOid", ""),
+        "state": next((s for s in CHECK_ORDER if counts[s]), "none"),
+        "summary": " · ".join(f"{counts[s]} {CHECK_LABELS.get(s, s)}" for s in CHECK_ORDER if counts[s]),
+        "checks": checks,
+        # More than one page of checks: the counts cover only the first 100.
+        "truncated": (contexts.get("totalCount") or 0) > len(contexts.get("nodes") or []),
+        "mergeable": node.get("mergeable") or "UNKNOWN",
+        "merge_state": node.get("mergeStateStatus") or "UNKNOWN",
+        "review_decision": node.get("reviewDecision") or "",
+    }
 
 
 def enrich_run(run: dict, store) -> dict:
@@ -118,6 +178,36 @@ def register_dashboard(app, controller, repo_name, get_run):
             task = closed_fetches[name] = asyncio.create_task(fetch_closed(name))
         return await asyncio.shield(task)
 
+    # GitHub's own checks and mergeability per repository: time fetched, data, error.
+    # Display only, like closed PRs; the executor never reads it.
+    remote_cache: dict[str, tuple[float, dict, str]] = {}
+    remote_fetches: dict[str, asyncio.Task] = {}
+
+    async def fetch_remote(name: str):
+        try:
+            data = await controller.github.pull_request_checks(name)
+        except (RuntimeError, httpx.HTTPError, OSError) as exc:
+            previous = remote_cache.get(name)
+            # A failed refresh must not leave stale checks looking current, or a merge
+            # button enabled on them.
+            remote_cache[name] = (
+                time.time(),
+                {"merge_methods": previous[1]["merge_methods"] if previous else [], "prs": {}},
+                str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__,
+            )
+        else:
+            remote_cache[name] = (time.time(), data, "")
+        return remote_cache[name]
+
+    async def remote_prs(name: str):
+        cached = remote_cache.get(name)
+        if cached and time.time() - cached[0] < 20:
+            return cached
+        task = remote_fetches.get(name)
+        if task is None or task.done():
+            task = remote_fetches[name] = asyncio.create_task(fetch_remote(name))
+        return await asyncio.shield(task)
+
     @app.get("/api/prs")
     async def pull_requests(state: Literal["open", "closed"] = "open"):
         errors = []
@@ -149,6 +239,13 @@ def register_dashboard(app, controller, repo_name, get_run):
                     {"repo": name, "number": pr["number"], "data": json.dumps(pr), "error": ""}
                     for pr in cached[1]
                 )
+        remote, github_errors = {}, []
+        if state == "open":
+            names = sorted({row["repo"] for row in rows})
+            for name, cached in zip(names, await asyncio.gather(*map(remote_prs, names)), strict=True):
+                remote[name] = cached[1]
+                if cached[2]:
+                    github_errors.append({"name": name, "error": cached[2]})
         latest_rows = await asyncio.to_thread(
             store.rows,
             """SELECT r.repo,r.pr,r.id,r.state,r.head,r.base,r.steps,r.created
@@ -168,6 +265,11 @@ def register_dashboard(app, controller, repo_name, get_run):
                 latest["current"] = (latest["head"], latest["base"]) == (pr["head"]["sha"], pr["base"]["sha"])
                 latest["checks_summary"] = check_summary(json.loads(latest.pop("steps")))
             draft = bool(pr.get("draft"))
+            node = remote.get(row["repo"], {}).get("prs", {}).get(row["number"])
+            github = github_checks(node) if node else None
+            if github:
+                # The local snapshot can trail GitHub by one poll.
+                github["current"] = github["head"] == pr["head"]["sha"]
             fork = (pr["head"].get("repo") or {}).get("full_name") != row["repo"]
             items.append(
                 {
@@ -194,6 +296,8 @@ def register_dashboard(app, controller, repo_name, get_run):
                     if fork
                     else "Automatic CI",
                     "latest_run": latest,
+                    "github": github,
+                    "merge_methods": remote.get(row["repo"], {}).get("merge_methods", []),
                     "sync_error": row["error"],
                 }
             )
@@ -203,7 +307,41 @@ def register_dashboard(app, controller, repo_name, get_run):
             "last_poll": synced,
             "state": state,
             "errors": errors,
+            "github_errors": github_errors,
         }
+
+    @app.post("/api/repos/{owner}/{repo}/prs/{number}/merge")
+    async def merge_pr(owner: str, repo: str, number: int, body: MergeRequest):
+        name = repo_name(owner, repo)
+        if not store.repo(name)["enabled"]:
+            raise HTTPException(400, "Enable the repository before merging its pull requests")
+        try:
+            result = await controller.github.merge(name, number, body.sha, body.method)
+        except GitHubError as exc:
+            # GitHub decides: branch protection, required checks and reviews all apply.
+            detail = {
+                403: "GitHub refused: the worker's GitHub login may not merge this pull request",
+                404: "GitHub could not find this pull request, or the login cannot access it",
+                405: "GitHub refused: the pull request is not mergeable (conflicts, required "
+                "checks or reviews, a draft, or a merge method the repository does not allow)",
+                409: "The pull request head changed since this page loaded; review it and try again",
+                422: "GitHub rejected the merge request for this pull request",
+            }.get(exc.status, str(exc))
+            raise HTTPException(409 if exc.status in (405, 409, 422) else 502, detail) from None
+        except (RuntimeError, httpx.HTTPError, OSError) as exc:
+            # The outcome is unknown; the operator must check before trying again.
+            raise HTTPException(
+                502, f"GitHub did not confirm the merge ({type(exc).__name__}); check the pull request"
+            ) from None
+        if not (result or {}).get("merged"):
+            raise HTTPException(502, "GitHub did not confirm the merge; check the pull request")
+        # Show the result now; the executor's next poll replaces the snapshot and cancels
+        # any run still active for the merged PR.
+        await asyncio.to_thread(store.execute, "DELETE FROM prs WHERE repo=? AND number=?", (name, number))
+        remote_cache.pop(name, None)
+        closed_cache.pop(name, None)
+        controller.notify()
+        return {"merged": True, "sha": result.get("sha", "")}
 
     @app.get("/api/execution")
     def execution():

@@ -9,6 +9,49 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+PR_CHECKS_QUERY = """
+query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    mergeCommitAllowed
+    squashMergeAllowed
+    rebaseMergeAllowed
+    viewerDefaultMergeMethod
+    pullRequests(states: OPEN, first: 50, after: $cursor, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        headRefOid
+        mergeable
+        mergeStateStatus
+        reviewDecision
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                contexts(first: 100) {
+                  totalCount
+                  nodes {
+                    __typename
+                    ... on CheckRun {
+                      name
+                      status
+                      conclusion
+                      detailsUrl
+                      checkSuite { workflowRun { workflow { name } } }
+                    }
+                    ... on StatusContext { context state targetUrl }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 
 class GitHubError(RuntimeError):
     def __init__(self, status: int, method: str, path: str, retry_after: float | None = None):
@@ -92,6 +135,48 @@ class GitHub:
         if not await self.request("GET", f"{path}{separator}per_page=1&page={max_pages * 100 + 1}"):
             return result
         raise RuntimeError(f"GitHub pagination exceeded {max_pages} pages; refusing a partial result")
+
+    async def graphql(self, query: str, variables: dict) -> dict:
+        result = await self.request("POST", "graphql", json={"query": query, "variables": variables})
+        if not isinstance(result, dict) or result.get("errors") or not result.get("data"):
+            # GraphQL reports failures with HTTP 200; never echo arbitrary server text.
+            raise RuntimeError("GitHub GraphQL query failed")
+        return result["data"]
+
+    async def pull_request_checks(self, repo: str, *, max_pages: int = 4) -> dict:
+        """GitHub's own view of a repository's open PRs: checks and statuses on each
+        head commit, mergeability, and the merge methods the repository allows."""
+        owner, name = repo.split("/", 1)
+        prs, cursor, repository = [], None, {}
+        for _ in range(max_pages):
+            data = await self.graphql(PR_CHECKS_QUERY, {"owner": owner, "name": name, "cursor": cursor})
+            repository = data.get("repository") or {}
+            page = repository.get("pullRequests") or {}
+            prs.extend(page.get("nodes") or [])
+            info = page.get("pageInfo") or {}
+            if not info.get("hasNextPage"):
+                break
+            cursor = info.get("endCursor")
+        methods = [
+            method
+            for method, key in (
+                ("merge", "mergeCommitAllowed"),
+                ("squash", "squashMergeAllowed"),
+                ("rebase", "rebaseMergeAllowed"),
+            )
+            if repository.get(key)
+        ]
+        default = str(repository.get("viewerDefaultMergeMethod") or "").lower()
+        if default in methods:
+            methods.insert(0, methods.pop(methods.index(default)))
+        return {"merge_methods": methods, "prs": {pr["number"]: pr for pr in prs if pr}}
+
+    async def merge(self, repo: str, number: int, sha: str, method: str):
+        """Merge as the authenticated user. ``sha`` binds the merge to the head commit the
+        operator saw: GitHub refuses with HTTP 409 when the PR has moved on."""
+        return await self.request(
+            "PUT", f"repos/{repo}/pulls/{number}/merge", json={"sha": sha, "merge_method": method}
+        )
 
     async def discover(self):
         user, repos = await asyncio.gather(
