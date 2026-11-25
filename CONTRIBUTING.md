@@ -11,7 +11,7 @@ uv run ruff check .
 uv run ruff format --check .
 uv run pyright
 node --check localci/static/app.js
-node --test tests/test_history.mjs tests/test_selection.mjs
+node --test tests/test_history.mjs tests/test_selection.mjs tests/test_render.mjs
 ```
 
 For execution changes, also run the relevant local Docker smoke tests in a disposable environment. Do not run paid model reviews or publish results to real repositories merely to validate a change.

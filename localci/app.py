@@ -8,15 +8,26 @@ from functools import partial
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+import yaml
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from localci.controller import Controller
 from localci.dashboard import enrich_run, register_dashboard
-from localci.github import app_jwt
-from localci.policy import BOT_HOLD, bot_pr, eligible, is_pr_workflow, uses_review_action, workflow
+from localci.github import GitHubError, app_jwt
+from localci.policy import (
+    BOT_HOLD,
+    WORKFLOW_PATH_HELP,
+    bot_pr,
+    eligible,
+    is_local_workflow,
+    is_pr_workflow,
+    uses_review_action,
+    valid_workflow_path,
+    workflow,
+)
 from localci.store import RetryLimitReached, RevisionChanged
 
 ROOT = Path(os.environ.get("LOCALCI_DATA", "/data"))
@@ -24,6 +35,8 @@ ROOT = Path(os.environ.get("LOCALCI_DATA", "/data"))
 
 class RepoConfig(BaseModel):
     enabled: bool = False
+    # Show the repository's PRs and GitHub's own checks without running anything locally.
+    watch_only: bool = False
     workflows: list[str] = Field(default_factory=list, max_length=30)
     review: bool = False
     review_failure_threshold: Literal["major", "minor", "trivial"] = "major"
@@ -39,8 +52,8 @@ class RepoConfig(BaseModel):
     @field_validator("workflows")
     @classmethod
     def paths(cls, values):
-        if any(not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", v) for v in values):
-            raise ValueError("Expected .github/workflows/name.yml")
+        if any(not valid_workflow_path(v) for v in values):
+            raise ValueError(WORKFLOW_PATH_HELP)
         if len(set(values)) != len(values):
             raise ValueError("Duplicate workflow path")
         return values
@@ -71,6 +84,10 @@ class SecretInput(BaseModel):
 class AppInput(BaseModel):
     app_id: str = Field(pattern=r"^[0-9]{1,20}$")
     private_key: str = Field(min_length=100, max_length=20000)
+
+
+class Integrations(BaseModel):
+    mergecraft: bool = False
 
 
 def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
@@ -113,6 +130,14 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
     @app.get("/healthz")
     async def health():
         return {"ok": True}
+
+    def github_app_info():
+        credentials = controller.secrets("__github_app__", "app")
+        if not credentials:
+            return None
+        rows = controller.store.rows("SELECT value FROM settings WHERE key='github_app'")
+        # Connected before the name was recorded: the App ID alone identifies it.
+        return {"app_id": credentials.get("app_id", ""), **(json.loads(rows[0]["value"]) if rows else {})}
 
     @app.get("/api/state")
     def state():
@@ -169,7 +194,8 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
             "last_poll": worker["last_poll"],
             "disk_free": disk.free,
             "poll_seconds": 60,
-            "github_app": bool(controller.secrets("__github_app__", "app")),
+            "github_app": github_app_info(),
+            "integrations": controller.store.integrations(),
             "host": controller.host_label,
             "retention_days": 14,
             "execution": controller.store.settings(),
@@ -186,53 +212,106 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
         return name
 
     @app.get("/api/repos/{owner}/{repo}/workflows")
-    async def workflows(owner: str, repo: str):
+    async def workflows(owner: str, repo: str, include: list[str] = Query(default=[], max_length=30)):
+        """Workflow choices: .github/workflows/ on the default branch, then other repository
+        files that are selected or being added (``include``), then local-only workflows."""
         name = repo_name(owner, repo)
-        data = json.loads(controller.store.repo(name)["data"])
+        if any(not valid_workflow_path(path) for path in include):
+            raise HTTPException(400, WORKFLOW_PATH_HELP)
+        record = controller.store.repo(name)
+        data, config = json.loads(record["data"]), json.loads(record["config"])
+        branch = data["default_branch"]
         try:
             entries = await controller.github.request(
-                "GET", f"repos/{name}/contents/.github/workflows", params={"ref": data["default_branch"]}
+                "GET", f"repos/{name}/contents/.github/workflows", params={"ref": branch}
             )
         except RuntimeError as exc:
-            if "HTTP 404" in str(exc):
-                return []
-            raise HTTPException(502, str(exc)) from None
-        result = []
-        for entry in entries:
-            if entry["type"] != "file" or not entry["name"].endswith((".yml", ".yaml")):
-                continue
-            upstream = await controller.github.content(name, entry["path"], data["default_branch"])
-            overrides = controller.store.rows(
-                "SELECT version,content FROM workflow_versions WHERE repo=? AND path=? AND active=1",
-                (name, entry["path"]),
+            if "HTTP 404" not in str(exc):
+                raise HTTPException(502, str(exc)) from None
+            entries = []
+        paths = [
+            entry["path"]
+            for entry in entries
+            if entry["type"] == "file" and entry["name"].endswith((".yml", ".yaml"))
+        ]
+        overrides = {
+            row["path"]: row
+            for row in controller.store.rows(
+                "SELECT path,version,content FROM workflow_versions WHERE repo=? AND active=1", (name,)
             )
-            text = overrides[0]["content"] if overrides else upstream
+        }
+        local = sorted(path for path in overrides if is_local_workflow(path))
+        for path in [*config.get("workflows", []), *include, *local]:
+            if path not in paths and valid_workflow_path(path):
+                paths.append(path)
+        result = []
+        for path in paths:
+            override = overrides.get(path)
+            item = {
+                "path": path,
+                "name": path.rsplit("/", 1)[-1],
+                "source": "local"
+                if is_local_workflow(path)
+                else "workflows"
+                if path.startswith(".github/workflows/") and path.count("/") == 2
+                else "repository",
+                "pr": False,
+                "review": False,
+                "local_version": override["version"] if override else None,
+            }
+            if override:
+                text = override["content"]
+            elif item["source"] == "local":
+                result.append({**item, "error": "This local workflow was deleted"})
+                continue
+            else:
+                try:
+                    text = await controller.github.content(name, path, branch)
+                except GitHubError as exc:
+                    if exc.status != 404:
+                        raise HTTPException(502, str(exc)) from None
+                    result.append({**item, "error": f"Not found on {branch}"})
+                    continue
+                except (KeyError, TypeError, ValueError):
+                    result.append({**item, "error": "Not a readable text file"})
+                    continue
             try:
                 parsed = workflow(text)
-                result.append(
-                    {
-                        "path": entry["path"],
-                        "name": parsed.get("name", entry["name"]),
-                        "pr": is_pr_workflow(parsed),
-                        "review": uses_review_action(parsed),
-                        "local_version": overrides[0]["version"] if overrides else None,
-                        "variables": sorted(set(re.findall(r"vars\.([A-Za-z_][A-Za-z0-9_]*)", text))),
-                        "secrets": sorted(
-                            set(re.findall(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)", text))
-                            - {"GITHUB_TOKEN", "GH_TOKEN"}
-                        ),
-                        "jobs": list(parsed.get("jobs", {})),
-                    }
-                )
-            except RuntimeError:
-                result.append({"path": entry["path"], "name": entry["name"], "pr": False, "review": False})
+            except (RuntimeError, yaml.YAMLError):
+                result.append({**item, "error": "Not a GitHub Actions workflow: it needs a jobs mapping"})
+                continue
+            result.append(
+                {
+                    **item,
+                    "name": parsed.get("name", item["name"]),
+                    "pr": is_pr_workflow(parsed),
+                    "review": uses_review_action(parsed),
+                    "variables": sorted(set(re.findall(r"vars\.([A-Za-z_][A-Za-z0-9_]*)", text))),
+                    "secrets": sorted(
+                        set(re.findall(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)", text))
+                        - {"GITHUB_TOKEN", "GH_TOKEN"}
+                    ),
+                    "jobs": list(parsed.get("jobs", {})),
+                }
+            )
         return result
 
     @app.put("/api/repos/{owner}/{repo}")
     def configure(owner: str, repo: str, config: RepoConfig):
         name = repo_name(owner, repo)
+        if config.watch_only and config.enabled:
+            raise HTTPException(
+                400, "Just watch this repo runs nothing locally; turn it off to run PR checks here"
+            )
+        mergecraft = controller.store.keep_integrations()["mergecraft"]
+        if config.review and not mergecraft:
+            raise HTTPException(
+                400, "Add mergeCraft review in Settings before turning it on for a repository"
+            )
         if config.enabled and not config.workflows and not config.review:
-            raise HTTPException(400, "Select at least one CI workflow or mergeCraft review")
+            raise HTTPException(
+                400, "Select at least one CI workflow" + (" or mergeCraft review" if mergecraft else "")
+            )
         controller.store.execute(
             "UPDATE repos SET enabled=?,config=? WHERE name=?",
             (int(config.enabled), config.model_dump_json(), name),
@@ -286,7 +365,29 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
                     "INSERT INTO secrets VALUES(?,?,?) ON CONFLICT(repo,name) DO UPDATE SET ciphertext=excluded.ciphertext",
                     ("__github_app__", f"app:{name}", controller.cipher.encrypt(text.encode()).decode()),
                 )
+            # Display only, so the Settings page can name the connected App.
+            db.execute(
+                "INSERT INTO settings VALUES('github_app',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps({"name": str(info.get("name", "")), "slug": str(info.get("slug", ""))}),),
+            )
         return {"ok": True, "name": info["name"]}
+
+    @app.delete("/api/github-app")
+    def disconnect_github_app():
+        # Later results are published as commit statuses with the worker's GitHub login.
+        with controller.store.connect() as db:
+            db.execute("DELETE FROM secrets WHERE repo='__github_app__'")
+            db.execute("DELETE FROM settings WHERE key='github_app'")
+        return {"ok": True}
+
+    @app.put("/api/integrations")
+    def integrations(value: Integrations):
+        try:
+            changed = controller.store.save_integrations(value.model_dump())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        controller.notify()
+        return {"integrations": controller.store.integrations(), "review_turned_off": changed}
 
     def get_run(rid: str):
         if not re.fullmatch("[0-9a-f]{32}", rid):

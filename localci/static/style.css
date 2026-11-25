@@ -15,3 +15,19 @@
 
 .menu-toggle{position:fixed;top:12px;left:12px;z-index:10;display:grid;place-items:center;width:32px;height:32px;padding:6px;border:0;border-radius:6px;background:var(--sidebar);color:var(--muted)}.menu-toggle:hover{background:var(--button-hover);color:var(--text)}.menu-toggle svg{width:20px;height:20px}.menu-toggle .toggle-arrow{transform-origin:13px 12px}body.menu-closed .toggle-arrow{transform:rotate(180deg)}body.menu-closed .menu-toggle{background:var(--background)}#sidebar{padding-top:60px}body.menu-closed main{padding-top:60px}body.menu-closed main{margin-left:0;width:100%}.history-filters{display:flex;align-items:end;flex-wrap:wrap;gap:12px;margin-bottom:18px}.history-filters label{min-width:150px}.sort-column{background:none;border:0;color:inherit;padding:0;font:inherit;text-transform:inherit;letter-spacing:inherit;text-align:left}.sort-column:hover{color:var(--text)}th[aria-sort="ascending"],th[aria-sort="descending"]{color:var(--green)}#run-search{min-width:min(340px,100%)}
 .check-list{margin-top:6px}.check-list summary{cursor:pointer;font-size:11px}.check-list ul{list-style:none;margin:6px 0 0;padding:0}.check-list li{margin:4px 0;font-size:11px}.pr-table td:nth-child(7){min-width:190px}.badge.cancelled,.badge.skipped,.badge.none{opacity:.8}
+
+.badge.watching{color:var(--chip-text);background:var(--chip-bg);border-color:var(--chip-border)}
+.watch-toggle{padding-bottom:4px}
+#local-settings{border-top:1px solid var(--line);margin-top:8px;padding-top:4px}
+#add-workflow{border:1px dashed var(--button-border);border-radius:6px;padding:10px 14px;margin:0 0 18px}
+#add-workflow summary{color:var(--green)}
+.source-picker{display:flex;flex-wrap:wrap;gap:8px 18px;margin:12px 0}
+.source-picker label{display:flex;align-items:center;gap:7px}
+#add-workflow-result,#integration-result,#app-result{color:var(--warning-text)}
+.setup-steps{padding-left:20px}
+.setup-steps li{margin:4px 0}
+#preferences h2{margin-top:30px}
+#preferences h2:first-child{margin-top:0}
+input[type=radio]{accent-color:var(--green);width:15px;height:15px;margin:0;padding:0}
+.source-picker label>input[type=radio]{display:inline-block;width:15px;margin:0}
+.panel>h3:first-child{margin-top:0}

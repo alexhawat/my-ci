@@ -23,7 +23,15 @@ import yaml
 
 from localci import ci_report
 from localci.github import GitHub
-from localci.policy import Blocked, dependabot_pr, github_token_referenced, plan, secret_references
+from localci.policy import (
+    Blocked,
+    dependabot_pr,
+    github_token_referenced,
+    is_local_workflow,
+    plan,
+    secret_references,
+    workflow_files,
+)
 from localci.review_evidence import (
     classify_review,
     configuration_diagnostic,
@@ -1077,18 +1085,40 @@ class Runner:
             prepared = []
             workflow_secrets: dict[str, set[str]] = {}
             blockers = []
-            for path in config.get("workflows", []):
+            files = workflow_files(config.get("workflows", []))
+            for path, filename in files.items():
                 override = config.get("workflow_overrides", {}).get(path)
                 if override:
                     text = override["content"]
+                    origin = (
+                        "uploaded or pasted here"
+                        if is_local_workflow(path)
+                        else f"imported from {override['source_ref']}"
+                    )
                     await asyncio.to_thread(
-                        self.log,
-                        f"Using local workflow v{override['version']}: {path} (imported from {override['source_ref']})\n",
+                        self.log, f"Using local workflow v{override['version']}: {path} ({origin})\n"
                     )
+                elif is_local_workflow(path):
+                    # Deleted after it was selected: there is nothing in the repository to fall back to.
+                    blockers.append(
+                        f"{path}: this local workflow was deleted; unselect it in repository settings"
+                    )
+                    await asyncio.to_thread(self.step, filename, "blocked", blockers[-1])
+                    continue
                 else:
-                    _, text = await self.command(
-                        "git", "show", f"{run['base']}:{path}", cwd=checkout, capture=True
+                    code, text = await self.command(
+                        "git",
+                        "show",
+                        f"{run['base']}:{path}",
+                        cwd=checkout,
+                        capture=True,
+                        check=False,
+                        quiet=True,
                     )
+                    if code:
+                        blockers.append(f"{path}: not found in base commit {run['base'][:12]}")
+                        await asyncio.to_thread(self.step, filename, "blocked", blockers[-1])
+                        continue
                     await asyncio.to_thread(
                         self.log,
                         f"Using GitHub base {run['base'][:12]}: {path}; "
@@ -1096,7 +1126,7 @@ class Runner:
                     )
                 try:
                     data, notes = plan(text, set(secrets), config.get("variables", {}))
-                    destination = control / Path(path).name
+                    destination = control / filename
                     destination.write_text(yaml.safe_dump(data, sort_keys=False))
                     names, dynamic = secret_references(data)
                     # Enabling host GitHub login is the operator's opt-in for every selected
@@ -1111,7 +1141,7 @@ class Runner:
                     await asyncio.to_thread(self.log, "\n".join(notes) + "\n")
                 except Blocked as exc:
                     blockers.append(str(exc))
-                    await asyncio.to_thread(self.step, Path(path).name, "blocked", str(exc))
+                    await asyncio.to_thread(self.step, filename, "blocked", str(exc))
             code, _ = await self.command(
                 "git",
                 "-c",

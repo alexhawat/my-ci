@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import time
 from datetime import datetime
 from typing import Literal
@@ -10,14 +9,20 @@ from typing import Literal
 import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from localci import updater
 from localci.github import GitHubError
-from localci.policy import is_pr_workflow, workflow
+from localci.policy import (
+    WORKFLOW_PATH_HELP,
+    is_local_workflow,
+    is_pr_workflow,
+    valid_workflow_path,
+    workflow,
+)
 from localci.results import check_summary
 
-WORKFLOW_PATH = r"^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$"
+PR_TRIGGER_HELP = "Local CI runs workflows for pull requests; keep an on: pull_request trigger"
 
 
 class ExecutionSettings(BaseModel):
@@ -29,10 +34,17 @@ class ExecutionSettings(BaseModel):
 
 
 class WorkflowEdit(BaseModel):
-    path: str = Field(pattern=WORKFLOW_PATH)
+    path: str
     content: str = Field(min_length=1, max_length=200000)
     source_ref: str = Field(max_length=200)
     expected_version: int = Field(default=0, ge=0)
+
+    @field_validator("path")
+    @classmethod
+    def workflow_path(cls, value):
+        if not valid_workflow_path(value):
+            raise ValueError(WORKFLOW_PATH_HELP)
+        return value
 
 
 class MergeRequest(BaseModel):
@@ -212,24 +224,23 @@ def register_dashboard(app, controller, repo_name, get_run):
     async def pull_requests(state: Literal["open", "closed"] = "open"):
         errors = []
         synced = controller.status()["last_poll"]
+        # Repositories that run checks locally and those that are only watched.
+        watched = {repo["name"]: repo for repo in await asyncio.to_thread(store.watched_repos)}
         if state == "open":
-            rows = await asyncio.to_thread(
-                store.rows,
-                """SELECT p.repo,p.number,p.data,r.error FROM prs p
-                JOIN repos r ON r.name=p.repo WHERE r.enabled=1""",
-            )
-            errors = await asyncio.to_thread(
-                store.rows, "SELECT name,error FROM repos WHERE enabled=1 AND error!=''"
-            )
+            rows = [
+                {**row, "error": watched[row["repo"]]["error"]}
+                for row in await asyncio.to_thread(store.rows, "SELECT repo,number,data FROM prs")
+                if row["repo"] in watched
+            ]
+            errors = [
+                {"name": name, "error": repo["error"]} for name, repo in watched.items() if repo["error"]
+            ]
         else:
             rows = []
             synced = time.time()
             # Display-only cache: never replace the executor's open-PR snapshot
             # or enqueue work while browsing closed/merged pull requests.
-            names = [
-                repo["name"]
-                for repo in await asyncio.to_thread(store.rows, "SELECT name FROM repos WHERE enabled=1")
-            ]
+            names = list(watched)
             for name, cached in zip(names, await asyncio.gather(*map(closed_prs, names)), strict=True):
                 # The oldest successful fetch, so a failed refresh does not look current.
                 synced = min(synced, cached[3])
@@ -271,6 +282,7 @@ def register_dashboard(app, controller, repo_name, get_run):
                 # The local snapshot can trail GitHub by one poll.
                 github["current"] = github["head"] == pr["head"]["sha"]
             fork = (pr["head"].get("repo") or {}).get("full_name") != row["repo"]
+            watch_only = not watched[row["repo"]]["enabled"]
             items.append(
                 {
                     "repo": row["repo"],
@@ -288,8 +300,11 @@ def register_dashboard(app, controller, repo_name, get_run):
                     "fork": fork,
                     "created": pr.get("created_at"),
                     "updated": pr.get("updated_at"),
+                    "watch_only": watch_only,
                     "ci_eligibility": "Closed — not scheduled"
                     if state == "closed"
+                    else "Watch only — not run locally"
+                    if watch_only
                     else "Draft — not scheduled"
                     if draft
                     else "Fork — not scheduled"
@@ -313,8 +328,8 @@ def register_dashboard(app, controller, repo_name, get_run):
     @app.post("/api/repos/{owner}/{repo}/prs/{number}/merge")
     async def merge_pr(owner: str, repo: str, number: int, body: MergeRequest):
         name = repo_name(owner, repo)
-        if not store.repo(name)["enabled"]:
-            raise HTTPException(400, "Enable the repository before merging its pull requests")
+        if name not in {r["name"] for r in await asyncio.to_thread(store.watched_repos)}:
+            raise HTTPException(400, "Enable or watch the repository before merging its pull requests")
         try:
             result = await controller.github.merge(name, number, body.sha, body.method)
         except GitHubError as exc:
@@ -432,8 +447,8 @@ def register_dashboard(app, controller, repo_name, get_run):
     @app.get("/api/repos/{owner}/{repo}/workflow")
     async def get_workflow(owner: str, repo: str, path: str, version: int | None = None):
         name = repo_name(owner, repo)
-        if not re.fullmatch(WORKFLOW_PATH, path):
-            raise HTTPException(400, "Expected .github/workflows/name.yml")
+        if not valid_workflow_path(path):
+            raise HTTPException(400, WORKFLOW_PATH_HELP)
         versions = store.rows(
             "SELECT version,source_ref,created,active FROM workflow_versions WHERE repo=? AND path=? ORDER BY version DESC",
             (name, path),
@@ -450,9 +465,18 @@ def register_dashboard(app, controller, repo_name, get_run):
         )
         if active:
             return {**active[0], "versions": versions}
+        if is_local_workflow(path):
+            raise HTTPException(404, "This local workflow was deleted")
         data = json.loads(store.repo(name)["data"])
         commit = await controller.github.request("GET", f"repos/{name}/commits/{data['default_branch']}")
-        content = await controller.github.content(name, path, commit["sha"])
+        try:
+            content = await controller.github.content(name, path, commit["sha"])
+        except GitHubError as exc:
+            if exc.status != 404:
+                raise
+            raise HTTPException(404, f"{path} is not on {data['default_branch']}") from None
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, f"{path} is not a readable text file") from None
         return {
             "path": path,
             "content": content,
@@ -467,7 +491,7 @@ def register_dashboard(app, controller, repo_name, get_run):
         try:
             data = workflow(value.content)
             if not is_pr_workflow(data):
-                raise ValueError("Keep the pull_request trigger for local CI")
+                raise ValueError(PR_TRIGGER_HELP)
         except Exception as exc:
             raise HTTPException(400, f"Invalid workflow: {exc}") from None
         # Serialize optimistic version check and write in the same DB transaction.
@@ -477,6 +501,10 @@ def register_dashboard(app, controller, repo_name, get_run):
                 "SELECT version FROM workflow_versions WHERE repo=? AND path=? AND active=1",
                 (name, value.path),
             ).fetchone()
+            if current and not value.expected_version and is_local_workflow(value.path):
+                raise HTTPException(
+                    409, "A local workflow with this name already exists. Choose another name, or edit it."
+                )
             if (current[0] if current else 0) != value.expected_version:
                 raise HTTPException(409, "This workflow changed in another window. Reopen it before saving.")
             version = db.execute(
@@ -492,8 +520,21 @@ def register_dashboard(app, controller, repo_name, get_run):
 
     @app.delete("/api/repos/{owner}/{repo}/workflow")
     def upstream_workflow(owner: str, repo: str, path: str):
+        """Go back to the repository's file. A local-only workflow has none: it is deleted
+        and unselected (its versions stay viewable in run history)."""
         name = repo_name(owner, repo)
-        store.execute("UPDATE workflow_versions SET active=0 WHERE repo=? AND path=?", (name, path))
+        if not valid_workflow_path(path):
+            raise HTTPException(400, WORKFLOW_PATH_HELP)
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE workflow_versions SET active=0 WHERE repo=? AND path=?", (name, path))
+            if is_local_workflow(path):
+                config = json.loads(
+                    db.execute("SELECT config FROM repos WHERE name=?", (name,)).fetchone()[0]
+                )
+                if path in config.get("workflows", []):
+                    config["workflows"] = [p for p in config["workflows"] if p != path]
+                    db.execute("UPDATE repos SET config=? WHERE name=?", (json.dumps(config), name))
         return {"ok": True}
 
     @app.get("/api/runs/{rid}")

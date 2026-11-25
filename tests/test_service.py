@@ -204,6 +204,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALCI_URL", "https://machine.example:9443")
     app = create_app(tmp_path, background=False)
     app.state.controller.store.discover([repo()])
+    # An installation that has added mergeCraft in Settings.
+    app.state.controller.store.save_integrations({"mergecraft": True})
     with TestClient(
         app, headers={"Tailscale-User-Login": "owner@example.com", "Origin": "https://machine.example:9443"}
     ) as client:

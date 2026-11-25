@@ -145,13 +145,20 @@ class Controller:
         async with self.lock:
             if time.time() - self.last_discovery > 600:
                 await self.discover()
-            for repo in await asyncio.to_thread(self.store.rows, "SELECT * FROM repos WHERE enabled=1"):
+            for repo in await asyncio.to_thread(self.store.watched_repos):
                 try:
                     # Oldest first: a PR closing between page requests then shifts later
                     # pages toward newer PRs less often than the default newest-first order.
                     prs = await self.github.pages(
                         f"repos/{repo['name']}/pulls?state=open&sort=created&direction=asc"
                     )
+                    if not repo["enabled"]:
+                        # Watched only: list its PRs for the dashboard, never run or report.
+                        await asyncio.to_thread(self.store.replace_prs, repo["name"], prs)
+                        await asyncio.to_thread(
+                            self.store.execute, "UPDATE repos SET error='' WHERE name=?", (repo["name"],)
+                        )
+                        continue
                     await asyncio.to_thread(self.store.cancel_stale, repo["name"], prs)
                     await asyncio.to_thread(self.store.replace_prs, repo["name"], prs)
                     config = json.loads(repo["config"])

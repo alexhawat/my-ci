@@ -8,6 +8,60 @@ class Blocked(RuntimeError):
     pass
 
 
+# Where a selected workflow comes from. A repository path names a YAML file anywhere in
+# the repository, read from each PR's trusted base commit (.github/workflows/ is the
+# usual place, not the only one). A ``local:`` name is a workflow the operator uploaded
+# or pasted: it exists only here, so it never resolves against repository content.
+LOCAL_WORKFLOW_PREFIX = "local:"
+_REPOSITORY_WORKFLOW = re.compile(r"(?:[A-Za-z0-9_.-]+/){0,20}[A-Za-z0-9_.-]+\.ya?ml")
+_LOCAL_WORKFLOW = re.compile(re.escape(LOCAL_WORKFLOW_PREFIX) + r"[A-Za-z0-9_.-]{1,100}\.ya?ml")
+WORKFLOW_PATH_HELP = (
+    "Expected a YAML path in the repository, such as .github/workflows/ci.yml, or local:name.yml"
+)
+
+
+def is_local_workflow(path: str) -> bool:
+    return path.startswith(LOCAL_WORKFLOW_PREFIX)
+
+
+def valid_workflow_path(path: str) -> bool:
+    if len(path) > 300:
+        return False
+    if is_local_workflow(path):
+        return _LOCAL_WORKFLOW.fullmatch(path) is not None
+    # No "." or ".." segment: the path stays inside the repository.
+    return _REPOSITORY_WORKFLOW.fullmatch(path) is not None and not any(
+        part in {".", ".."} for part in path.split("/")
+    )
+
+
+def workflow_files(paths: list[str]) -> dict[str, str]:
+    """The file (and check) name each selected workflow runs under, unique within a run.
+
+    A file in .github/workflows/ keeps its own name, as it always has. Any other source
+    uses its file name too, with ``-2``, ``-3``... added when another selected workflow
+    already has that name. Deterministic, so reports can name the checks a run expects.
+    """
+    names: dict[str, str] = {}
+    used = {
+        path.rsplit("/", 1)[-1]
+        for path in paths
+        if path.startswith(".github/workflows/") and path.count("/") == 2
+    }
+    for path in paths:
+        if path.startswith(".github/workflows/") and path.count("/") == 2:
+            names[path] = path.rsplit("/", 1)[-1]
+            continue
+        name = path.removeprefix(LOCAL_WORKFLOW_PREFIX).rsplit("/", 1)[-1]
+        stem, dot, suffix = name.rpartition(".")
+        candidate, number = name, 2
+        while candidate in used:
+            candidate, number = f"{stem}-{number}{dot}{suffix}", number + 1
+        used.add(candidate)
+        names[path] = candidate
+    return names
+
+
 class WorkflowLoader(yaml.SafeLoader):
     pass
 
