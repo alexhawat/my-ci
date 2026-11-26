@@ -1,5 +1,6 @@
 import {historyColumns, historyRows} from './history.mjs';
 import {availableForRerun, selectedPRs, retrySelected} from './selection.mjs';
+import {replaceHTML} from './render.mjs';
 const $ = id => document.getElementById(id);
 let state = {repos: [], runs: [], execution: {}}, selectedRepo = null, selectedRun = null;
 let openPRs = [], prMode = 'open', prRequest = 0;
@@ -26,7 +27,8 @@ async function api(path, options={}) {
 async function view(name) {
   currentView=name; document.querySelectorAll('.view').forEach(el=>el.hidden=el.id!==name);
   document.querySelectorAll('.nav').forEach(el=>el.classList.toggle('active',el.dataset.view===name));
-  $('heading').textContent={overview:'Overview',repositories:'Repositories',prs:'PRs',runs:'Run history',analytics:'Usage & analytics',execution:'Execution settings'}[name];
+  $('heading').textContent={overview:'Overview',repositories:'Repositories',prs:'PRs',runs:'Run history',analytics:'Usage & analytics',execution:'Execution settings',preferences:'Settings'}[name];
+  if(name==='preferences') renderPreferences();
   if(name==='prs') await loadPRs(); if(name==='execution') await loadExecution(); if(name==='analytics') await loadAnalytics();
 }
 function runTable(runs, selectable=false, sortable=false) {
@@ -79,17 +81,17 @@ function filterPRs() {
   const q=$('pr-search').value.toLowerCase();
   const prs=openPRs.filter(p=>[p.repo,`#${p.number}`,p.title,p.author,p.branch,p.state==='closed'?(p.merged?'merged':'closed'):(p.draft?'draft':'open'),p.latest_run?.state].join(' ').toLowerCase().includes(q));
   const iso=t=>t?date(Date.parse(t)/1000):'—';
-  $('pr-list').innerHTML=prs.length?`<div class="table-wrap"><table class="pr-table"><thead><tr><th>Repository / PR</th><th>Title</th><th>Author / state</th><th>Branch → base</th><th>Local CI</th><th>Checks</th><th>GitHub CI</th><th>Updated</th><th>Opened</th><th></th></tr></thead><tbody>${prs.map(p=>{
+  replaceHTML($('pr-list'),prs.length?`<div class="table-wrap"><table class="pr-table"><thead><tr><th>Repository / PR</th><th>Title</th><th>Author / state</th><th>Branch → base</th><th>Local CI</th><th>Checks</th><th>GitHub CI</th><th>Updated</th><th>Opened</th><th></th></tr></thead><tbody>${prs.map(p=>{
     const r=p.latest_run,current=r?.current,status=r?(current?badge(r.state):badge('outdated')):'<span class="muted">Not run</span>';
     return `<tr><td><a class="text-button" href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.repo)} #${p.number} ↗</a></td><td><strong>${esc(p.title)}</strong></td><td>${esc(p.author)}<small>${p.state==='closed'?(p.merged?'Merged':'Closed'):(p.draft?'Draft':'Open')}${p.fork?' · Fork':''}</small></td><td>${esc(p.branch)} → ${esc(p.base_branch)}<small><code>${esc(p.head.slice(0,8))}</code></small></td><td>${status}<small>${esc(p.ci_eligibility)}</small>${p.sync_error?'<small>Sync needs attention</small>':''}</td><td>${r?`${current?'':'Previous revision: '}${esc(r.checks_summary||r.state)}`:'—'}</td><td>${githubCell(p)}</td><td>${iso(p.updated)}</td><td>${iso(p.created)}</td><td><div class="button-row">${r?`<button class="button" data-run="${esc(r.id)}">View run ↗</button>`:''}${mergeButton(p)}</div></td></tr>`;
-  }).join('')}</tbody></table></div>`:`<div class="empty"><strong>No matching ${prMode} pull requests.</strong>Only enabled repositories appear here.</div>`;
+  }).join('')}</tbody></table></div>`:`<div class="empty"><strong>No matching ${prMode} pull requests.</strong>Only repositories that run checks here or that you watch appear here.</div>`);
 }
 function selectionRuns() {return [...new Map([...state.runs,...(state.latest_runs||[])].map(r=>[r.id,r])).values()].sort((a,b)=>b.created-a.created);}
 function overviewRuns() {return ($('overview-latest').checked?(state.latest_runs||state.runs):state.runs).slice(0,Number($('overview-limit').value));}
 function renderOverviewRuns() {
   const visible=new Set(overviewRuns().map(r=>r.id));
   if(!retryingSelection)for(const id of selectedRuns)if(!visible.has(id))selectedRuns.delete(id);
-  $('recent-runs').innerHTML=runTable(overviewRuns(),true);updateRunSelection();
+  replaceHTML($('recent-runs'),runTable(overviewRuns(),true));updateRunSelection();
 }
 function updateRunSelection() {
   const count=selectedPRs(selectionRuns(),selectedRuns).length,button=$('run-selected');
@@ -120,8 +122,10 @@ $('run-selected').addEventListener('click',async()=>{
     $('selection-result').textContent=`Created ${queued.length} new run${queued.length===1?'':'s'}.${active.length?' '+active.length+' PRs already have an active run.':''}${errors.length?' '+errors.map(r=>`${r.run.repo} #${r.run.pr}: ${r.message}`).join(' · '):''}`;
   }finally{retryingSelection=false;await refresh();renderOverviewRuns();}
 });
-function repoCards(repos) {return repos.length?`<div class="repo-grid">${repos.map(r=>`<article class="repo-card"><div class="eyebrow">${r.private?'PRIVATE':'PUBLIC'}</div><h3>${esc(r.name)}</h3><p>${esc(r.description||'No description')}</p><div class="bottom">${badge(r.enabled?'enabled':'disabled')}<button class="button" data-repo="${esc(r.name)}">Configure</button></div>${r.error?`<p>${esc(r.error)}</p>`:''}</article>`).join('')}</div>`:'<div class="empty"><strong>No repositories here yet.</strong>Choose a repository to start.</div>';}
-function filterRepos() {const q=$('search').value.toLowerCase(); $('repo-list').innerHTML=repoCards(state.repos.filter(r=>r.name.toLowerCase().includes(q)));}
+function repoCards(repos) {return repos.length?`<div class="repo-grid">${repos.map(r=>`<article class="repo-card"><div class="eyebrow">${r.private?'PRIVATE':'PUBLIC'}</div><h3>${esc(r.name)}</h3><p>${esc(r.description||'No description')}</p><div class="bottom">${badge(r.enabled?'enabled':watchOnly(r)?'watching':'disabled')}<button class="button" data-repo="${esc(r.name)}">Configure</button></div>${r.error?`<p>${esc(r.error)}</p>`:''}</article>`).join('')}</div>`:'<div class="empty"><strong>No repositories here yet.</strong>Choose a repository to start.</div>';}
+function filterRepos() {const q=$('search').value.toLowerCase(); replaceHTML($('repo-list'),repoCards(state.repos.filter(r=>r.name.toLowerCase().includes(q))));}
+const watchOnly=r=>!r.enabled&&!!r.config?.watch_only;
+const mergecraft=()=>!!state.integrations?.mergecraft;
 function filterRuns() {
   const repo=$('run-repo'), selected=repo.value;
   const names=[...new Set(state.runs.map(r=>r.repo))].sort();
@@ -131,20 +135,20 @@ function filterRuns() {
   }
   const runs=historyRows(state.runs,{query:$('run-search').value,repo:repo.value,result:$('run-result').value,days:Number($('run-period').value),sort:historySort,direction:historyDirection},{date,elapsed,fixed,memory});
   $('history-count').textContent=`${runs.length} of ${state.runs.length} recent runs (latest 100)`;
-  $('all-runs').innerHTML=runTable(runs,false,true);
+  replaceHTML($('all-runs'),runTable(runs,false,true));
 }
 function render() {
-  const enabled=state.repos.filter(r=>r.enabled), done=state.runs.filter(r=>['success','failure','error','blocked'].includes(r.state));
-  $('app-setup').textContent=state.github_app?'✓ GitHub App':'Connect GitHub App';
+  const enabled=state.repos.filter(r=>r.enabled), watched=state.repos.filter(watchOnly), done=state.runs.filter(r=>['success','failure','error','blocked'].includes(r.state));
   $('host-label').textContent=state.host||'local worker'; document.title=`my-ci · ${state.host||'local worker'}`;
-  $('repo-count').textContent=state.repos.length; $('enabled').textContent=enabled.length; $('discovered').textContent=`${state.repos.length} repositories available`;
+  $('repo-count').textContent=state.repos.length; $('enabled').textContent=enabled.length; $('discovered').textContent=`${state.repos.length} repositories available${watched.length?` · ${watched.length} watched`:''}`;
   $('queue').textContent=`${state.runs.filter(r=>r.state==='running').length} / ${state.runs.filter(r=>r.state==='queued').length}`;
   $('parallel-summary').textContent=`${state.execution.max_parallel_runs} parallel run slots${state.execution.paused?' · queue paused':''}`;
   $('pass').textContent=done.length?Math.round(done.filter(r=>r.state==='success').length/done.length*100)+'%':'—';
   $('disk').textContent=Math.floor((state.disk_free||0)/2**30)+' GB';
   $('account').textContent=state.login?`● ${state.login} · GitHub connected`:'Waiting for GitHub login';
   $('updated').textContent=state.last_poll?'Synced '+date(state.last_poll):'Waiting for first sync';
-  renderOverviewRuns(); filterRuns(); $('enabled-repos').innerHTML=repoCards(enabled); filterRepos();
+  renderOverviewRuns(); filterRuns(); replaceHTML($('enabled-repos'),repoCards([...enabled,...watched])); filterRepos();
+  showIntegrations(); if(currentView==='preferences') renderPreferences();
   // The worker's own error is shown while it lasts and cleared when it ends, without
   // replacing a message from an action the operator has just taken in a dialog.
   if(state.error){if(state.error!==workerError){workerError=state.error;$('notice').textContent=workerError;$('notice').hidden=false;}}
@@ -166,18 +170,73 @@ function variables() {
   const result={};for(const row of document.querySelectorAll('.variable-row')) {const name=row.querySelector('.variable-name').value.trim(),value=row.querySelector('.variable-value').value;if(!name&&!value)continue;if(!/^[A-Z][A-Z0-9_]*$/.test(name))throw new Error('Variable names use uppercase letters, numbers and underscores.');if(Object.hasOwn(result,name))throw new Error('Duplicate variable: '+name);result[name]=value;}return result;
 }
 async function configure(name) {
-  selectedRepo=state.repos.find(r=>r.name===name);const r=selectedRepo;
-  $('settings-error').textContent='';$('settings-title').textContent=name;$('repo-enabled').checked=!!r.enabled;$('repo-run-bot-prs').checked=!!r.config.run_bot_prs;$('repo-review').checked=!!r.config.review;$('repo-review-threshold').value=r.config.review_failure_threshold||'major';
+  selectedRepo=state.repos.find(r=>r.name===name);const r=selectedRepo;addedPaths.clear();
+  $('settings-error').textContent='';$('settings-title').textContent=name;$('repo-watch-only').checked=watchOnly(r);$('repo-enabled').checked=!!r.enabled;showLocalSettings();showIntegrations();$('repo-run-bot-prs').checked=!!r.config.run_bot_prs;$('repo-review').checked=!!r.config.review;$('repo-review-threshold').value=r.config.review_failure_threshold||'major';
   $('repo-github-auth').value=r.config.github_auth||'none';$('repo-parallel').value=r.config.job_parallelism||1;$('repo-timeout').value=(r.config.timeout||7200)/60;$('repo-review-timeout').value=(r.config.review_timeout||3000)/60;$('repo-review-token-ceiling').value=r.config.review_token_ceiling??'';
-  variableRows(r.config.variables||{});$('workflow-options').textContent='Loading workflows…';workflowChoices=[];renderSecrets();credentialChoices();$('settings').showModal();
+  variableRows(r.config.variables||{});$('workflow-options').textContent='Loading workflows…';workflowChoices=[];
+  $('add-workflow').open=false;for(const id of ['add-path','add-name','add-yaml','add-file'])$(id).value='';$('add-workflow-result').textContent='';
+  renderSecrets();credentialChoices();$('settings').showModal();
   await loadWorkflowChoices(r.config.workflows||[]);
 }
+// Files outside .github/workflows/ added in this dialog, listed until it closes.
+const addedPaths=new Set();
+const sourceLabel={workflows:'GITHUB BASE → LOCAL DOCKER',repository:'REPOSITORY FILE · BASE → LOCAL DOCKER',local:'LOCAL ONLY'};
 async function loadWorkflowChoices(selected) {
-  const name=selectedRepo.name;
-  try {const choices=await api(`/repos/${name}/workflows`);if(selectedRepo.name!==name)return;workflowChoices=choices;
-    $('workflow-options').innerHTML=choices.length?choices.map(w=>`<div class="workflow-row"><label class="workflow ${!w.pr||w.review?'workflow-disabled':''}"><input type="checkbox" name="workflow" value="${esc(w.path)}" ${!w.pr||w.review?'disabled':''} ${selected.includes(w.path)?'checked':''}><span>${esc(w.name)}<small>${esc(w.path)} · ${w.local_version?'LOCAL v'+w.local_version:'GITHUB BASE → LOCAL DOCKER'}${w.review?' · use review toggle':!w.pr?' · not a PR workflow':''}</small><small>${esc((w.jobs||[]).join(' · '))}</small></span></label><button type="button" class="button" data-edit-workflow="${esc(w.path)}">Edit local copy</button></div>`).join(''):'<p class="muted">No workflows found. mergeCraft can still review PRs.</p>';
+  const name=selectedRepo.name, include=[...addedPaths].map(p=>'include='+encodeURIComponent(p)).join('&');
+  try {const choices=await api(`/repos/${name}/workflows${include?'?'+include:''}`);if(selectedRepo.name!==name)return;workflowChoices=choices;
+    replaceHTML($('workflow-options'),choices.length?choices.map(w=>{
+      const off=!w.pr||w.review||!!w.error, why=w.error?` · ${w.error}`:w.review?(mergecraft()?' · use the mergeCraft review toggle':' · runs mergeCraft; add mergeCraft in Settings to review PRs'):!w.pr?' · not a PR workflow':'';
+      const version=w.local_version?`${w.source==='local'?'LOCAL ONLY':'LOCAL'} v${w.local_version}`:sourceLabel[w.source]||sourceLabel.workflows;
+      return `<div class="workflow-row"><label class="workflow ${off?'workflow-disabled':''}"><input type="checkbox" name="workflow" value="${esc(w.path)}" ${off?'disabled':''} ${selected.includes(w.path)&&!off?'checked':''}><span>${esc(w.name)}<small>${esc(w.path)} · ${version}${esc(why)}</small><small>${esc((w.jobs||[]).join(' · '))}</small></span></label>${w.error?'':`<button type="button" class="button" data-edit-workflow="${esc(w.path)}">Edit local copy</button>`}</div>`;
+    }).join(''):'<p class="muted">No workflows found in .github/workflows/. Add one from any YAML file below'+(mergecraft()?', or use mergeCraft review alone.':'.')+'</p>');
     $('variable-names').innerHTML=[...new Set(choices.flatMap(w=>w.variables||[]))].map(v=>`<option value="${esc(v)}"></option>`).join('');credentialChoices();
   }catch(e){$('workflow-options').textContent=e.message;}
+}
+function showLocalSettings() {
+  // Hidden, not cleared: unticking it again restores the settings as they were.
+  const watch=$('repo-watch-only').checked;$('local-settings').hidden=watch;$('repo-secrets').hidden=watch;
+}
+function showIntegrations() {
+  const on=mergecraft();document.querySelectorAll('.mergecraft-only').forEach(el=>el.hidden=!on);
+  const review=$('secret-scope').querySelector('option[value=review]');review.hidden=review.disabled=!on;
+  if(!on&&$('secret-scope').value==='review'){$('secret-scope').value='ci';credentialChoices();}
+}
+function workflowSource() {return document.querySelector('input[name=workflow-source]:checked').value;}
+function showWorkflowSource() {
+  const source=workflowSource();
+  document.querySelectorAll('[data-workflow-source]').forEach(el=>el.hidden=!el.dataset.workflowSource.split(' ').includes(source));
+  $('add-workflow-result').textContent='';
+}
+function localName(value) {
+  const name=value.trim().split(/[\\/]/).pop().replace(/[^A-Za-z0-9_.-]+/g,'-').replace(/^-+|-+$/g,'');
+  return !name?'':/\.ya?ml$/i.test(name)?name.replace(/\.YA?ML$/i,m=>m.toLowerCase()):name+'.yml';
+}
+async function addWorkflow() {
+  const result=$('add-workflow-result'),source=workflowSource(),selected=selectedWorkflows();
+  let path;
+  if(source==='repository'){
+    path=$('add-path').value.trim().replace(/^\/+/,'');
+    if(!/^(?:[A-Za-z0-9_.-]+\/){0,20}[A-Za-z0-9_.-]+\.ya?ml$/.test(path)||path.split('/').some(part=>part==='.'||part==='..')){
+      result.textContent='Enter the path of a .yml or .yaml file in this repository, such as ci/pipeline.yml.';return;
+    }
+    addedPaths.add(path);
+  }else{
+    const file=$('add-file').files[0];
+    if(source==='file'&&!file){result.textContent='Choose a .yml or .yaml file.';return;}
+    if(file&&file.size>200000){result.textContent='Workflow files are limited to 200 KB.';return;}
+    const content=source==='file'?await file.text():$('add-yaml').value;
+    const name=localName($('add-name').value||(file?.name??''));
+    if(!content.trim()){result.textContent='Paste the workflow YAML first.';return;}
+    if(!name||name.length>100){result.textContent='Give the workflow a name of up to 100 characters, such as my-checks.yml.';return;}
+    path='local:'+name;
+    await api(`/repos/${selectedRepo.name}/workflow`,{method:'PUT',body:JSON.stringify({path,content,source_ref:source==='file'?`uploaded file ${file.name}`.slice(0,200):'pasted YAML',expected_version:0})});
+  }
+  await loadWorkflowChoices([...selected,path]);
+  const added=workflowChoices.find(w=>w.path===path);
+  if(!added){addedPaths.delete(path);await loadWorkflowChoices(selected);result.textContent=`${path} could not be listed.`;return;}
+  result.textContent=added.error||!added.pr?`${path} was added but cannot run: ${added.error||'it has no on: pull_request trigger'}.`:`Added and selected ${path}. Save repository settings to use it in new runs.`;
+  if(source==='repository'&&!added.error)$('add-path').value='';
+  if(source!=='repository'){for(const id of ['add-name','add-yaml','add-file'])$(id).value='';}
 }
 function selectedWorkflows(){return [...document.querySelectorAll('input[name=workflow]:checked:not(:disabled)')].map(x=>x.value);}
 function renderSecrets() {$('secret-list').innerHTML=(selectedRepo.secrets||[]).map(k=>`<button type="button" class="secret-chip" data-delete-secret="${esc(k)}" title="Delete this saved credential">${esc(k)} ×</button>`).join('')||'<span class="muted">No local credentials configured</span>';}
@@ -201,7 +260,11 @@ async function openEditor(path) {
   editor={...data,repo:selectedRepo.name,expected_version:data.version};renderEditor(data);
   $('editor-version').innerHTML=`<option value="current">${data.version?'Active local v'+data.version:'Imported GitHub version'}</option>`+data.versions.filter(v=>v.version!==data.version).map(v=>`<option value="${v.version}">Local v${v.version} · ${date(v.created)}</option>`).join('');
 }
-function renderEditor(data) {$('workflow-yaml').value=data.content;$('editor-source').textContent=`${data.version?'Local version '+data.version:'GitHub import'} · source commit/ref ${data.source_ref}. Saving creates a new local version for future runs.`;}
+function renderEditor(data) {
+  const local=data.path?.startsWith('local:');$('workflow-yaml').value=data.content;
+  $('editor-source').textContent=local?`Local-only workflow, version ${data.version} · ${data.source_ref}. It exists only on this worker; saving creates a new version for future runs.`:`${data.version?'Local version '+data.version:'GitHub import'} · source commit/ref ${data.source_ref}. Saving creates a new local version for future runs.`;
+  $('workflow-reset').textContent=local?'Delete local workflow':'Use GitHub version again';$('workflow-reset').classList.toggle('danger',local);
+}
 async function openRun(id) {selectedRun=id;$('log-feedback').textContent='';$('run-detail').showModal();await refreshRun();}
 const meta=(name,value)=>`<div><dt>${esc(name)}</dt><dd>${value}</dd></div>`;
 function ciJobs(report) {
@@ -219,12 +282,11 @@ async function refreshRun() {
   const id=selectedRun;const [r,files,log,events,samples,reports]=await Promise.all([api(`/runs/${id}`),api(`/runs/${id}/artifacts`),api(`/runs/${id}/log`),api(`/runs/${id}/events`),api(`/runs/${id}/resources`),api(`/runs/${id}/reports`)]);
   if(selectedRun!==id)return;
   $('run-title').textContent=`${r.repo} · PR #${r.pr}`;
-  $('run-summary').innerHTML=`${badge(r.state)} &nbsp; ${esc(r.title)}<br>${esc(r.message||`Executing on ${state.host||'configured worker'}`)}${r.publish_error?'<br>GitHub reporting: '+esc(r.publish_error):''}`;
-  $('run-metadata').innerHTML=meta('Run / attempt',`${esc(r.id)} / ${r.attempt}`)+meta('Retry budget',`${r.retries_remaining} left · ${r.max_attempts} total attempts per PR revision`)+meta('Branch / actor',`${esc(r.branch||'—')} / ${esc(r.actor||'—')}`)+meta('Event / runner',`pull_request / ${state.host||'configured worker'} · Docker`)+meta('Created',date(r.created))+meta('Started',date(r.started))+meta('Finished',date(r.finished))+meta('Queue / elapsed',`${r.started?elapsed(r.started-r.created):'Waiting'} / ${duration(r)}`)+meta('CPU / peak memory',`${r.usage?.samples?fixed(r.usage.cpu_seconds/60)+' core-min':'Not measured'} / ${memory(r.usage?.peak_memory_bytes)}`)+meta('Parallel jobs / resource limit',`${r.job_parallelism} / ${r.execution.cpus_per_run||'—'} CPUs · ${r.execution.memory_gb_per_run||'—'} GiB`)+meta('Review time limit',`${r.review_timeout/60} minutes`)+meta('GitHub authentication',r.github_auth==='gh'?'Host gh login (CI only)':'No token in CI')+meta('Repository reporting method',esc(r.reporting))+meta('Head commit',esc(r.head))+meta('Base commit',esc(r.base))+meta('Workflow definitions',(r.workflow_sources||[]).map(w=>`${esc(w.path)}<br>${w.version?'Local v'+w.version:'GitHub base'} · ${esc(w.source_ref.slice(0,12))}`).join('<br>')||'Review only');
-  $('run-steps').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Check</th><th>Status</th><th>Started</th><th>Finished</th><th>Duration</th><th>Detail</th></tr></thead><tbody>${r.steps.map(s=>`<tr><td>${esc(s.name)}</td><td>${badge(s.state)}</td><td>${date(s.started)}</td><td>${date(s.finished)}</td><td>${s.started?elapsed((s.finished||Date.now()/1000)-s.started):'—'}</td><td>${esc(s.message)}</td></tr>`).join('')}</tbody></table></div>`;
-  $('run-steps').innerHTML+=Object.entries(reports).map(([kind,report])=>`<section><h3>${kind==='ci'?'CI result':'mergeCraft review'} · ${esc(report.result_label||report.state)}</h3>${report.policy_adjustment?'<p>This legacy result was re-evaluated from retained evidence; CI was not rerun.</p>':''}${kind==='ci'?ciJobs(report):report.findings_source==='evidence'?'<p>Recovered entries from retained evidence; draft/final entries may overlap. Recovery does not establish review completion.</p>':report.findings_source==='unavailable'?'<p>Findings unavailable; missing evidence is not a clean review.</p>':report.findings_source==='primary'&&!report.findings.length?'<p>No change-scoped findings in the available primary report. This alone is not an approval.</p>':''}${report.findings.map(f=>`<article><h4>${esc(f.severity)} · ${esc(f.path)}:${esc(f.start_line)}</h4><p>${esc(f.message)}</p>${f.evidence.map(e=>`<p>${esc(e)}</p>`).join('')}${f.remediation?`<p><strong>Suggested fix:</strong> ${esc(f.remediation)}</p>`:''}</article>`).join('')}${kind==='review'?`${reviewRecord(report)}${reviewProfile(report.record?.profile)}<details><summary>Analyzer results</summary>${(report.analyzers||[]).map(a=>`<p>${esc(a.name)}: ${esc(a.status)}</p>`).join('')}</details><details><summary>Run health · ${(report.run_health||[]).length} advisories</summary>${(report.run_health||[]).map(f=>`<p><strong>${esc(f.severity)}</strong> · ${esc(f.path)}: ${esc(f.message)} ${esc(f.remediation)}</p>`).join('')}</details>${report.narrative?`<details open><summary>Agent review summary</summary><pre>${esc(report.narrative)}</pre></details>`:''}`:''}${report.diagnostics.length?`<details open><summary>Diagnostic details</summary><pre>${esc(report.diagnostics.join('\n'))}</pre></details>`:''}</section>`).join('');
+  replaceHTML($('run-summary'),`${badge(r.state)} &nbsp; ${esc(r.title)}<br>${esc(r.message||`Executing on ${state.host||'configured worker'}`)}${r.publish_error?'<br>GitHub reporting: '+esc(r.publish_error):''}`);
+  replaceHTML($('run-metadata'),meta('Run / attempt',`${esc(r.id)} / ${r.attempt}`)+meta('Retry budget',`${r.retries_remaining} left · ${r.max_attempts} total attempts per PR revision`)+meta('Branch / actor',`${esc(r.branch||'—')} / ${esc(r.actor||'—')}`)+meta('Event / runner',`pull_request / ${state.host||'configured worker'} · Docker`)+meta('Created',date(r.created))+meta('Started',date(r.started))+meta('Finished',date(r.finished))+meta('Queue / elapsed',`${r.started?elapsed(r.started-r.created):'Waiting'} / ${duration(r)}`)+meta('CPU / peak memory',`${r.usage?.samples?fixed(r.usage.cpu_seconds/60)+' core-min':'Not measured'} / ${memory(r.usage?.peak_memory_bytes)}`)+meta('Parallel jobs / resource limit',`${r.job_parallelism} / ${r.execution.cpus_per_run||'—'} CPUs · ${r.execution.memory_gb_per_run||'—'} GiB`)+meta('Review time limit',`${r.review_timeout/60} minutes`)+meta('GitHub authentication',r.github_auth==='gh'?'Host gh login (CI only)':'No token in CI')+meta('Repository reporting method',esc(r.reporting))+meta('Head commit',esc(r.head))+meta('Base commit',esc(r.base))+meta('Workflow definitions',(r.workflow_sources||[]).map(w=>`${esc(w.path)}<br>${w.version?'Local v'+w.version:'GitHub base'} · ${esc(w.source_ref.slice(0,12))}`).join('<br>')||'Review only'));
+  replaceHTML($('run-steps'),`<div class="table-wrap"><table><thead><tr><th>Check</th><th>Status</th><th>Started</th><th>Finished</th><th>Duration</th><th>Detail</th></tr></thead><tbody>${r.steps.map(s=>`<tr><td>${esc(s.name)}</td><td>${badge(s.state)}</td><td>${date(s.started)}</td><td>${date(s.finished)}</td><td>${s.started?elapsed((s.finished||Date.now()/1000)-s.started):'—'}</td><td>${esc(s.message)}</td></tr>`).join('')}</tbody></table></div>`+Object.entries(reports).map(([kind,report])=>`<section><h3>${kind==='ci'?'CI result':'mergeCraft review'} · ${esc(report.result_label||report.state)}</h3>${report.policy_adjustment?'<p>This legacy result was re-evaluated from retained evidence; CI was not rerun.</p>':''}${kind==='ci'?ciJobs(report):report.findings_source==='evidence'?'<p>Recovered entries from retained evidence; draft/final entries may overlap. Recovery does not establish review completion.</p>':report.findings_source==='unavailable'?'<p>Findings unavailable; missing evidence is not a clean review.</p>':report.findings_source==='primary'&&!report.findings.length?'<p>No change-scoped findings in the available primary report. This alone is not an approval.</p>':''}${report.findings.map(f=>`<article><h4>${esc(f.severity)} · ${esc(f.path)}:${esc(f.start_line)}</h4><p>${esc(f.message)}</p>${f.evidence.map(e=>`<p>${esc(e)}</p>`).join('')}${f.remediation?`<p><strong>Suggested fix:</strong> ${esc(f.remediation)}</p>`:''}</article>`).join('')}${kind==='review'?`${reviewRecord(report)}${reviewProfile(report.record?.profile)}<details><summary>Analyzer results</summary>${(report.analyzers||[]).map(a=>`<p>${esc(a.name)}: ${esc(a.status)}</p>`).join('')}</details><details><summary>Run health · ${(report.run_health||[]).length} advisories</summary>${(report.run_health||[]).map(f=>`<p><strong>${esc(f.severity)}</strong> · ${esc(f.path)}: ${esc(f.message)} ${esc(f.remediation)}</p>`).join('')}</details>${report.narrative?`<details open><summary>Agent review summary</summary><pre>${esc(report.narrative)}</pre></details>`:''}`:''}${report.diagnostics.length?`<details open><summary>Diagnostic details</summary><pre>${esc(report.diagnostics.join('\n'))}</pre></details>`:''}</section>`).join(''));
   $('cancel').hidden=!['running','queued'].includes(r.state);$('retry').hidden=['running','queued'].includes(r.state);$('retry').disabled=!!r.retry_limit_reached;$('retry').textContent=r.retry_limit_reached?'Retry limit reached':`↻ Retry latest PR (${r.retries_remaining} left)`;
-  $('run-artifacts').innerHTML=files.length?'<h3>Artifacts</h3>'+files.map(f=>`<p><a class="text-button" href="/api/runs/${r.id}/artifact?path=${encodeURIComponent(f.path)}">↓ ${esc(f.path)} (${Math.ceil(f.bytes/1024)} KB)</a></p>`).join(''):'';
+  replaceHTML($('run-artifacts'),files.length?'<h3>Artifacts</h3>'+files.map(f=>`<p><a class="text-button" href="/api/runs/${r.id}/artifact?path=${encodeURIComponent(f.path)}">↓ ${esc(f.path)} (${Math.ceil(f.bytes/1024)} KB)</a></p>`).join(''):'');
   $('export-log').href=`/api/runs/${r.id}/download-log`;
   const pre=$('run-log'),bottom=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-30;pre.textContent=log;if(bottom)pre.scrollTop=pre.scrollHeight;
   logEvents=events;renderEvents();resourceChart(samples);
@@ -233,14 +295,14 @@ function renderEvents() {
   const raw=$('log-view').value==='raw',q=$('log-filter').value.toLowerCase();$('run-log').hidden=!raw;$('run-events').hidden=raw;
   const rows=logEvents.filter(e=>[e.phase,e.job,e.level,e.message].join(' ').toLowerCase().includes(q));
   const el=$('run-events'),bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-40;
-  el.innerHTML=rows.length?`<table><thead><tr><th>Timestamp</th><th>Phase</th><th>Job</th><th>Level</th><th>Message</th></tr></thead><tbody>${rows.map(e=>`<tr><td>${date(e.timestamp)}</td><td>${esc(e.phase)}</td><td>${esc(e.job||'—')}</td><td>${badge(e.level)}</td><td>${esc(e.message)}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">No structured lines yet. Historical runs are available in Raw output and Export.</p>';
+  replaceHTML(el,rows.length?`<table><thead><tr><th>Timestamp</th><th>Phase</th><th>Job</th><th>Level</th><th>Message</th></tr></thead><tbody>${rows.map(e=>`<tr><td>${date(e.timestamp)}</td><td>${esc(e.phase)}</td><td>${esc(e.job||'—')}</td><td>${badge(e.level)}</td><td>${esc(e.message)}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">No structured lines yet. Historical runs are available in Raw output and Export.</p>');
   if(bottom)el.scrollTop=el.scrollHeight;
 }
 function resourceChart(samples) {
-  if(!samples.length){$('run-resources').innerHTML='<p class="muted">Resource sampling begins when a worker container starts. Older runs have no resource measurements.</p>';return;}
+  if(!samples.length){replaceHTML($('run-resources'),'<p class="muted">Resource sampling begins when a worker container starts. Older runs have no resource measurements.</p>');return;}
   const max=Math.max(100,...samples.map(s=>s.cpu_percent)),start=samples[0].timestamp,end=samples.at(-1).timestamp;
   const points=samples.map(s=>`${20+(s.timestamp-start)/Math.max(1,end-start)*960},${105-s.cpu_percent/max*90}`).join(' ');
-  $('run-resources').innerHTML=`<h3>CPU over time · ${samples.length} samples</h3><svg class="resource-chart" viewBox="0 0 1000 120" role="img" aria-label="Sampled CPU usage, peak ${fixed(max)} percent; 100 percent is one CPU core"><polyline points="${points}" fill="none" stroke="currentColor" stroke-width="2"/><line x1="20" x2="980" y1="105" y2="105" stroke="#344259"/></svg><p class="muted">${date(start)} → ${date(end)} · ${fixed(max)}% chart maximum (100% = 1 CPU core). Samples about every 5 seconds.</p>`;
+  replaceHTML($('run-resources'),`<h3>CPU over time · ${samples.length} samples</h3><svg class="resource-chart" viewBox="0 0 1000 120" role="img" aria-label="Sampled CPU usage, peak ${fixed(max)} percent; 100 percent is one CPU core"><polyline points="${points}" fill="none" stroke="currentColor" stroke-width="2"/><line x1="20" x2="980" y1="105" y2="105" stroke="#344259"/></svg><p class="muted">${date(start)} → ${date(end)} · ${fixed(max)}% chart maximum (100% = 1 CPU core). Samples about every 5 seconds.</p>`);
 }
 async function loadExecution() {
   loadUpdate();
@@ -281,11 +343,11 @@ async function loadUpdate() {
 function capacityPlan() {$('capacity-plan').textContent=`At full concurrency: up to ${Number($('max-runs').value)*Number($('run-cpus').value)} CPU cores and ${Number($('max-runs').value)*Number($('run-memory').value)} GiB allocated across workers. These are limits, not measured usage.`;}
 async function loadAnalytics() {
   const data=await api(`/analytics?days=${$('analytics-days').value}`),t=data.totals;
-  $('analytics-metrics').innerHTML=[['Runs',t.runs,`${t.success} passed · ${t.failure} failed/blocked`],['Run minutes',fixed(t.minutes),'Elapsed time summed across runs'],['CPU core-minutes',fixed(t.cpu_minutes),`${t.measured_runs} runs measured`],['Peak memory',memory(t.peak_memory_bytes),'Largest sampled single-run usage']].map(([label,value,detail])=>`<article><span>${label}</span><strong>${value}</strong><small>${detail}</small></article>`).join('');
+  replaceHTML($('analytics-metrics'),[['Runs',t.runs,`${t.success} passed · ${t.failure} failed/blocked`],['Run minutes',fixed(t.minutes),'Elapsed time summed across runs'],['CPU core-minutes',fixed(t.cpu_minutes),`${t.measured_runs} runs measured`],['Peak memory',memory(t.peak_memory_bytes),'Largest sampled single-run usage']].map(([label,value,detail])=>`<article><span>${label}</span><strong>${value}</strong><small>${detail}</small></article>`).join(''));
   $('analytics-note').textContent=data.measurement;
   const max=Math.max(1,...data.daily.map(d=>d.minutes));
-  $('analytics-chart').innerHTML=data.daily.length?data.daily.map(d=>`<div class="chart-row"><span>${d.day}</span><meter min="0" max="${max}" value="${d.minutes}" aria-label="${d.day}: ${fixed(d.minutes)} run minutes"></meter><span>${fixed(d.minutes)} min</span></div>`).join(''):'<p class="muted">Usage appears as new runs execute. Historical compute usage cannot be reconstructed.</p>';
-  $('analytics-repos').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Repository</th><th>Runs</th><th>Passed</th><th>Failed / blocked</th><th>Run minutes</th><th>CPU core-minutes</th><th>Peak memory</th><th>Measured runs</th></tr></thead><tbody>${data.repositories.map(r=>`<tr><td>${esc(r.repo)}</td><td>${r.runs}</td><td>${r.success}</td><td>${r.failure}</td><td>${fixed(r.minutes)}</td><td>${fixed(r.cpu_minutes)}</td><td>${memory(r.peak_memory_bytes)}</td><td>${r.measured_runs}</td></tr>`).join('')}</tbody></table></div>`;
+  replaceHTML($('analytics-chart'),data.daily.length?data.daily.map(d=>`<div class="chart-row"><span>${d.day}</span><meter min="0" max="${max}" value="${d.minutes}" aria-label="${d.day}: ${fixed(d.minutes)} run minutes"></meter><span>${fixed(d.minutes)} min</span></div>`).join(''):'<p class="muted">Usage appears as new runs execute. Historical compute usage cannot be reconstructed.</p>');
+  replaceHTML($('analytics-repos'),`<div class="table-wrap"><table><thead><tr><th>Repository</th><th>Runs</th><th>Passed</th><th>Failed / blocked</th><th>Run minutes</th><th>CPU core-minutes</th><th>Peak memory</th><th>Measured runs</th></tr></thead><tbody>${data.repositories.map(r=>`<tr><td>${esc(r.repo)}</td><td>${r.runs}</td><td>${r.success}</td><td>${r.failure}</td><td>${fixed(r.minutes)}</td><td>${fixed(r.cpu_minutes)}</td><td>${memory(r.peak_memory_bytes)}</td><td>${r.measured_runs}</td></tr>`).join('')}</tbody></table></div>`);
 }
 document.addEventListener('click',async e=>{const target=e.target.closest('button');if(!target)return;try{
   if(target.dataset.view)await view(target.dataset.view);
@@ -329,16 +391,23 @@ $('merge-confirm').addEventListener('click',async()=>{
 $('search').addEventListener('input',filterRepos);$('run-search').addEventListener('input',filterRuns);$('pr-search').addEventListener('input',filterPRs);
 $('add-variable').addEventListener('click',()=>addVariable());
 $('apply-vars').addEventListener('click',()=>{try{const v=JSON.parse($('repo-vars').value);if(!v||Array.isArray(v)||typeof v!=='object'||Object.values(v).some(x=>typeof x!=='string'))throw new Error('Use a JSON object with string values, for example {"RUN_CODEQL":"false"}.');variableRows(v);}catch(e){notice(e.message);}});
-$('settings-form').addEventListener('submit',async e=>{e.preventDefault();try{const config={enabled:$('repo-enabled').checked,run_bot_prs:$('repo-run-bot-prs').checked,review:$('repo-review').checked,review_failure_threshold:$('repo-review-threshold').value,github_auth:$('repo-github-auth').value,workflows:selectedWorkflows(),variables:variables(),timeout:Number($('repo-timeout').value)*60,review_timeout:Number($('repo-review-timeout').value)*60,review_token_ceiling:$('repo-review-token-ceiling').value===''?null:Number($('repo-review-token-ceiling').value),job_parallelism:Number($('repo-parallel').value)};await api(`/repos/${selectedRepo.name}`,{method:'PUT',body:JSON.stringify(config)});$('settings').close();notice('Settings saved. Existing runs keep their snapshot; Retry uses your latest configuration.');await refresh();}catch(e){notice(e.message);}});
+$('settings-form').addEventListener('submit',async e=>{e.preventDefault();try{const watch=$('repo-watch-only').checked,config={watch_only:watch,enabled:!watch&&$('repo-enabled').checked,run_bot_prs:$('repo-run-bot-prs').checked,review:mergecraft()&&$('repo-review').checked,review_failure_threshold:$('repo-review-threshold').value,github_auth:$('repo-github-auth').value,workflows:selectedWorkflows(),variables:variables(),timeout:Number($('repo-timeout').value)*60,review_timeout:Number($('repo-review-timeout').value)*60,review_token_ceiling:$('repo-review-token-ceiling').value===''?null:Number($('repo-review-token-ceiling').value),job_parallelism:Number($('repo-parallel').value)};await api(`/repos/${selectedRepo.name}`,{method:'PUT',body:JSON.stringify(config)});$('settings').close();notice(watch?`Watching ${selectedRepo.name}. Its PRs and GitHub CI appear on the PRs page after the next sync, within a few seconds; nothing runs on this worker.`:'Settings saved. Existing runs keep their snapshot; Retry uses your latest configuration.');await refresh();}catch(e){notice(e.message);}});
 $('secret-scope').addEventListener('change',credentialChoices);$('secret-choice').addEventListener('change',credentialHelp);$('workflow-options').addEventListener('change',credentialChoices);
 $('secret-form').addEventListener('submit',async e=>{e.preventDefault();try{const scope=$('secret-scope').value,name=$('secret-choice').value==='custom'?$('secret-name').value:$('secret-choice').value;await api(`/repos/${selectedRepo.name}/secrets`,{method:'PUT',body:JSON.stringify({scope,name,value:$('secret-value').value})});$('secret-value').value='';selectedRepo.secrets=[...new Set([...selectedRepo.secrets,`${scope}:${name}`])];renderSecrets();notice('Credential saved. Its value cannot be read back.');}catch(e){notice(e.message);}});
 $('workflow-save').addEventListener('click',async()=>{try{const result=await api(`/repos/${editor.repo}/workflow`,{method:'PUT',body:JSON.stringify({path:editor.path,content:$('workflow-yaml').value,source_ref:editor.source_ref,expected_version:editor.expected_version})});editor.expected_version=result.version;editor.version=result.version;editor.content=$('workflow-yaml').value;renderEditor(editor);$('editor-version').options[0].textContent='Active local v'+result.version;$('editor-version').value='current';$('editor-result').textContent=`Saved local v${result.version}. GitHub is unchanged. New runs will use this version when the workflow is selected.`;await loadWorkflowChoices(selectedWorkflows());}catch(e){$('editor-result').textContent=e.message;}});
-$('workflow-reset').addEventListener('click',async()=>{try{await api(`/repos/${editor.repo}/workflow?path=${encodeURIComponent(editor.path)}`,{method:'DELETE'});$('workflow-editor').close();await loadWorkflowChoices(selectedWorkflows());notice('Future runs use the GitHub base workflow again. Local revision history is retained.');}catch(e){$('editor-result').textContent=e.message;}});
+$('workflow-reset').addEventListener('click',async()=>{try{
+  const local=editor.path.startsWith('local:');
+  if(local&&!confirm(`Delete ${editor.path}? It is unselected in this repository's saved settings. Runs that already used it keep their copy.`))return;
+  await api(`/repos/${editor.repo}/workflow?path=${encodeURIComponent(editor.path)}`,{method:'DELETE'});$('workflow-editor').close();
+  if(local&&selectedRepo)selectedRepo.config.workflows=(selectedRepo.config.workflows||[]).filter(p=>p!==editor.path);
+  await loadWorkflowChoices(selectedWorkflows().filter(p=>p!==editor.path));
+  notice(local?`Deleted ${editor.path}.`:'Future runs use the GitHub base workflow again. Local revision history is retained.');
+}catch(e){$('editor-result').textContent=e.message;}});
 $('editor-version').addEventListener('change',async()=>{try{const v=$('editor-version').value;if(v==='current'){renderEditor(editor);return;}const data=await api(`/repos/${editor.repo}/workflow?path=${encodeURIComponent(editor.path)}&version=${v}`);renderEditor(data);}catch(e){$('editor-result').textContent=e.message;}});
 $('workflow-yaml').addEventListener('keydown',e=>{if(e.key==='Tab'){e.preventDefault();const el=e.target,start=el.selectionStart,end=el.selectionEnd;el.setRangeText('  ',start,end,'end');}});
 $('log-view').addEventListener('change',renderEvents);$('log-filter').addEventListener('input',renderEvents);
 $('copy-log').addEventListener('click',async()=>{try{const log=await api(`/runs/${selectedRun}/download-log`);await navigator.clipboard.writeText(log);$('log-feedback').textContent='Full retained log copied.';}catch(e){$('log-feedback').textContent='Copy failed: '+e.message+'. Use Export to download the log.';}});
-$('sync').addEventListener('click',async()=>{try{await api('/sync',{method:'POST'});notice('GitHub sync requested.');}catch(e){notice(e.message);}});
+$('sync').addEventListener('click',async()=>{try{await api('/sync',{method:'POST'});notice('Checking GitHub now: new repositories and pull requests appear within a few seconds. This happens on its own every 60 seconds for PRs and every 10 minutes for repositories.');}catch(e){notice(e.message);}});
 $('cancel').addEventListener('click',async()=>{try{await api(`/runs/${selectedRun}/cancel`,{method:'POST'});await refresh();}catch(e){notice(e.message);}});
 $('retry').addEventListener('click',async()=>{try{await api(`/runs/${selectedRun}/retry`,{method:'POST'});$('run-detail').close();await refresh();}catch(e){notice(e.message);}});
 $('execution-form').addEventListener('input',capacityPlan);
@@ -353,6 +422,31 @@ $('update-cancel').addEventListener('click',async()=>{
 });
 $('execution-form').addEventListener('submit',async e=>{e.preventDefault();try{await api('/execution',{method:'PUT',body:JSON.stringify({max_parallel_runs:Number($('max-runs').value),max_retries:Number($('max-retries').value),cpus_per_run:Number($('run-cpus').value),memory_gb_per_run:Number($('run-memory').value),paused:$('queue-paused').checked})});$('execution-result').textContent='Saved. New containers start on demand within these limits.';await refresh();}catch(e){$('execution-result').textContent=e.message;}});
 $('analytics-days').addEventListener('change',()=>loadAnalytics().catch(e=>notice(e.message)));
-$('app-setup').addEventListener('click',()=>$('app-dialog').showModal());
-$('app-form').addEventListener('submit',async e=>{e.preventDefault();try{const file=$('app-key').files[0];if(!file||file.size>20000)throw new Error('Choose a PEM key under 20 KB');const result=await api('/github-app',{method:'PUT',body:JSON.stringify({app_id:$('app-id').value,private_key:await file.text()})});$('app-key').value='';$('app-result').textContent='Connected '+result.name;await refresh();}catch(e){$('app-result').textContent=e.message;}});
+$('app-form').addEventListener('submit',async e=>{e.preventDefault();try{const file=$('app-key').files[0];if(!file||file.size>20000)throw new Error('Choose a PEM key under 20 KB');const result=await api('/github-app',{method:'PUT',body:JSON.stringify({app_id:$('app-id').value,private_key:await file.text()})});$('app-key').value='';$('app-id').value='';$('app-result').textContent=`Connected ${result.name}. New results are published as Check Runs.`;await refresh();}catch(e){$('app-result').textContent=e.message;}});
+function renderPreferences() {
+  const app=state.github_app;
+  $('reporting-status').innerHTML=app?`<strong>Check Runs via GitHub App ${esc(app.name||'')}</strong> (App ID ${esc(app.app_id)}). Repositories the App is not installed on get a commit status from ${esc(state.login||'the worker\u2019s GitHub login')} instead.`:`<strong>Commit statuses via ${esc(state.login||'the worker\u2019s GitHub login')}.</strong> Each PR gets a <code>local-ci</code> status. No GitHub App is connected, and none is required.`;
+  $('app-heading').textContent=app?'Replace or disconnect the GitHub App':'Optional: publish Check Runs with a GitHub App';
+  $('app-connect').textContent=app?'Validate & replace App':'Validate & connect App';$('app-disconnect').hidden=!app;
+  if(document.activeElement!==$('integration-mergecraft'))$('integration-mergecraft').checked=mergecraft();
+}
+$('app-disconnect').addEventListener('click',async()=>{
+  if(!confirm('Disconnect the GitHub App? New results are posted as commit statuses with the worker\u2019s GitHub login. Check Runs already published stay on GitHub.'))return;
+  try{await api('/github-app',{method:'DELETE'});$('app-result').textContent='Disconnected. New results are posted as commit statuses.';await refresh();}catch(e){$('app-result').textContent=e.message;}
+});
+$('integration-mergecraft').addEventListener('change',async e=>{
+  const on=e.target.checked,using=state.repos.filter(r=>r.config?.review).map(r=>r.name);
+  if(!on&&using.length&&!confirm(`Remove mergeCraft? Review is turned off in ${using.join(', ')}. Runs already queued keep their settings.`)){e.target.checked=true;return;}
+  e.target.disabled=true;
+  try{const result=await api('/integrations',{method:'PUT',body:JSON.stringify({mergecraft:on})});
+    $('integration-result').textContent=on?'mergeCraft added. Turn review on per repository in Repositories → Configure.':`mergeCraft removed.${result.review_turned_off.length?' Review turned off in '+result.review_turned_off.join(', ')+'.':''}`;await refresh();}
+  catch(err){e.target.checked=!on;$('integration-result').textContent=err.message;}
+  finally{e.target.disabled=false;}
+});
+$('repo-watch-only').addEventListener('change',showLocalSettings);
+document.querySelectorAll('input[name=workflow-source]').forEach(el=>el.addEventListener('change',showWorkflowSource));
+$('add-file').addEventListener('change',()=>{const file=$('add-file').files[0];if(file&&!$('add-name').value)$('add-name').value=localName(file.name);});
+$('add-path').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('add-workflow-button').click();}});
+$('add-name').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('add-workflow-button').click();}});
+$('add-workflow-button').addEventListener('click',async()=>{const button=$('add-workflow-button');button.disabled=true;try{await addWorkflow();}catch(e){$('add-workflow-result').textContent=e.message;}finally{button.disabled=false;}});
 await refresh();const run=new URLSearchParams(location.search).get('run');if(run)await openRun(run);setInterval(refresh,5000);

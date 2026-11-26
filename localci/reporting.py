@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from localci.ci_report import evidence as ci_evidence
+from localci.policy import workflow_files
 from localci.results import BAD
 from localci.review_evidence import (
     REVIEW_THRESHOLDS,
@@ -33,7 +34,7 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
     result = {}
     # Parallel review can finish before CI. Publish each phase only after its
     # own configured checks are terminal, including blocked/skipped workflows.
-    expected = {Path(path).name for path in config.get("workflows", [])}
+    expected = set(workflow_files(config.get("workflows", [])).values())
     completed = {s["name"] for s in ci if s["state"] in TERMINAL}
     ci_complete = expected <= completed and all(s["state"] in TERMINAL for s in ci) and bool(ci)
     run_level = False

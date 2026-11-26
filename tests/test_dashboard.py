@@ -37,6 +37,8 @@ def client(tmp_path, monkeypatch):
     app = create_app(tmp_path, background=False)
     controller = app.state.controller
     controller.capacity = {"cpus": 32, "memory_gb": 125}
+    # An installation that has added mergeCraft in Settings.
+    controller.store.save_integrations({"mergecraft": True})
     controller.store.discover(
         [
             {

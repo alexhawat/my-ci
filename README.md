@@ -8,10 +8,11 @@ Self-hosted pull-request CI, optional mergeCraft reviews, and a private web dash
 
 - Polls open, non-draft, same-repository pull requests.
 - Shows the checks and statuses GitHub itself reports for every open PR (GitHub Actions and other integrations) next to the local result, including draft and fork PRs that do not run locally.
+- Watches a repository without running anything: **Just watch this repo** lists its PRs and their GitHub CI on the dashboard only.
 - Merges a PR from the dashboard through GitHub, bound to the commit you reviewed.
-- Runs selected Linux GitHub Actions workflows with pinned `act` compatibility fixes.
+- Runs selected Linux GitHub Actions workflows with pinned `act` compatibility fixes, from `.github/workflows/`, any other YAML file in the repository, or a file you upload or paste.
 - Supports matrices, parallel jobs, PostgreSQL services, browser tests, and artifacts.
-- Runs CI and mergeCraft review independently and in parallel.
+- Optionally adds mergeCraft AI review, run independently of CI and in parallel with it.
 - Publishes commit statuses, bounded CI comments, and native review summaries.
 - Encrypts locally configured credentials and redacts known values (and, on a best-effort basis, their common encodings) from logs and PR comments; CI artifacts are not redacted.
 - Provides cancellation, bounded retries, history, logs, artifacts, analytics, and backups.
@@ -64,7 +65,7 @@ tailscale serve --bg --https=9443 http://127.0.0.1:8787
 
 Set `LOCALCI_URL` to the complete external origin, including `:9443`; write requests reject a mismatched `Origin`. An alternative ingress must strip every client-supplied `Tailscale-User-Login` header and insert the authenticated identity itself. The application cannot distinguish a forged header from a trusted proxy on a multi-user host.
 
-Open the configured dashboard URL, select **Repositories → Configure**, choose CI workflows and/or review, add any required variables and credentials, and explicitly enable the repository. Repositories start disabled. The dashboard URL is included in public commit statuses and PR comments, so do not use a hostname you need to keep private.
+Open the configured dashboard URL, select **Repositories → Configure**, choose CI workflows, add any required variables and credentials, and explicitly enable the repository. Repositories start disabled. To see a repository's PRs and GitHub CI without running anything, tick **Just watch this repo** instead (see [Watching a repository](#watching-a-repository)). mergeCraft review appears in **Configure** once it is added under **Settings → Integrations**. The dashboard URL is included in public commit statuses and PR comments, so do not use a hostname you need to keep private.
 
 ## Configuration
 
@@ -102,7 +103,7 @@ Values are encrypted, write-only, and never imported automatically from GitHub A
 
 The optional host GitHub login grants CI jobs all permissions of that login; workflow YAML `permissions` does not narrow it under `act`. Leaving it disabled keeps the token out of CI jobs, but once `login.sh` has run the token file exists on the host, where PR code can read it regardless of the setting. Use a dedicated low-privilege GitHub account and token.
 
-For repository-scoped Check Runs, connect a GitHub App with Checks read/write permission and an RSA private key. App credentials are not passed to CI or review containers, but they are stored in the data volume, which host-root-equivalent PR code can read.
+Results reach GitHub as a `local-ci` commit status posted with the worker's GitHub login; no GitHub App is needed. To publish a `local-ci` Check Run instead, connect a GitHub App under **Settings → Reporting results to GitHub**. Any App you own works (it need not be a mergeCraft App, although one you already use for mergeCraft can be reused) if it has Checks read/write permission and is installed on the repository; repositories it is not installed on keep getting commit statuses. Provide its App ID and an RSA private key. **Disconnect App** deletes the stored credentials and goes back to commit statuses. App credentials are not passed to CI or review containers, but they are stored in the data volume, which host-root-equivalent PR code can read.
 
 Each provider in a trusted review roster needs its own review-scoped credential binding, using the provider's configured environment index or documented credential name. Credential changes apply to the next execution. A confirmed free-tier HTTP 429 rejection is recorded against its single pending request with zero charged tokens and can proceed to the next configured model with the same shared budget. Completed requests retain their usage; incomplete or ambiguous accounting still stops the review.
 
@@ -145,6 +146,22 @@ Git runs as the checkout's owner. The update fast-forwards only; a checkout with
 - `LOCALCI_UPDATE_REPO` and `LOCALCI_UPDATE_BRANCH` (optional): the repository whose latest commit is shown, default `alexhawat/my-ci`, and the branch to fetch from `origin`, default `main`.
 - `LOCALCI_SELF_UPDATE=0` turns the button off.
 
+### Settings and the mergeCraft add-on
+
+The **Settings** page holds the GitHub App described above and the optional integrations. mergeCraft review is an add-on: until it is added under **Settings → Integrations**, **Configure** shows no review options and the API refuses to turn review on. Installations that already review a repository with it keep it added. Removing it turns review off in every repository (queued runs keep their snapshot) and is refused while an enabled repository has nothing but review to run.
+
+The worker asks GitHub for open PRs every 60 seconds and for new repositories every 10 minutes. **Check GitHub now**, in the header, asks right away, for example after creating a repository. Runs never depend on it.
+
+### Workflow sources
+
+A selected workflow can come from:
+
+- `.github/workflows/` on the default branch, listed automatically;
+- any other YAML file in the repository, added by its path (such as `ci/pipeline.yml`) under **Configure → Add a workflow from any YAML file**. Like files in `.github/workflows/`, it is read from each PR's base commit;
+- a file you upload or YAML you paste there. It is stored on this worker as a local-only workflow named `local:<name>.yml`, never committed, and edited or deleted with **Edit local copy**. Deleting one also unselects it.
+
+Every source must be a GitHub Actions workflow with an `on: pull_request` trigger. A file that is missing from a PR's base commit, or a local workflow deleted after it was selected, blocks that workflow's check with a message instead of running something else. Each workflow runs under its file name; when two selected workflows share a name, later ones get `-2`, `-3` and so on.
+
 ### Workflow overrides
 
 **Repositories → Configure** includes a workflow editor. Saving creates a new local version that replaces the base-revision workflow file for that repository in later runs; the file must keep its `pull_request` trigger. Earlier versions stay viewable, each run records which version it used, and reverting returns to the file from the PR's base revision.
@@ -155,9 +172,13 @@ Base images are pinned by digest. The job image installs Chrome from Google's si
 
 ## GitHub CI and merging
 
-The **PRs** view shows two results for each open pull request. **Local CI** is the run on your worker. **GitHub CI** is what GitHub reports for the PR's head commit: GitHub Actions check runs and commit statuses from other integrations, with a link to each. The `local-ci` result this service publishes is left out of that column. GitHub CI is display only: it never starts, cancels or changes a local run. It is read with the worker's GitHub login (one GraphQL request per enabled repository, cached for 20 seconds) and covers the 200 most recently updated open PRs of a repository and the first 100 checks of each.
+The **PRs** view shows two results for each open pull request. **Local CI** is the run on your worker. **GitHub CI** is what GitHub reports for the PR's head commit: GitHub Actions check runs and commit statuses from other integrations, with a link to each. The `local-ci` result this service publishes is left out of that column. GitHub CI is display only: it never starts, cancels or changes a local run. It is read with the worker's GitHub login (one GraphQL request per enabled or watched repository, cached for 20 seconds) and covers the 200 most recently updated open PRs of a repository and the first 100 checks of each.
 
 **Merge** asks GitHub to merge the pull request as the worker's GitHub login, using the merge method you choose from those the repository allows. The request names the head commit shown in the dashboard, so GitHub refuses it if the PR has changed since. Local CI does not gate the button: the confirmation lists a local or GitHub result that is not green, and GitHub's branch protection, required checks and required reviews decide whether the merge is accepted. Draft PRs and PRs with merge conflicts cannot be merged from the dashboard. The login needs write access to the repository; anyone who can reach the dashboard can merge with it.
+
+### Watching a repository
+
+**Repositories → Configure → Just watch this repo** shows a repository's open and closed PRs and their GitHub CI on the **PRs** page without running anything locally: no runs are queued, nothing new is posted to GitHub, and it needs no workflow or credential. The repository stays disabled, so **Retry** and bulk reruns refuse it; **Merge** still works. Watching a repository that ran checks here cancels its active runs, as disabling does. Untick the box to run checks again; the earlier settings are kept.
 
 ## Review behavior
 
@@ -214,7 +235,7 @@ uv run ruff check .
 uv run ruff format --check .
 uv run pyright
 node --check localci/static/app.js
-node --test tests/test_history.mjs tests/test_selection.mjs
+node --test tests/test_history.mjs tests/test_selection.mjs tests/test_render.mjs
 ```
 
 Tests use temporary databases, synthetic workflow fixtures, and mocked GitHub endpoints. They do not require real repository credentials or paid model calls. Docker smoke scripts create local fixture repositories and should be run only in a suitable disposable Docker environment.

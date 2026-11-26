@@ -11,7 +11,7 @@ uv run ruff check .
 uv run ruff format --check .
 uv run pyright
 node --check localci/static/app.js
-node --test tests/test_history.mjs tests/test_selection.mjs
+node --test tests/test_history.mjs tests/test_selection.mjs tests/test_render.mjs
 ```
 
 Privacy release tests reject personal paths, non-public commit identities, common credential formats, concrete private IPv4/IPv6 and Tailscale addresses and hostnames (documented IPv6 ranges with an empty host part, such as `fd00::/8`, are allowed), the former private registry namespace, non-placeholder email addresses, and non-synthetic workflow fixtures without embedding a denylist of private names. Files and commit message bodies are both checked for personal paths, private network names and email addresses; the only allowed addresses are at example.com, example.org or example.net (and their subdomains), `users.noreply.github.com` addresses, `git@github.com`, and the `noreply@anthropic.com` co-author trailer. They also verify generic deployment defaults and configurable host labels.

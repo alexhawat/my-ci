@@ -247,6 +247,70 @@ class Store:
             raise KeyError(name)
         return rows[0]
 
+    def watched_repos(self) -> list[dict]:
+        """Repositories whose open PRs are synced and shown: those that run checks
+        locally (``enabled``) and those that are only watched. A watched-only repository
+        stays disabled, so every path that queues or retries a run refuses it."""
+        return [
+            repo
+            for repo in self.rows("SELECT * FROM repos ORDER BY name")
+            if repo["enabled"] or json.loads(repo["config"]).get("watch_only")
+        ]
+
+    def integrations(self) -> dict:
+        """Optional add-ons chosen in Settings. mergeCraft review is off until added,
+        except on an installation that already reviews a repository with it."""
+        rows = self.rows("SELECT value FROM settings WHERE key='integrations'")
+        value = json.loads(rows[0]["value"]) if rows else {}
+        if "mergecraft" not in value:
+            value["mergecraft"] = any(
+                json.loads(repo["config"]).get("review") for repo in self.rows("SELECT config FROM repos")
+            )
+        return value
+
+    def keep_integrations(self) -> dict:
+        """Record the add-ons before a repository change can alter what they derive from:
+        turning review off in the last repository must not remove mergeCraft too."""
+        value = self.integrations()
+        self.execute("INSERT OR IGNORE INTO settings VALUES('integrations',?)", (json.dumps(value),))
+        return value
+
+    def save_integrations(self, value: dict) -> list[str]:
+        """Store the add-ons. Removing mergeCraft turns its review off in every repository
+        (runs already queued keep their snapshot) and returns the repositories changed.
+        A running repository that has nothing but the review to run is refused instead,
+        so that removing an add-on never leaves it enabled with no checks."""
+        changed = []
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not value.get("mergecraft"):
+                repos = [
+                    (row["name"], row["enabled"], json.loads(row["config"]))
+                    for row in db.execute("SELECT name,enabled,config FROM repos ORDER BY name")
+                ]
+                review_only = [
+                    name
+                    for name, enabled, config in repos
+                    if enabled and config.get("review") and not config.get("workflows")
+                ]
+                if review_only:
+                    raise ValueError(
+                        f"{', '.join(review_only)} run only mergeCraft review. Select a CI workflow "
+                        "for them or turn them off in Repositories → Configure first."
+                    )
+                for name, _, config in repos:
+                    if config.get("review"):
+                        db.execute(
+                            "UPDATE repos SET config=? WHERE name=?",
+                            (json.dumps({**config, "review": False}), name),
+                        )
+                        changed.append(name)
+            db.execute(
+                "INSERT INTO settings VALUES('integrations',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(value),),
+            )
+        return changed
+
     def enqueue(
         self,
         repo: str,
