@@ -7,8 +7,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from localci.agent_operations import persist_repo_config, retry_pull_request_run
 from localci.dashboard import enrich_run
-from localci.policy import eligible
 
 FORBIDDEN_KEYS = frozenset(
     {
@@ -158,42 +158,7 @@ class AgentService:
 
     async def rerun(self, run_id: str) -> dict:
         self._need("write-runs")
-        rows = self.controller.store.rows("SELECT * FROM runs WHERE id=?", (run_id,))
-        if not rows:
-            raise HTTPException(404, "Unknown run")
-        run = rows[0]
-        repo = self.controller.store.repo(run["repo"])
-        if not repo["enabled"]:
-            raise HTTPException(400, "Enable the repository before retrying")
-        pr = await self.controller.github.request("GET", f"repos/{run['repo']}/pulls/{run['pr']}")
-        if not eligible(pr, run["repo"]):
-            raise HTTPException(400, "Only open, non-draft, same-repository PRs can run")
-        import asyncio
-        from functools import partial
-
-        from localci.app import BOT_HOLD
-        from localci.policy import bot_pr
-        from localci.store import RetryLimitReached, RevisionChanged
-
-        config = json.loads(self.controller.store.repo(run["repo"])["config"])
-        try:
-            new_id = await asyncio.to_thread(
-                partial(
-                    self.controller.store.enqueue,
-                    run["repo"],
-                    pr,
-                    config,
-                    retry=True,
-                    require_enabled=True,
-                    bot_hold=BOT_HOLD if bot_pr(pr) else None,
-                    reviewed=(run["head"], run["base"]),
-                )
-            )
-        except (RetryLimitReached, RevisionChanged) as exc:
-            raise HTTPException(409, str(exc)) from None
-        if new_id is None and not self.controller.store.repo(run["repo"])["enabled"]:
-            raise HTTPException(400, "Enable the repository before retrying")
-        self.controller.notify()
+        new_id = await retry_pull_request_run(self.controller, run_id)
         return self.public_view({"id": new_id})
 
     def set_repo_review(
@@ -209,30 +174,16 @@ class AgentService:
         except KeyError:
             raise HTTPException(404, "Unknown repository") from None
         config = json.loads(record["config"])
-        mergecraft = self.controller.store.integrations().get("mergecraft")
-        if review is True and not mergecraft:
-            raise HTTPException(400, "Add mergeCraft review in Settings before turning it on")
         if enabled is not None:
             config["enabled"] = enabled
         if review is not None:
             config["review"] = review
         if config.get("watch_only") and config.get("enabled"):
             raise HTTPException(400, "Cannot enable execution while watch-only is set")
-        if config.get("enabled") and not config.get("workflows") and not config.get("review"):
-            raise HTTPException(400, "Select at least one CI workflow or mergeCraft review")
         from localci.app import RepoConfig
 
         parsed = RepoConfig(**config)
-        self.controller.store.execute(
-            "UPDATE repos SET enabled=?,config=? WHERE name=?",
-            (int(parsed.enabled), parsed.model_dump_json(), name),
-        )
-        if not parsed.enabled:
-            for row in self.controller.store.rows(
-                "SELECT id FROM runs WHERE repo=? AND state IN ('queued','running')", (name,)
-            ):
-                self.controller.store.request_cancel(row["id"], "repo_disabled", "Repository disabled")
-        self.controller.notify()
+        persist_repo_config(self.controller, name, parsed)
         return self.public_view({"name": name, "enabled": parsed.enabled, "review": parsed.review})
 
     def _run_summary(self, run: dict) -> dict:

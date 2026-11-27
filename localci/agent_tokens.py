@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import time
@@ -19,6 +20,8 @@ from mcp.server.auth.provider import AccessToken
 VALID_SCOPES = frozenset({"read", "write-config", "write-runs"})
 AuditAction = Literal["auth", "read", "write", "denied"]
 TOKEN_RE = re.compile(r"^mci_([0-9a-f]{32})\.([A-Za-z0-9_-]+)$")
+DEFAULT_AUDIT_RETENTION_DAYS = 30
+DEFAULT_AUDIT_MAX_ROWS = 10_000
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,26 @@ class AgentTokenStore:
             "INSERT INTO agent_token_audit(token_id,timestamp,action,path,detail) VALUES(?,?,?,?,?)",
             (token_id, time.time(), action, path[:200], detail[:500]),
         )
+        self._prune_audit()
+
+    def _prune_audit(self) -> None:
+        days = int(os.environ.get("LOCALCI_AGENT_AUDIT_RETENTION_DAYS", DEFAULT_AUDIT_RETENTION_DAYS))
+        max_rows = int(os.environ.get("LOCALCI_AGENT_AUDIT_MAX_ROWS", DEFAULT_AUDIT_MAX_ROWS))
+        if days > 0:
+            self.store.execute(
+                "DELETE FROM agent_token_audit WHERE timestamp < ?",
+                (time.time() - days * 86400,),
+            )
+        if max_rows <= 0:
+            return
+        (row,) = self.store.rows("SELECT COUNT(*) AS n FROM agent_token_audit")
+        excess = row["n"] - max_rows
+        if excess > 0:
+            self.store.execute(
+                "DELETE FROM agent_token_audit WHERE id IN "
+                "(SELECT id FROM agent_token_audit ORDER BY id ASC LIMIT ?)",
+                (excess,),
+            )
 
     def _public_row(self, token_id: str) -> dict:
         (row,) = self.store.rows(

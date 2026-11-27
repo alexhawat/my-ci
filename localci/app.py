@@ -4,7 +4,6 @@ import os
 import re
 import shutil
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path
 from typing import Literal
 
@@ -17,14 +16,13 @@ from pydantic import BaseModel, Field, field_validator
 from localci.agent_api import register_agent_api
 from localci.agent_dashboard import register_agent_dashboard
 from localci.agent_mcp import build_mcp_app
+from localci.agent_operations import persist_repo_config, retry_pull_request_run
 from localci.agent_tokens import token_store_from_controller
 from localci.controller import Controller
 from localci.dashboard import enrich_run, register_dashboard
 from localci.github import GitHubError, app_jwt
 from localci.policy import (
-    BOT_HOLD,
     WORKFLOW_PATH_HELP,
-    bot_pr,
     eligible,
     is_local_workflow,
     is_pr_workflow,
@@ -32,7 +30,6 @@ from localci.policy import (
     valid_workflow_path,
     workflow,
 )
-from localci.store import RetryLimitReached, RevisionChanged
 
 ROOT = Path(os.environ.get("LOCALCI_DATA", "/data"))
 
@@ -109,8 +106,10 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
         raise ValueError("Execution is a separate service; run python -m localci.worker")
     controller = Controller(root)
     token_store = token_store_from_controller(controller)
+
     def addon_enabled() -> bool:
         return bool(controller.store.integrations().get("agent_access", False))
+
     mcp_asgi, mcp_sessions = build_mcp_app(controller, token_store, addon_enabled)
 
     @asynccontextmanager
@@ -128,6 +127,8 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
         expected = os.environ.get("LOCALCI_TAILSCALE_LOGIN", "")
         if request.url.path != "/healthz":
             agent = _agent_path(request.url.path)
+            if agent and not addon_enabled():
+                return JSONResponse({"detail": "Agent access is disabled"}, status_code=404)
             if not agent:
                 if (
                     not expected
@@ -325,25 +326,7 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
             raise HTTPException(
                 400, "Just watch this repo runs nothing locally; turn it off to run PR checks here"
             )
-        mergecraft = controller.store.keep_integrations()["mergecraft"]
-        if config.review and not mergecraft:
-            raise HTTPException(
-                400, "Add mergeCraft review in Settings before turning it on for a repository"
-            )
-        if config.enabled and not config.workflows and not config.review:
-            raise HTTPException(
-                400, "Select at least one CI workflow" + (" or mergeCraft review" if mergecraft else "")
-            )
-        controller.store.execute(
-            "UPDATE repos SET enabled=?,config=? WHERE name=?",
-            (int(config.enabled), config.model_dump_json(), name),
-        )
-        if not config.enabled:
-            for row in controller.store.rows(
-                "SELECT id FROM runs WHERE repo=? AND state IN ('queued','running')", (name,)
-            ):
-                controller.store.request_cancel(row["id"], "repo_disabled", "Repository disabled")
-        controller.notify()
+        persist_repo_config(controller, name, config)
         return {"ok": True}
 
     @app.put("/api/repos/{owner}/{repo}/secrets")
@@ -458,38 +441,8 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
 
     @app.post("/api/runs/{rid}/retry")
     async def retry(rid: str):
-        run = get_run(rid)
-        repo = controller.store.repo(run["repo"])
-        if not repo["enabled"]:
-            raise HTTPException(400, "Enable the repository before retrying")
-        pr = await controller.github.request("GET", f"repos/{run['repo']}/pulls/{run['pr']}")
-        if not eligible(pr, run["repo"]):
-            raise HTTPException(400, "Only open, non-draft, same-repository PRs can run")
-        # Settings may have changed while this request waited on GitHub: use the current
-        # configuration for the new run. The enabled flag and the bot-PR gate are checked
-        # again inside the enqueue transaction.
-        config = json.loads(controller.store.repo(run["repo"])["config"])
-        try:
-            new_id = await asyncio.to_thread(
-                partial(
-                    controller.store.enqueue,
-                    run["repo"],
-                    pr,
-                    config,
-                    retry=True,
-                    require_enabled=True,
-                    # Starting a held bot PR is the operator's approval of one exact revision.
-                    # A retry runs the PR's current head, so it is refused when that is not
-                    # the revision of the run being retried.
-                    bot_hold=BOT_HOLD if bot_pr(pr) else None,
-                    reviewed=(run["head"], run["base"]),
-                )
-            )
-        except (RetryLimitReached, RevisionChanged) as exc:
-            raise HTTPException(409, str(exc)) from None
-        if new_id is None and not controller.store.repo(run["repo"])["enabled"]:
-            raise HTTPException(400, "Enable the repository before retrying")
-        controller.notify()
+        get_run(rid)
+        new_id = await retry_pull_request_run(controller, rid)
         return {"id": new_id}
 
     register_dashboard(app, controller, repo_name, get_run)

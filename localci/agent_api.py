@@ -17,6 +17,14 @@ class AgentRepoPatch(BaseModel):
     review: bool | None = None
 
 
+def _require_addon(addon_enabled):
+    def _check() -> None:
+        if not addon_enabled():
+            raise HTTPException(404, "Agent access is disabled")
+
+    return _check
+
+
 def _bearer(authorization: Annotated[str | None, Header()] = None) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Bearer token required")
@@ -24,11 +32,9 @@ def _bearer(authorization: Annotated[str | None, Header()] = None) -> str:
 
 
 def register_agent_api(main_app, controller, token_store: AgentTokenStore, *, addon_enabled) -> None:
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(_require_addon(addon_enabled))])
 
     async def require_token(raw: str = Depends(_bearer)) -> VerifiedToken:
-        if not addon_enabled():
-            raise HTTPException(404, "Agent access is disabled")
         verified = await token_store.verify_async(raw)
         if not verified:
             token_store.audit("anonymous", "denied", "api", "invalid token")
@@ -125,9 +131,9 @@ def register_agent_api(main_app, controller, token_store: AgentTokenStore, *, ad
         title="my-ci Agent API",
         version="1.0.0",
         description="Tailnet-only programmatic access to my-ci. Authenticate with `Authorization: Bearer <token>`.",
-        openapi_url="/openapi.json",
-        docs_url="/docs",
+        docs_url=None,
         redoc_url=None,
+        openapi_url=None,
     )
     agent_app.include_router(router)
     main_app.mount("/api/agent/v1", agent_app)

@@ -1,5 +1,8 @@
 import asyncio
 import json
+import sqlite3
+import time
+from unittest.mock import AsyncMock
 from urllib.parse import urlparse
 
 import pytest
@@ -133,6 +136,16 @@ def test_addon_disabled_returns_404(tmp_path, monkeypatch):
         assert http.get("/api/agent/v1/repos").status_code == 404
 
 
+def test_addon_disabled_without_bearer_returns_404(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_TAILSCALE_LOGIN", "owner@example.com")
+    app = create_app(tmp_path, background=False)
+    controller = app.state.controller
+    controller.store.save_integrations({"agent_access": False})
+    with TestClient(app) as http:
+        assert http.get("/api/agent/v1/repos").status_code == 404
+        assert http.get("/api/agent/v1/openapi.json").status_code == 404
+
+
 def test_scope_enforcement(env):
     http, controller, raw, token_store = env
     read_only, _ = token_store.create("read", ["read"])
@@ -149,9 +162,10 @@ def test_api_repos_and_queue(env):
     assert "queued" in queue and "running" in queue
 
 
-def test_openapi_available(env):
+def test_agent_openapi_not_exposed(env):
     http, controller, raw, token_store = env
-    assert http.get("/api/agent/v1/openapi.json").status_code == 200
+    assert http.get("/api/agent/v1/openapi.json").status_code == 404
+    assert http.get("/api/agent/v1/docs").status_code == 404
 
 
 def test_no_secret_leak_in_agent_payloads(env):
@@ -251,6 +265,132 @@ async def test_verify_async_delegates_to_thread(monkeypatch, tmp_path):
     verified = await token_store.verify_async(raw)
     assert verified is not None
     assert verified.name == "async"
+
+
+def test_expired_token_rejected(env):
+    http, controller, raw, token_store = env
+    meta = token_store.list_tokens()[0]
+    token_store.store.execute(
+        "UPDATE agent_tokens SET expires_at=? WHERE id=?",
+        (time.time() - 60, meta["id"]),
+    )
+    assert token_store.verify(raw) is None
+    assert http.get("/api/agent/v1/repos", headers=agent_headers(raw)).status_code == 401
+
+
+def test_revoke_via_dashboard_then_api_401(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_TAILSCALE_LOGIN", "owner@example.com")
+    app = create_app(tmp_path, background=False)
+    controller = app.state.controller
+    controller.store.save_integrations({"agent_access": True})
+    token_store = token_store_from_controller(controller)
+    raw, meta = token_store.create("rev", ["read"])
+    dash = {
+        "Tailscale-User-Login": "owner@example.com",
+        "Origin": controller.base_url,
+    }
+    with TestClient(app, headers=dash) as http:
+        assert http.delete(f"/api/agent-tokens/{meta['id']}").status_code == 200
+        assert http.get("/api/agent/v1/repos", headers=agent_headers(raw)).status_code == 401
+
+
+def test_write_config_scope_patch_allowed_and_denied(env):
+    http, controller, raw, token_store = env
+    writer, _ = token_store.create("cfg", ["write-config"])
+    read_only, _ = token_store.create("ro", ["read"])
+    assert (
+        http.patch(
+            "/api/agent/v1/repos/o/r",
+            headers=agent_headers(writer),
+            json={"enabled": True},
+        ).status_code
+        == 200
+    )
+    assert (
+        http.patch(
+            "/api/agent/v1/repos/o/r",
+            headers=agent_headers(read_only),
+            json={"review": False},
+        ).status_code
+        == 403
+    )
+
+
+def test_write_runs_retry_allowed(env):
+    http, controller, raw, token_store = env
+    controller.github.request = AsyncMock(return_value=_pr())
+    rid = controller.store.enqueue("o/r", _pr(), {"workflows": [".github/workflows/ci.yml"]})
+    assert http.post(f"/api/agent/v1/runs/{rid}/retry", headers=agent_headers(raw)).status_code == 200
+
+
+def test_write_runs_denied_without_scope(env):
+    http, controller, raw, token_store = env
+    cfg_only, _ = token_store.create("cfg", ["write-config"])
+    rid = controller.store.enqueue("o/r", _pr(), {"workflows": []})
+    assert http.post(f"/api/agent/v1/runs/{rid}/retry", headers=agent_headers(cfg_only)).status_code == 403
+
+
+def test_mcp_tool_call_list_repos(env):
+    http, controller, raw, token_store = env
+    headers = mcp_headers(controller, raw)
+    assert http.post("/agent/mcp/", json=_MCP_INIT, headers=headers).status_code == 200
+    call = http.post(
+        "/agent/mcp/",
+        json={
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "list_repos", "arguments": {}},
+        },
+        headers=headers,
+    )
+    assert call.status_code == 200
+    payload = json.loads(call.json()["result"]["content"][0]["text"])
+    assert payload and payload[0]["name"] == "o/r"
+
+
+def test_integrations_toggle_preserves_mergecraft(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_TAILSCALE_LOGIN", "owner@example.com")
+    app = create_app(tmp_path, background=False)
+    controller = app.state.controller
+    controller.store.save_integrations({"mergecraft": True, "agent_access": True})
+    dash = {"Tailscale-User-Login": "owner@example.com", "Origin": controller.base_url}
+    with TestClient(app, headers=dash) as http:
+        body = http.put("/api/integrations", json={"agent_access": False}).json()
+    assert body["integrations"]["mergecraft"] is True
+    assert body["integrations"]["agent_access"] is False
+
+
+def test_v6_migration_revokes_legacy_salted_tokens(tmp_path):
+    from localci.store import Store
+
+    path = tmp_path / "localci.db"
+    store = Store(path)
+    store.close()
+    created = time.time()
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA user_version=5")
+        db.execute(
+            "INSERT INTO agent_tokens VALUES(?,?,?,?,?,?,?,?,NULL)",
+            ("legacy", "old", '["read"]', "salted", "deadbeef", created, None, None),
+        )
+        db.commit()
+    Store(path)
+    row = Store(path).rows("SELECT revoked_at FROM agent_tokens WHERE id='legacy'")[0]
+    assert row["revoked_at"] is not None
+
+
+def test_audit_retention_caps_rows(monkeypatch, tmp_path):
+    from localci.store import Store
+
+    monkeypatch.setenv("LOCALCI_AGENT_AUDIT_MAX_ROWS", "5")
+    monkeypatch.setenv("LOCALCI_AGENT_AUDIT_RETENTION_DAYS", "3650")
+    store = Store(tmp_path / "db")
+    token_store = AgentTokenStore(store, b"pepper" * 4)
+    for i in range(12):
+        token_store.audit(f"id{i}", "read", "/p", "")
+    count = store.rows("SELECT COUNT(*) AS n FROM agent_token_audit")[0]["n"]
+    assert count == 5
 
 
 def test_agent_path_skips_tailscale_login(tmp_path, monkeypatch):
