@@ -320,6 +320,7 @@ def test_write_runs_retry_allowed(env):
     http, controller, raw, token_store = env
     controller.github.request = AsyncMock(return_value=_pr())
     rid = controller.store.enqueue("o/r", _pr(), {"workflows": [".github/workflows/ci.yml"]})
+    controller.store.finish(rid, "failure", "fixture")
     assert http.post(f"/api/agent/v1/runs/{rid}/retry", headers=agent_headers(raw)).status_code == 200
 
 
