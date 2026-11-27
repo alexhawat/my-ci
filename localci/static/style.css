@@ -31,3 +31,14 @@
 input[type=radio]{accent-color:var(--green);width:15px;height:15px;margin:0;padding:0}
 .source-picker label>input[type=radio]{display:inline-block;width:15px;margin:0}
 .panel>h3:first-child{margin-top:0}
+
+#pipeline-graph {display:grid;gap:12px;margin:14px 0}
+.pipeline-row {border-left:3px solid var(--green);padding:4px 12px}
+.pipeline-heading,.pipeline-chain {display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pipeline-heading {margin-bottom:8px}
+.pipeline-heading .button {padding:3px 8px}
+.pipeline-node {display:grid;gap:3px;text-align:left;min-width:120px;max-width:100%;overflow-wrap:anywhere}
+.pipeline-node small {color:var(--muted)}
+#base-credentials {margin-top:20px}
+#slot-editor {width:min(480px,92vw)}
+#slot-error {color:var(--warning-text)}

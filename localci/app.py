@@ -10,9 +10,11 @@ from typing import Literal
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from localci.controller import Controller
 from localci.dashboard import enrich_run, register_dashboard
@@ -28,6 +30,7 @@ from localci.policy import (
     valid_workflow_path,
     workflow,
 )
+from localci.review_pipeline import ReviewChain, validate_pipeline
 from localci.store import RetryLimitReached, RevisionChanged
 
 ROOT = Path(os.environ.get("LOCALCI_DATA", "/data"))
@@ -46,6 +49,10 @@ class RepoConfig(BaseModel):
     timeout: int = Field(default=7200, ge=60, le=14400)
     review_timeout: int = Field(default=3000, ge=60, le=3000)
     review_token_ceiling: int | None = Field(default=None, strict=True, ge=1, le=100_000_000)
+    review_pipeline: list[ReviewChain] = Field(default_factory=list, max_length=16)
+    review_key_updates: dict[str, SecretStr] = Field(default_factory=dict, exclude=True)
+    _pipeline = field_validator("review_pipeline")(validate_pipeline)
+
     # Bot-authored PRs carry third-party content; they wait for an operator unless enabled.
     run_bot_prs: bool = False
 
@@ -103,6 +110,14 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.controller = controller
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        if isinstance(exc.body, dict) and "review_key_updates" in exc.body:
+            # FastAPI normally echoes the rejected input, including malformed private values.
+            details = [{"loc": error["loc"], "msg": error["msg"]} for error in exc.errors()]
+            return JSONResponse({"detail": details}, status_code=422)
+        return await request_validation_exception_handler(request, exc)
 
     @app.middleware("http")
     async def access(request: Request, call_next):
@@ -303,19 +318,50 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
             raise HTTPException(
                 400, "Just watch this repo runs nothing locally; turn it off to run PR checks here"
             )
-        mergecraft = controller.store.keep_integrations()["mergecraft"]
-        if config.review and not mergecraft:
-            raise HTTPException(
-                400, "Add mergeCraft review in Settings before turning it on for a repository"
+        controller.store.keep_integrations()
+        with controller.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            active = json.loads(
+                db.execute("SELECT value FROM settings WHERE key='integrations'").fetchone()[0]
             )
-        if config.enabled and not config.workflows and not config.review:
-            raise HTTPException(
-                400, "Select at least one CI workflow" + (" or mergeCraft review" if mergecraft else "")
+            if config.review and not active["mergecraft"]:
+                raise HTTPException(
+                    400, "Add mergeCraft review in Settings before turning it on for a repository"
+                )
+            if config.enabled and not config.workflows and not config.review:
+                raise HTTPException(
+                    400,
+                    "Select at least one CI workflow"
+                    + (" or mergeCraft review" if active["mergecraft"] else ""),
+                )
+            current = json.loads(db.execute("SELECT config FROM repos WHERE name=?", (name,)).fetchone()[0])
+            saved = config.model_dump()
+            if "review_pipeline" not in config.model_fields_set:
+                saved["review_pipeline"] = current.get("review_pipeline", [])
+            if not active["mergecraft"] and (
+                config.review_key_updates or saved["review_pipeline"] != current.get("review_pipeline", [])
+            ):
+                raise HTTPException(400, "Enable the mergeCraft integration to edit its pipeline")
+            keys = {slot["credential"] for chain in saved["review_pipeline"] for slot in chain}
+            for key, secret_value in config.review_key_updates.items():
+                raw = secret_value.get_secret_value()
+                if key not in keys or not raw.strip() or len(raw) > 20000 or any(c in raw for c in "\0\n\r"):
+                    raise HTTPException(
+                        400, "Enter a single-line API key for a credential used in the pipeline"
+                    )
+                db.execute(
+                    "INSERT INTO secrets VALUES(?,?,?) ON CONFLICT(repo,name) DO UPDATE SET ciphertext=excluded.ciphertext",
+                    (name, f"review:{key}", controller.cipher.encrypt(raw.encode()).decode()),
+                )
+            if "review_pipeline" in config.model_fields_set:
+                existing = {row[0] for row in db.execute("SELECT name FROM secrets WHERE repo=?", (name,))}
+                for key in sorted(keys):
+                    if f"review:{key}" not in existing:
+                        raise HTTPException(400, f"Enter a private value for {key}")
+            db.execute(
+                "UPDATE repos SET enabled=?,config=? WHERE name=?",
+                (int(config.enabled), json.dumps(saved), name),
             )
-        controller.store.execute(
-            "UPDATE repos SET enabled=?,config=? WHERE name=?",
-            (int(config.enabled), config.model_dump_json(), name),
-        )
         if not config.enabled:
             for row in controller.store.rows(
                 "SELECT id FROM runs WHERE repo=? AND state IN ('queued','running')", (name,)
@@ -340,9 +386,17 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
 
     @app.delete("/api/repos/{owner}/{repo}/secrets/{scope}/{name}")
     def delete_secret(owner: str, repo: str, scope: str, name: str):
-        controller.store.execute(
-            "DELETE FROM secrets WHERE repo=? AND name=?", (repo_name(owner, repo), f"{scope}:{name}")
-        )
+        repository = repo_name(owner, repo)
+        with controller.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if scope == "review":
+                row = db.execute("SELECT config FROM repos WHERE name=?", (repository,)).fetchone()
+                chains = json.loads(row[0]).get("review_pipeline", [])
+                if any(slot["credential"] == name for chain in chains for slot in chain):
+                    raise HTTPException(
+                        409, "Save the pipeline with a replacement credential before deleting this key"
+                    )
+            db.execute("DELETE FROM secrets WHERE repo=? AND name=?", (repository, f"{scope}:{name}"))
         return {"ok": True}
 
     @app.post("/api/sync")
