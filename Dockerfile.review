@@ -71,3 +71,9 @@ RUN python /tmp/localci-citation-patch.py && rm /tmp/localci-citation-patch.py
 COPY patches/test_review_loop.py /opt/localci/test_review_loop.py
 RUN --network=none python /opt/localci/test_review_loop.py
 RUN --network=none python /opt/localci/test_opencode_fallback.py
+
+COPY --chmod=0644 patches/localci_review_pipeline.py /opt/mergecraft/src/mergecraft/localci_review_pipeline.py
+COPY patches/mergecraft_review_pipeline.patch /tmp/localci-review-pipeline.patch
+RUN git -C /opt/mergecraft apply --no-index /tmp/localci-review-pipeline.patch && rm /tmp/localci-review-pipeline.patch
+COPY patches/test_review_pipeline_image.py /opt/localci/test_review_pipeline_image.py
+RUN --network=none python /opt/localci/test_review_pipeline_image.py

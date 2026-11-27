@@ -9,9 +9,11 @@ from typing import Literal
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from localci.agent_api import register_agent_api
 from localci.agent_dashboard import register_agent_dashboard
@@ -30,6 +32,7 @@ from localci.policy import (
     valid_workflow_path,
     workflow,
 )
+from localci.review_pipeline import ReviewChain, validate_pipeline
 
 ROOT = Path(os.environ.get("LOCALCI_DATA", "/data"))
 
@@ -47,6 +50,10 @@ class RepoConfig(BaseModel):
     timeout: int = Field(default=7200, ge=60, le=14400)
     review_timeout: int = Field(default=3000, ge=60, le=3000)
     review_token_ceiling: int | None = Field(default=None, strict=True, ge=1, le=100_000_000)
+    review_pipeline: list[ReviewChain] = Field(default_factory=list, max_length=16)
+    review_key_updates: dict[str, SecretStr] = Field(default_factory=dict, exclude=True)
+    _pipeline = field_validator("review_pipeline")(validate_pipeline)
+
     # Bot-authored PRs carry third-party content; they wait for an operator unless enabled.
     run_bot_prs: bool = False
 
@@ -121,6 +128,14 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.controller = controller
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        if isinstance(exc.body, dict) and "review_key_updates" in exc.body:
+            # FastAPI normally echoes the rejected input, including malformed private values.
+            details = [{"loc": error["loc"], "msg": error["msg"]} for error in exc.errors()]
+            return JSONResponse({"detail": details}, status_code=422)
+        return await request_validation_exception_handler(request, exc)
 
     @app.middleware("http")
     async def access(request: Request, call_next):
@@ -345,9 +360,17 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
 
     @app.delete("/api/repos/{owner}/{repo}/secrets/{scope}/{name}")
     def delete_secret(owner: str, repo: str, scope: str, name: str):
-        controller.store.execute(
-            "DELETE FROM secrets WHERE repo=? AND name=?", (repo_name(owner, repo), f"{scope}:{name}")
-        )
+        repository = repo_name(owner, repo)
+        with controller.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if scope == "review":
+                row = db.execute("SELECT config FROM repos WHERE name=?", (repository,)).fetchone()
+                chains = json.loads(row[0]).get("review_pipeline", [])
+                if any(slot["credential"] == name for chain in chains for slot in chain):
+                    raise HTTPException(
+                        409, "Save the pipeline with a replacement credential before deleting this key"
+                    )
+            db.execute("DELETE FROM secrets WHERE repo=? AND name=?", (repository, f"{scope}:{name}"))
         return {"ok": True}
 
     @app.post("/api/sync")
