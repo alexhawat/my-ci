@@ -40,6 +40,7 @@ from localci.review_evidence import (
     primary_findings,
     terminal_event,
 )
+from localci.review_pipeline import configure_pipeline
 from localci.store import Store
 from localci.telemetry import sample_resources
 
@@ -1529,6 +1530,9 @@ class Runner:
                         # the trusted base budget; never load this from the PR head.
                         token_ceiling = config.get("review_token_ceiling")
                         try:
+                            provider_env, routes = configure_pipeline(
+                                review_config, config.get("review_pipeline", []), review_secrets
+                            )
                             apply_review_token_ceiling(review_config, token_ceiling)
                         except ValueError as exc:
                             blockers.append(str(exc))
@@ -1550,6 +1554,8 @@ class Runner:
                         review_config["modeInstructions"] = instructions
                         review_control = work / "review-control"
                         review_control.mkdir()
+                        if routes:
+                            (review_control / "local-review-pipeline").write_text(json.dumps(routes))
                         shutil.copyfile(
                             Path(__file__).with_name("review_bootstrap.py"),
                             review_control / "review-bootstrap.py",
@@ -1573,7 +1579,7 @@ class Runner:
                         (work / "review-env").write_text(
                             docker_env_file(
                                 {
-                                    **review_secrets,
+                                    **provider_env,
                                     "LOCALCI_PROFILE_PATH": "/tmp/mergecraft-profile.jsonl",
                                     "MERGECRAFT_NONINTERACTIVE": "1",
                                     "MERGECRAFT_ENV": "/dev/null",

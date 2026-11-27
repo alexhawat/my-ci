@@ -452,3 +452,68 @@ async def test_runner_uses_local_and_repository_workflows_under_unique_names(tmp
     assert "Using local workflow v1: local:ci.yml (uploaded or pasted here)" in log
     # Reports wait for exactly these check names before calling CI complete.
     assert reports(row, runner.root, store, [])["ci"]["state"] == "blocked"
+
+
+def test_edit_review_pipeline_atomic_credentials_and_snapshots(client):
+    http, c = client
+    endpoint = "/api/repos/o/r"
+    first = {"label": "General", "model": "anthropic/claude-sonnet", "credential": "GENERAL_API_KEY"}
+    backup = {"label": "Backup", "model": "openai/gpt-5.3-codex", "credential": "BACKUP_API_KEY"}
+    key = "fixture-only-pipeline-key"
+    config = {"review_pipeline": [[first, backup], [backup]], "review_key_updates": {"GENERAL_API_KEY": key}}
+    assert http.put(endpoint, json=config).status_code == 400
+    http.put("/api/integrations", json={"mergecraft": True}).raise_for_status()
+    assert http.put(endpoint, json=config).status_code == 400
+    assert c.secrets("o/r", "review") == {}  # The missing second key rolls back the first write.
+    config["review_key_updates"]["BACKUP_API_KEY"] = "fixture-only-backup"
+    http.put(endpoint, json=config).raise_for_status()
+    persisted = json.loads(c.store.repo("o/r")["config"])
+    assert persisted["review_pipeline"] == config["review_pipeline"]
+    assert "review_key_updates" not in persisted
+    assert key not in http.get("/api/state").text
+    assert key not in str(c.store.rows("SELECT ciphertext FROM secrets"))
+    assert c.secrets("o/r", "review")["GENERAL_API_KEY"] == key and not c.secrets("o/r", "ci")
+    rid = c.store.enqueue("o/r", pr(), persisted)
+    http.put(endpoint, json={"review_pipeline": [[{**backup, "label": "New primary"}]]}).raise_for_status()
+    snapshot = json.loads(c.store.rows("SELECT config FROM runs WHERE id=?", (rid,))[0]["config"])
+    assert snapshot["review_pipeline"] == persisted["review_pipeline"]
+    assert http.delete(endpoint + "/secrets/review/BACKUP_API_KEY").status_code == 409
+    malformed = http.put(endpoint, json={"review_key_updates": {"BACKUP_API_KEY": {"invalid": key}}})
+    assert malformed.status_code == 422 and key not in malformed.text
+    # An older client saving generic settings retains the new pipeline.
+    http.put(endpoint, json={"workflows": ["ci/a.yml"]}).raise_for_status()
+    assert json.loads(c.store.repo("o/r")["config"])["review_pipeline"][0][0]["label"] == "New primary"
+    assert http.put(endpoint, json={"review_pipeline": [[{**first, "label": " "}]]}).status_code == 422
+    assert http.put(endpoint, json={"review_pipeline": [[first] * 4]}).status_code == 422
+
+
+def test_pipeline_targets_and_trusted_policy():
+    from copy import deepcopy
+
+    from localci.review_pipeline import configure_pipeline
+
+    agents = {"old": {"role": "reviewer"}, "verifier": {"budget": 500}}
+    base = {
+        "agents": agents,
+        "review": {"ignorePaths": ["docs/**"]},
+        "providers": [{"label": "opencode-go", "envIndex": 3}],
+    }
+    original = deepcopy(base)
+    keys = {"GENERAL_API_KEY": "fixture-only-one", "BACKUP_API_KEY": "fixture-only-two", "OTHER": "unused"}
+    assert configure_pipeline(base, [], keys) == (keys, {}) and base == original
+    a = {"label": "General", "model": "anthropic/claude-sonnet", "credential": "GENERAL_API_KEY"}
+    b = {"label": "Backup", "model": "opencode-go/deepseek-v4.1-flash", "credential": "BACKUP_API_KEY"}
+    env, routes = configure_pipeline(base, [[a, b], [b]], keys)
+    assert env["ANTHROPIC_API_KEY"] == keys["GENERAL_API_KEY"]
+    assert env["LLM_PROVIDER_3_API_KEY"] == keys["BACKUP_API_KEY"]
+    assert "OTHER" not in env
+    assert env[routes["reviewer-2"][0]["source"]] == keys["BACKUP_API_KEY"]
+    assert base["models"] == [a["model"], b["model"]] and base["allowFallback"] and not base["modelPin"]
+    assert base["agents"]["reviewer-2"] == {
+        "role": "reviewer",
+        "modelChain": [b["model"]],
+        "required": True,
+        "after": "reviewer",
+    }
+    assert base["agents"]["verifier"] == agents["verifier"] and "old" not in base["agents"]
+    assert base["review"] == original["review"]

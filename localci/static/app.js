@@ -1,5 +1,6 @@
 import {historyColumns, historyRows} from './history.mjs';
 import {availableForRerun, selectedPRs, retrySelected} from './selection.mjs';
+import {pipelineEditor} from './pipeline.mjs';
 import {replaceHTML} from './render.mjs';
 const $ = id => document.getElementById(id);
 let state = {repos: [], runs: [], execution: {}}, selectedRepo = null, selectedRun = null;
@@ -18,6 +19,7 @@ function duration(r) {return r.started ? elapsed((r.finished||Date.now()/1000)-r
 let workerError='';
 let mergeTarget=null;
 const openChecks=new Set();
+const pipeline = pipelineEditor({get:$, escape:esc});
 function notice(message) {if($('settings').open) $('settings-error').textContent=message; $('notice').textContent=message; $('notice').hidden=!message;}
 async function api(path, options={}) {
   const response=await fetch('/api'+path,{...options,headers:{'Content-Type':'application/json',...options.headers}});
@@ -171,10 +173,11 @@ function variables() {
 }
 async function configure(name) {
   selectedRepo=state.repos.find(r=>r.name===name);const r=selectedRepo;addedPaths.clear();
-  $('settings-error').textContent='';$('settings-title').textContent=name;$('repo-watch-only').checked=watchOnly(r);$('repo-enabled').checked=!!r.enabled;showLocalSettings();showIntegrations();$('repo-run-bot-prs').checked=!!r.config.run_bot_prs;$('repo-review').checked=!!r.config.review;$('repo-review-threshold').value=r.config.review_failure_threshold||'major';
+  $('settings-error').textContent='';$('settings-title').textContent=name;$('repo-watch-only').checked=watchOnly(r);$('repo-enabled').checked=!!r.enabled;showLocalSettings();$('repo-run-bot-prs').checked=!!r.config.run_bot_prs;$('repo-review').checked=!!r.config.review;$('repo-review-threshold').value=r.config.review_failure_threshold||'major';
   $('repo-github-auth').value=r.config.github_auth||'none';$('repo-parallel').value=r.config.job_parallelism||1;$('repo-timeout').value=(r.config.timeout||7200)/60;$('repo-review-timeout').value=(r.config.review_timeout||3000)/60;$('repo-review-token-ceiling').value=r.config.review_token_ceiling??'';
   variableRows(r.config.variables||{});$('workflow-options').textContent='Loading workflows…';workflowChoices=[];
   $('add-workflow').open=false;for(const id of ['add-path','add-name','add-yaml','add-file'])$(id).value='';$('add-workflow-result').textContent='';
+  pipeline.reset(r.config.review_pipeline);$('base-credentials').open=false;
   renderSecrets();credentialChoices();$('settings').showModal();
   await loadWorkflowChoices(r.config.workflows||[]);
 }
@@ -183,23 +186,22 @@ const addedPaths=new Set();
 const sourceLabel={workflows:'GITHUB BASE → LOCAL DOCKER',repository:'REPOSITORY FILE · BASE → LOCAL DOCKER',local:'LOCAL ONLY'};
 async function loadWorkflowChoices(selected) {
   const name=selectedRepo.name, include=[...addedPaths].map(p=>'include='+encodeURIComponent(p)).join('&');
-  try {const choices=await api(`/repos/${name}/workflows${include?'?'+include:''}`);if(selectedRepo.name!==name)return;workflowChoices=choices;
-    replaceHTML($('workflow-options'),choices.length?choices.map(w=>{
-      const off=!w.pr||w.review||!!w.error, why=w.error?` · ${w.error}`:w.review?(mergecraft()?' · use the mergeCraft review toggle':' · runs mergeCraft; add mergeCraft in Settings to review PRs'):!w.pr?' · not a PR workflow':'';
+  try {const choices=await api(`/repos/${name}/workflows${include?'?'+include:''}`);if(selectedRepo.name!==name)return;workflowChoices=choices.filter(w=>!w.review);
+    replaceHTML($('workflow-options'),workflowChoices.length?workflowChoices.map(w=>{
+      const off=!w.pr||!!w.error, why=w.error?` · ${w.error}`:!w.pr?' · not a PR workflow':'';
       const version=w.local_version?`${w.source==='local'?'LOCAL ONLY':'LOCAL'} v${w.local_version}`:sourceLabel[w.source]||sourceLabel.workflows;
       return `<div class="workflow-row"><label class="workflow ${off?'workflow-disabled':''}"><input type="checkbox" name="workflow" value="${esc(w.path)}" ${off?'disabled':''} ${selected.includes(w.path)&&!off?'checked':''}><span>${esc(w.name)}<small>${esc(w.path)} · ${version}${esc(why)}</small><small>${esc((w.jobs||[]).join(' · '))}</small></span></label>${w.error?'':`<button type="button" class="button" data-edit-workflow="${esc(w.path)}">Edit local copy</button>`}</div>`;
-    }).join(''):'<p class="muted">No workflows found in .github/workflows/. Add one from any YAML file below'+(mergecraft()?', or use mergeCraft review alone.':'.')+'</p>');
+    }).join(''):'<p class="muted">No CI workflows found. Add one from a YAML file below.</p>');
     $('variable-names').innerHTML=[...new Set(choices.flatMap(w=>w.variables||[]))].map(v=>`<option value="${esc(v)}"></option>`).join('');credentialChoices();
   }catch(e){$('workflow-options').textContent=e.message;}
 }
 function showLocalSettings() {
   // Hidden, not cleared: unticking it again restores the settings as they were.
-  const watch=$('repo-watch-only').checked;$('local-settings').hidden=watch;$('repo-secrets').hidden=watch;
+  const watch=$('repo-watch-only').checked;$('local-settings').hidden=watch;$('repo-secrets').hidden=watch;showIntegrations();
 }
 function showIntegrations() {
-  const on=mergecraft();document.querySelectorAll('.mergecraft-only').forEach(el=>el.hidden=!on);
-  const review=$('secret-scope').querySelector('option[value=review]');review.hidden=review.disabled=!on;
-  if(!on&&$('secret-scope').value==='review'){$('secret-scope').value='ci';credentialChoices();}
+  $('repo-mergecraft').hidden=!mergecraft()||$('repo-watch-only').checked;
+  if($('repo-mergecraft').hidden && $('slot-editor').open)$('slot-editor').close();
 }
 function workflowSource() {return document.querySelector('input[name=workflow-source]:checked').value;}
 function showWorkflowSource() {
@@ -239,20 +241,27 @@ async function addWorkflow() {
   if(source!=='repository'){for(const id of ['add-name','add-yaml','add-file'])$(id).value='';}
 }
 function selectedWorkflows(){return [...document.querySelectorAll('input[name=workflow]:checked:not(:disabled)')].map(x=>x.value);}
-function renderSecrets() {$('secret-list').innerHTML=(selectedRepo.secrets||[]).map(k=>`<button type="button" class="secret-chip" data-delete-secret="${esc(k)}" title="Delete this saved credential">${esc(k)} ×</button>`).join('')||'<span class="muted">No local credentials configured</span>';}
-const reviewKeys={LLM_PROVIDER_1:'Provider identifier from your trusted base mergeCraft configuration, not an API key. Save its credential separately.',LLM_PROVIDER_1_API_KEY:'API key for the provider selected by LLM_PROVIDER_1. For OpenCode Go, paste your OpenCode Go provider key.',OPENAI_API_KEY:'OpenAI API key. Use only if the trusted mergeCraft configuration selects this provider.',ANTHROPIC_API_KEY:'Anthropic API key. Use only if the trusted mergeCraft configuration selects this provider.',OPENCODE_GO_API_KEY:'Direct OpenCode Go key name. If your mergeCraft configuration uses indexed providers, use LLM_PROVIDER_1_API_KEY instead.'};
+function renderSecrets() {
+  const names=(selectedRepo.secrets||[]);
+  for (const [scope, id] of [['ci','secret-list'], ['review','review-secret-list']]) {
+    const scoped=names.filter(key=>key.startsWith(scope+':'));
+    $(id).innerHTML=scoped.map(key=>`<button type="button" class="secret-chip" data-delete-secret="${esc(key)}" title="Delete saved credential">${esc(key.split(':')[1])} ×</button>`).join('')||'<span class="muted">No saved credentials</span>';
+  }
+  const keys=names.filter(k=>k.startsWith('review:')).map(k=>k.split(':')[1]);
+  pipeline.setKeys(keys);
+  $('review-key-names').innerHTML=[...new Set([...keys,'LLM_PROVIDER_1_API_KEY','OPENAI_API_KEY','ANTHROPIC_API_KEY','OPENCODE_GO_API_KEY'])].map(k=>`<option value="${esc(k)}"></option>`).join('');
+}
 function credentialChoices() {
-  const ci=$('secret-scope').value==='ci', old=$('secret-choice').value;
-  const detected=[...new Set(workflowChoices.filter(w=>selectedWorkflows().includes(w.path)).flatMap(w=>w.secrets||[]))];
-  const saved=(selectedRepo?.secrets||[]).filter(k=>k.startsWith(ci?'ci:':'review:')).map(k=>k.split(':')[1]);
-  const keys=[...new Set([...(ci?detected:Object.keys(reviewKeys)),...saved])].filter(k=>!['GITHUB_TOKEN','GH_TOKEN'].includes(k));
-  $('secret-choice').innerHTML=keys.map(k=>`<option value="${esc(k)}">${esc(k)}${ci&&detected.includes(k)?' · referenced by workflow':''}</option>`).join('')+'<option value="custom">Custom credential name…</option>';
+  const old=$('secret-choice').value;
+  const detected=workflowChoices.filter(w=>selectedWorkflows().includes(w.path)).flatMap(w=>w.secrets||[]);
+  const saved=(selectedRepo?.secrets||[]).filter(k=>k.startsWith('ci:')).map(k=>k.split(':')[1]);
+  const keys=[...new Set([...detected,...saved])].filter(k=>!['GITHUB_TOKEN','GH_TOKEN'].includes(k));
+  $('secret-choice').innerHTML=keys.map(k=>`<option value="${esc(k)}">${esc(k)}</option>`).join('')+'<option value="custom">Custom credential name…</option>';
   if(keys.includes(old))$('secret-choice').value=old;credentialHelp();
 }
 function credentialHelp() {
-  const key=$('secret-choice').value,ci=$('secret-scope').value==='ci';
-  $('custom-secret-label').hidden=key!=='custom';$('secret-name').required=key==='custom';
-  $('credential-help').textContent=key==='custom'?'Enter the exact environment/secret name expected by your workflow or provider configuration.':ci?`${key} supplies secrets.${key} in selected CI workflows. This value is available to their jobs; it is not a GitHub login token.`:reviewKeys[key]||'Provider setting for mergeCraft review only.';
+  const custom=$('secret-choice').value==='custom';
+  $('custom-secret-label').hidden=!custom;$('secret-name').required=custom;
 }
 async function openEditor(path) {
   $('editor-result').textContent='';$('editor-title').textContent=path;$('workflow-yaml').value='Loading…';$('workflow-editor').showModal();
@@ -391,9 +400,18 @@ $('merge-confirm').addEventListener('click',async()=>{
 $('search').addEventListener('input',filterRepos);$('run-search').addEventListener('input',filterRuns);$('pr-search').addEventListener('input',filterPRs);
 $('add-variable').addEventListener('click',()=>addVariable());
 $('apply-vars').addEventListener('click',()=>{try{const v=JSON.parse($('repo-vars').value);if(!v||Array.isArray(v)||typeof v!=='object'||Object.values(v).some(x=>typeof x!=='string'))throw new Error('Use a JSON object with string values, for example {"RUN_CODEQL":"false"}.');variableRows(v);}catch(e){notice(e.message);}});
-$('settings-form').addEventListener('submit',async e=>{e.preventDefault();try{const watch=$('repo-watch-only').checked,config={watch_only:watch,enabled:!watch&&$('repo-enabled').checked,run_bot_prs:$('repo-run-bot-prs').checked,review:mergecraft()&&$('repo-review').checked,review_failure_threshold:$('repo-review-threshold').value,github_auth:$('repo-github-auth').value,workflows:selectedWorkflows(),variables:variables(),timeout:Number($('repo-timeout').value)*60,review_timeout:Number($('repo-review-timeout').value)*60,review_token_ceiling:$('repo-review-token-ceiling').value===''?null:Number($('repo-review-token-ceiling').value),job_parallelism:Number($('repo-parallel').value)};await api(`/repos/${selectedRepo.name}`,{method:'PUT',body:JSON.stringify(config)});$('settings').close();notice(watch?`Watching ${selectedRepo.name}. Its PRs and GitHub CI appear on the PRs page after the next sync, within a few seconds; nothing runs on this worker.`:'Settings saved. Existing runs keep their snapshot; Retry uses your latest configuration.');await refresh();}catch(e){notice(e.message);}});
-$('secret-scope').addEventListener('change',credentialChoices);$('secret-choice').addEventListener('change',credentialHelp);$('workflow-options').addEventListener('change',credentialChoices);
-$('secret-form').addEventListener('submit',async e=>{e.preventDefault();try{const scope=$('secret-scope').value,name=$('secret-choice').value==='custom'?$('secret-name').value:$('secret-choice').value;await api(`/repos/${selectedRepo.name}/secrets`,{method:'PUT',body:JSON.stringify({scope,name,value:$('secret-value').value})});$('secret-value').value='';selectedRepo.secrets=[...new Set([...selectedRepo.secrets,`${scope}:${name}`])];renderSecrets();notice('Credential saved. Its value cannot be read back.');}catch(e){notice(e.message);}});
+$('settings-form').addEventListener('submit',async e=>{e.preventDefault();try{const watch=$('repo-watch-only').checked,config={watch_only:watch,enabled:!watch&&$('repo-enabled').checked,run_bot_prs:$('repo-run-bot-prs').checked,review:mergecraft()&&$('repo-review').checked,review_failure_threshold:$('repo-review-threshold').value,github_auth:$('repo-github-auth').value,workflows:selectedWorkflows(),variables:variables(),timeout:Number($('repo-timeout').value)*60,review_timeout:Number($('repo-review-timeout').value)*60,review_token_ceiling:$('repo-review-token-ceiling').value===''?null:Number($('repo-review-token-ceiling').value),job_parallelism:Number($('repo-parallel').value),...(mergecraft()&&!watch?pipeline.payload():{})};await api(`/repos/${selectedRepo.name}`,{method:'PUT',body:JSON.stringify(config)});$('settings').close();notice(watch?`Watching ${selectedRepo.name}. Its PRs and GitHub CI appear on the PRs page after the next sync, within a few seconds; nothing runs on this worker.`:'Settings saved. Existing runs keep their snapshot; Retry uses your latest configuration.');await refresh();}catch(e){notice(e.message);}});
+$('secret-choice').addEventListener('change',credentialHelp);$('workflow-options').addEventListener('change',credentialChoices);
+async function saveCredential(scope,name,valueInput) {
+  const repo=selectedRepo;
+  await api(`/repos/${repo.name}/secrets`,{method:'PUT',body:JSON.stringify({scope,name,value:valueInput.value})});
+  if(repo!==selectedRepo)return;
+  valueInput.value='';repo.secrets=[...new Set([...repo.secrets,`${scope}:${name}`])];
+  renderSecrets();credentialChoices();notice('Credential saved.');
+}
+$('secret-form').addEventListener('submit',async e=>{e.preventDefault();try{await saveCredential('ci',$('secret-choice').value==='custom'?$('secret-name').value:$('secret-choice').value,$('secret-value'));}catch(err){notice(err.message);}});
+$('base-secret-form').addEventListener('submit',async e=>{e.preventDefault();try{await saveCredential('review',$('base-secret-name').value,$('base-secret-value'));}catch(err){notice(err.message);}});
+$('settings').addEventListener('close',()=>{pipeline.reset();$('secret-value').value='';$('base-secret-value').value='';$('base-secret-name').value='';});
 $('workflow-save').addEventListener('click',async()=>{try{const result=await api(`/repos/${editor.repo}/workflow`,{method:'PUT',body:JSON.stringify({path:editor.path,content:$('workflow-yaml').value,source_ref:editor.source_ref,expected_version:editor.expected_version})});editor.expected_version=result.version;editor.version=result.version;editor.content=$('workflow-yaml').value;renderEditor(editor);$('editor-version').options[0].textContent='Active local v'+result.version;$('editor-version').value='current';$('editor-result').textContent=`Saved local v${result.version}. GitHub is unchanged. New runs will use this version when the workflow is selected.`;await loadWorkflowChoices(selectedWorkflows());}catch(e){$('editor-result').textContent=e.message;}});
 $('workflow-reset').addEventListener('click',async()=>{try{
   const local=editor.path.startsWith('local:');

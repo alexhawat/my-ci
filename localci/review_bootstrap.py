@@ -5,6 +5,7 @@ reviews create private XDG directories before that drop, leaving OpenCode unable
 to write its log/auth tree. Starting the CLI unprivileged keeps ownership aligned.
 """
 
+import importlib.util
 import json
 import os
 import pwd
@@ -86,6 +87,12 @@ def preserve_evidence(root: Path) -> None:
 
 if __name__ == "__main__":
     prepare()
+    if Path("/control/local-review-pipeline").is_file() and not importlib.util.find_spec(
+        "mergecraft.localci_review_pipeline"
+    ):
+        sys.exit(
+            "Rebuild the mergeCraft review image with scripts/build_review.sh to run the configured pipeline"
+        )
     code = subprocess.call(["mergecraft", *sys.argv[1:]])
     try:
         preserve_evidence(Path("/tmp"))

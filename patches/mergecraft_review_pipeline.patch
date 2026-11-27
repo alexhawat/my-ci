@@ -1,0 +1,130 @@
+--- a/src/mergecraft/agents/resolution/chain.py
++++ b/src/mergecraft/agents/resolution/chain.py
+@@ -697,4 +697,9 @@
+ 
+     chain = effective_model_chain(settings, head=head, pin=pin)
++    from mergecraft.localci_review_pipeline import activate_key, primary_routes
++
++    slots = primary_routes(chain, pin=pin)
++    if slots:
++        chain = [slot["model"] for slot in slots]
+     requested_model = chain[0] if chain else (head or "")
+ 
+@@ -712,4 +712,5 @@
+         last_skip_reason: FallbackReason | None = None
+         deadline = chain_deadline()
++        opencode_limit = max(_OPENCODE_MAX_ATTEMPTS, len(slots))
+         opencode_attempts = 0
+         tail_retries = 0
+@@ -727,5 +728,5 @@
+             slug = chain[chain_index]
+             if runtime.agent_mode_for_slug(slug, settings=settings) == "opencode":
+-                if opencode_attempts >= _OPENCODE_MAX_ATTEMPTS:
++                if opencode_attempts >= opencode_limit:
+                     logger.warning(
+                         "» model chain skipping slug={} (fallback_index={}): opencode "
+@@ -733,5 +734,5 @@
+                         slug,
+                         chain_index,
+-                        _OPENCODE_MAX_ATTEMPTS,
++                        opencode_limit,
+                     )
+                     if chain_index < len(chain) - 1:
+@@ -798,5 +803,6 @@
+                     parent_span_id=attempt_parent_id,
+                 ) as call_span:
+-                    result = await run_once(slug)
++                    with activate_key(slots[chain_index] if slots else None):
++                        result = await run_once(slug)
+                     last_result = result
+                     last_executed_slug = slug
+--- a/src/mergecraft/review/roster_execution.py
++++ b/src/mergecraft/review/roster_execution.py
+@@ -20,4 +20,5 @@
+ from loguru import logger
+ 
++from mergecraft.localci_review_pipeline import check_backup, dispatch_secondary, run_attempt
+ from mergecraft.agents.gates import subagent_denied_tool_names
+ from mergecraft.agents.registry import AgentBinding, AgentRole, Registry, load_registry
+@@ -414,4 +415,6 @@
+             executed_model=attempt_model,
+         ):
++            if label == "secondary reviewer":
++                return await run_attempt(attempt_agent, run_ctx, binding, slug)
+             return await attempt_agent.run(run_ctx)
+ 
+@@ -433,4 +436,9 @@
+         from mergecraft.agents.shared import INFRA_REASON_KEY
+ 
++        if label == "secondary reviewer":
++            check_backup(result, slug, binding, clean=(
++                not _binding_already_recorded(tool_state, record_as)
++                and not _findings_since(before_findings, tool_state)
++            ))
+         reason = result.error or f"{label} agent failed"
+         infra_reason = (result.metadata or {}).get(INFRA_REASON_KEY)
+@@ -477,5 +485,6 @@
+ ) -> _SecondaryOutcome:
+     """Dispatch one secondary reviewer; return its hard error, if any."""
+-    return await _dispatch_reviewer(
++    return await dispatch_secondary(
++        _dispatch_reviewer,
+         binding=binding,
+         record_as=binding.agent_id,
+--- a/src/mergecraft/review/offline_agent.py
++++ b/src/mergecraft/review/offline_agent.py
+@@ -497,11 +497,14 @@
+         )
+ 
+-        roster_summary = await run_pending_roster_reviewers(
+-            tool_context=tool_context,
+-            base_run_ctx=run_ctx,
+-            settings=settings,
+-            payload=_offline_instruction_payload(shell, prompt),
+-            repo_root=cwd,
+-        )
++        from mergecraft.localci_review_pipeline import secondary_usage
++
++        with secondary_usage(_localci_usages if Path("/control/local-review-pipeline").is_file() else None):
++            roster_summary = await run_pending_roster_reviewers(
++                tool_context=tool_context,
++                base_run_ctx=run_ctx,
++                settings=settings,
++                payload=_offline_instruction_payload(shell, prompt),
++                repo_root=cwd,
++            )
+         result = apply_roster_failure(result, roster_summary)
+         from mergecraft.mcp.verdict import fold_reviewer_dispatch_findings_into_submission
+--- a/src/mergecraft/agents/harness_render.py
++++ b/src/mergecraft/agents/harness_render.py
+@@ -531,5 +531,6 @@
+         settings=settings, repo_root=root, model_head=_requested_model_head(ctx)
+     )
+-    batches = reviewer_dispatch_batches(registry)
++    from mergecraft.localci_review_pipeline import harness_batches
++    batches = harness_batches(reviewer_dispatch_batches(registry))
+     dispatch_instructions = format_reviewer_dispatch_instructions(batches)
+     roster = (
+--- a/src/mergecraft/mcp/reviewer_dispatch.py
++++ b/src/mergecraft/mcp/reviewer_dispatch.py
+@@ -79,4 +79,6 @@
+     async def _run(params: dict[str, Any]) -> dict[str, Any]:
+         validated = RecordReviewerDispatchErrorParams.model_validate(params)
++        from mergecraft.localci_review_pipeline import recording_model
++        recording_model(validated.agent_id)
+         _refuse_during_file_group(ctx, "record_reviewer_dispatch_error")
+         record_reviewer_dispatch_error(
+@@ -123,4 +125,6 @@
+         validated = RecordReviewerDispatchRunParams.model_validate(params)
+         _refuse_during_file_group(ctx, "record_reviewer_dispatch_run")
++        from mergecraft.localci_review_pipeline import recording_model
++        active_model = recording_model(validated.agent_id)
+         _validate_reviewer_agent_id(ctx, validated.agent_id)
+         from mergecraft.agents.registry import AgentRole, load_registry, resolve_agent_model
+@@ -141,5 +145,5 @@
+             agent_id=validated.agent_id,
+             findings=validated.findings,
+-            model_slug=model_slug,
++            model_slug=active_model or model_slug,
+         )
+         return {
