@@ -7,7 +7,7 @@ Programmatic access lets automation and LLM clients read my-ci state and perform
 | Layer | Control |
 |-------|---------|
 | Network | **Tailnet only.** Expose the dashboard with `tailscale serve` (or equivalent private ingress). Do not use Tailscale Funnel or a public reverse proxy without the same identity guarantees. |
-| Authentication | **Bearer tokens** you create in the dashboard. Tokens are stored as salted PBKDF2 hashes; the plaintext is shown once at creation. |
+| Authentication | **Bearer tokens** you create in the dashboard (`mci_<id>.<secret>`). Only an HMAC of the secret is stored; the plaintext is shown once at creation. Tokens created before the id-prefixed format was introduced are revoked on upgrade—create new ones. |
 | Authorization | **Scopes:** `read`, `write-config` (repo enable/review), `write-runs` (retry). Each request is audit-logged with token id, path, and action. |
 | Secrets | Tokens never gate access to workflow credentials, GitHub App keys, or review provider secrets. Agent responses are filtered to exclude secret material. |
 | Revocation | Revoke a token in the dashboard; agents receive **401** on the next call. |
@@ -26,7 +26,7 @@ Assume anyone who can reach the dashboard origin on your tailnet can attempt aut
 
 - Base: `{LOCALCI_URL}/api/agent/v1`
 - OpenAPI: `{LOCALCI_URL}/api/agent/v1/docs`
-- Header: `Authorization: Bearer mci_…`
+- Header: `Authorization: Bearer mci_<token-id>.<secret>`
 
 Example (set `MY_CI_TOKEN` to the value from the dashboard; do not commit it):
 

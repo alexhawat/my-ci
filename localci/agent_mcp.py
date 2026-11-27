@@ -36,7 +36,7 @@ class AgentMcpMiddleware:
             self.token_store.audit("anonymous", "denied", scope.get("path", ""), "missing bearer")
             await _json_error(send, 401, "Bearer token required")
             return
-        verified = self.token_store.verify(auth[7:].strip())
+        verified = await self.token_store.verify_async(auth[7:].strip())
         if not verified:
             self.token_store.audit("anonymous", "denied", scope.get("path", ""), "invalid token")
             await _json_error(send, 401, "Invalid or expired token")

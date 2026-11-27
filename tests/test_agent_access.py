@@ -1,10 +1,16 @@
+import asyncio
 import json
 
 import pytest
 from fastapi.testclient import TestClient
 
 from localci.agent_service import AgentService
-from localci.agent_tokens import token_store_from_controller
+from localci.agent_tokens import (
+    AgentTokenStore,
+    hash_agent_secret,
+    parse_agent_token,
+    token_store_from_controller,
+)
 from localci.app import create_app
 
 WORKFLOW = (
@@ -129,6 +135,65 @@ def test_invalid_token_401(env):
         assert client.get("/api/agent/v1/repos").status_code == 401
 
 
+def test_public_view_allows_benign_begin_in_title(env):
+    http, controller, raw, token_store = env
+    title = "Document -----BEGIN marker in PEM export"
+    rid = controller.store.enqueue("o/r", _pr(title=title), {"workflows": []})
+    body = http.get(f"/api/agent/v1/runs/{rid}").json()
+    assert body["title"] == title
+
+
+def test_public_view_strips_secret_keys():
+    payload = AgentService.public_view(
+        {"name": "o/r", "ciphertext": "hidden", "nested": {"private_key": "x"}}
+    )
+    assert payload == {"name": "o/r", "nested": {}}
+
+
+def test_verify_rejects_legacy_format_without_hash(monkeypatch, tmp_path):
+    store = AgentTokenStore(
+        __import__("localci.store", fromlist=["Store"]).Store(tmp_path / "db"), b"pepper" * 4
+    )
+    calls = []
+    monkeypatch.setattr(
+        "localci.agent_tokens.hash_agent_secret",
+        lambda *args, **kwargs: calls.append(1) or "deadbeef",
+    )
+    assert parse_agent_token("mci_onlylegacysecret") is None
+    assert store.verify("mci_onlylegacysecret") is None
+    assert calls == []
+
+
+def test_verify_hashes_once_with_many_tokens(monkeypatch, tmp_path):
+    from localci.store import Store
+
+    token_store = AgentTokenStore(Store(tmp_path / "db"), b"pepper" * 4)
+    raws = [token_store.create(f"t{i}", ["read"])[0] for i in range(5)]
+    calls = []
+    monkeypatch.setattr(
+        "localci.agent_tokens.hash_agent_secret",
+        lambda *args, **kwargs: calls.append(1) or hash_agent_secret(args[0], args[1]),
+    )
+    assert token_store.verify(raws[2]) is not None
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_async_delegates_to_thread(monkeypatch, tmp_path):
+    from localci.store import Store
+
+    token_store = AgentTokenStore(Store(tmp_path / "db"), b"pepper" * 4)
+    raw, _ = token_store.create("async", ["read"])
+
+    async def capture(fn, *args):
+        return fn(*args)
+
+    monkeypatch.setattr(asyncio, "to_thread", capture)
+    verified = await token_store.verify_async(raw)
+    assert verified is not None
+    assert verified.name == "async"
+
+
 def test_agent_path_skips_tailscale_login(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALCI_TAILSCALE_LOGIN", "owner@example.com")
     app = create_app(tmp_path, background=False)
@@ -140,10 +205,10 @@ def test_agent_path_skips_tailscale_login(tmp_path, monkeypatch):
         assert http.get("/api/agent/v1/repos").status_code == 200
 
 
-def _pr(n=1):
+def _pr(n=1, title="Test"):
     return {
         "number": n,
-        "title": "Test",
+        "title": title,
         "state": "open",
         "draft": False,
         "head": {"sha": "a" * 40, "ref": "feature", "repo": {"full_name": "o/r"}},

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from fastapi import HTTPException
@@ -22,7 +21,6 @@ FORBIDDEN_KEYS = frozenset(
         "password",
     }
 )
-FORBIDDEN_SUBSTRINGS = ("-----BEGIN", "app:private_key", "app:app_id")
 
 
 class AgentService:
@@ -36,15 +34,20 @@ class AgentService:
 
     @staticmethod
     def public_view(data: Any) -> Any:
-        """Return a JSON-safe structure with no secret material."""
-        text = json.dumps(data, default=str)
-        lowered = text.casefold()
-        for bad in FORBIDDEN_SUBSTRINGS:
-            if bad.casefold() in lowered:
-                raise HTTPException(500, "Internal serialization guard")
-        if re.search(r'"ciphertext"\s*:', text):
-            raise HTTPException(500, "Internal serialization guard")
-        return json.loads(text)
+        """Drop secret-shaped keys; responses are built from allow-listed fields elsewhere."""
+        return AgentService._strip_secret_keys(data)
+
+    @staticmethod
+    def _strip_secret_keys(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: AgentService._strip_secret_keys(item)
+                for key, item in value.items()
+                if key not in FORBIDDEN_KEYS
+            }
+        if isinstance(value, list):
+            return [AgentService._strip_secret_keys(item) for item in value]
+        return value
 
     def list_repos(self) -> list[dict]:
         self._need("read")

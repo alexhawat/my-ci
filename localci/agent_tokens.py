@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import hmac
 import json
+import re
 import secrets
 import time
 import uuid
@@ -15,6 +18,7 @@ from mcp.server.auth.provider import AccessToken
 
 VALID_SCOPES = frozenset({"read", "write-config", "write-runs"})
 AuditAction = Literal["auth", "read", "write", "denied"]
+TOKEN_RE = re.compile(r"^mci_([0-9a-f]{32})\.([A-Za-z0-9_-]+)$")
 
 
 @dataclass(frozen=True)
@@ -24,8 +28,16 @@ class VerifiedToken:
     scopes: frozenset[str]
 
 
-def _hash_token(raw: str, salt: str, pepper: bytes) -> str:
-    return hashlib.pbkdf2_hmac("sha256", raw.encode(), salt.encode() + pepper, 200_000).hex()
+def parse_agent_token(raw: str) -> tuple[str, str] | None:
+    """Split ``mci_<id>.<secret>``. Legacy ``mci_<secret>`` tokens are rejected."""
+    match = TOKEN_RE.match(raw)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def hash_agent_secret(secret: str, pepper: bytes) -> str:
+    return hmac.new(pepper, secret.encode(), hashlib.sha256).hexdigest()
 
 
 class AgentTokenStore:
@@ -42,9 +54,9 @@ class AgentTokenStore:
         if not name.strip():
             raise ValueError("Name is required")
         token_id = uuid.uuid4().hex
-        raw = f"mci_{secrets.token_urlsafe(32)}"
-        salt = secrets.token_hex(16)
-        token_hash = _hash_token(raw, salt, self.pepper)
+        secret = secrets.token_urlsafe(32)
+        raw = f"mci_{token_id}.{secret}"
+        token_hash = hash_agent_secret(secret, self.pepper)
         created = time.time()
         expires_at = created + expires_days * 86400 if expires_days else None
         self.store.execute(
@@ -53,7 +65,7 @@ class AgentTokenStore:
                 token_id,
                 name.strip(),
                 json.dumps(sorted(set(scopes))),
-                salt,
+                "",
                 token_hash,
                 created,
                 expires_at,
@@ -84,18 +96,23 @@ class AgentTokenStore:
         return True
 
     def verify(self, raw: str) -> VerifiedToken | None:
-        if not raw.startswith("mci_"):
+        parsed = parse_agent_token(raw)
+        if not parsed:
             return None
-        rows = self.store.rows("SELECT * FROM agent_tokens WHERE revoked_at IS NULL")
-        for row in rows:
-            if secrets.compare_digest(_hash_token(raw, row["salt"], self.pepper), row["token_hash"]):
-                if row["expires_at"] and row["expires_at"] < time.time():
-                    return None
-                self.store.execute(
-                    "UPDATE agent_tokens SET last_used_at=? WHERE id=?", (time.time(), row["id"])
-                )
-                return VerifiedToken(row["id"], row["name"], frozenset(json.loads(row["scopes"])))
-        return None
+        token_id, secret = parsed
+        rows = self.store.rows("SELECT * FROM agent_tokens WHERE id=? AND revoked_at IS NULL", (token_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        if row["expires_at"] and row["expires_at"] < time.time():
+            return None
+        if not hmac.compare_digest(hash_agent_secret(secret, self.pepper), row["token_hash"]):
+            return None
+        self.store.execute("UPDATE agent_tokens SET last_used_at=? WHERE id=?", (time.time(), token_id))
+        return VerifiedToken(row["id"], row["name"], frozenset(json.loads(row["scopes"])))
+
+    async def verify_async(self, raw: str) -> VerifiedToken | None:
+        return await asyncio.to_thread(self.verify, raw)
 
     def audit(self, token_id: str, action: AuditAction, path: str, detail: str = "") -> None:
         self.store.execute(
@@ -122,7 +139,7 @@ class AgentTokenVerifier:
         self.token_store = token_store
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        verified = self.token_store.verify(token)
+        verified = await self.token_store.verify_async(token)
         if not verified:
             return None
         return AccessToken(

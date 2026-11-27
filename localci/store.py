@@ -17,7 +17,7 @@ ACTIVE = ("queued", "running")
 # system-caused endings are re-queued automatically; an operator's cancel is final.
 RECOVERABLE = ("pr_inactive", "repo_disabled", "worker_interrupted")
 MAX_RECOVERIES = 3  # Unbilled automatic re-runs per PR revision; bounds crash loops.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _SELECT = re.compile(r"\s*SELECT\b", re.IGNORECASE)
 
 
@@ -155,6 +155,12 @@ class Store:
                     );
                     CREATE INDEX IF NOT EXISTS agent_token_audit_token ON agent_token_audit(token_id, id);
                 """)
+            if version == 5:
+                # Agent tokens issued before id-prefixed format use PBKDF2 over the full
+                # secret; revoke them so operators create new mci_<id>.<secret> tokens.
+                db.execute(
+                    "UPDATE agent_tokens SET revoked_at=created WHERE salt != '' AND revoked_at IS NULL"
+                )
             if version in (1, 2):
                 # One-time backfill for databases that predate the budget table. Running it on
                 # every start would bill unbilled automatic recoveries against the retry budget.

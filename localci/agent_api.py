@@ -26,12 +26,12 @@ def _bearer(authorization: Annotated[str | None, Header()] = None) -> str:
 def register_agent_api(main_app, controller, token_store: AgentTokenStore, *, addon_enabled) -> None:
     router = APIRouter()
 
-    def require_token(raw: str = Depends(_bearer)) -> VerifiedToken:
+    async def require_token(raw: str = Depends(_bearer)) -> VerifiedToken:
         if not addon_enabled():
             raise HTTPException(404, "Agent access is disabled")
-        verified = token_store.verify(raw)
+        verified = await token_store.verify_async(raw)
         if not verified:
-            token_store.audit("", "denied", "api", "invalid token")
+            token_store.audit("anonymous", "denied", "api", "invalid token")
             raise HTTPException(401, "Invalid or expired token")
         return verified
 
