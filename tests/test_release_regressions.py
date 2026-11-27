@@ -38,7 +38,7 @@ async def test_oversized_output_line_discards_secret_suffix(tmp_path):
     runner.deadline = time.monotonic() + 30
     runner.sensitive = ["SECRETVALUE123"]
     code, _ = await runner.command(
-        "python",
+        "python3",
         "-c",
         "import sys; sys.stdout.write('x' * 131000 + 'SECRETVALUE123\\nnext line\\n')",
     )
