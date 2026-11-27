@@ -14,6 +14,10 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
+from localci.agent_api import register_agent_api
+from localci.agent_dashboard import register_agent_dashboard
+from localci.agent_mcp import build_mcp_app
+from localci.agent_tokens import token_store_from_controller
 from localci.controller import Controller
 from localci.dashboard import enrich_run, register_dashboard
 from localci.github import GitHubError, app_jwt
@@ -88,6 +92,16 @@ class AppInput(BaseModel):
 
 class Integrations(BaseModel):
     mergecraft: bool = False
+    agent_access: bool = False
+
+
+class IntegrationsUpdate(BaseModel):
+    mergecraft: bool | None = None
+    agent_access: bool | None = None
+
+
+def _agent_path(path: str) -> bool:
+    return path.startswith("/api/agent/") or path.startswith("/agent/mcp")
 
 
 def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
@@ -108,16 +122,18 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
     async def access(request: Request, call_next):
         expected = os.environ.get("LOCALCI_TAILSCALE_LOGIN", "")
         if request.url.path != "/healthz":
-            if (
-                not expected
-                or request.headers.get("tailscale-user-login", "").casefold() != expected.casefold()
-            ):
-                return JSONResponse(
-                    {"detail": "Open this dashboard through its private Tailscale HTTPS URL"}, status_code=403
-                )
-            if request.method not in {"GET", "HEAD", "OPTIONS"}:
-                if request.headers.get("origin", "").rstrip("/") != controller.base_url:
-                    return JSONResponse({"detail": "Invalid request origin"}, status_code=403)
+            agent = _agent_path(request.url.path)
+            if not agent:
+                if (
+                    not expected
+                    or request.headers.get("tailscale-user-login", "").casefold() != expected.casefold()
+                ):
+                    return JSONResponse(
+                        {"detail": "Open this dashboard through its private Tailscale HTTPS URL"}, status_code=403
+                    )
+                if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                    if request.headers.get("origin", "").rstrip("/") != controller.base_url:
+                        return JSONResponse({"detail": "Invalid request origin"}, status_code=403)
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -381,9 +397,11 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
         return {"ok": True}
 
     @app.put("/api/integrations")
-    def integrations(value: Integrations):
+    def integrations(value: IntegrationsUpdate):
+        current = controller.store.integrations()
+        payload = {**current, **value.model_dump(exclude_unset=True)}
         try:
-            changed = controller.store.save_integrations(value.model_dump())
+            changed = controller.store.save_integrations(payload)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
         controller.notify()
@@ -469,6 +487,23 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
         return {"id": new_id}
 
     register_dashboard(app, controller, repo_name, get_run)
+
+    token_store = token_store_from_controller(controller)
+    register_agent_dashboard(app, controller)
+    register_agent_api(
+        app,
+        controller,
+        token_store,
+        addon_enabled=lambda: controller.store.integrations().get("agent_access", False),
+    )
+    app.mount(
+        "/agent/mcp",
+        build_mcp_app(
+            controller,
+            token_store,
+            lambda: controller.store.integrations().get("agent_access", False),
+        ),
+    )
 
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")

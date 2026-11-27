@@ -574,7 +574,7 @@ def test_v2_upgrade_backfills_budget_and_keeps_v2_restore_backup(tmp_path):
         db.execute("DROP TABLE revision_attempts")
         db.execute("PRAGMA user_version=2")
     upgraded = Store(path)
-    assert upgraded.rows("PRAGMA user_version")[0]["user_version"] == 4
+    assert upgraded.rows("PRAGMA user_version")[0]["user_version"] == 5
     with pytest.raises(RetryLimitReached):
         upgraded.enqueue("owner/repo", pr(), {}, retry=True)
     upgraded.close()
