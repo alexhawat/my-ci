@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextvars
 import json
+from urllib.parse import urlparse
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 from localci.agent_service import AgentService
 from localci.agent_tokens import AgentTokenStore, VerifiedToken
@@ -61,6 +63,19 @@ async def _json_error(send, status: int, detail: str) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+def _transport_security(base_url: str) -> TransportSecuritySettings:
+    parsed = urlparse(base_url)
+    netloc = parsed.netloc or "localhost:8787"
+    host = netloc.split(":")[0]
+    allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*", f"{host}:*", netloc]
+    origin = base_url.rstrip("/")
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=list(dict.fromkeys(allowed_hosts)),
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", origin],
+    )
+
+
 def _service(controller) -> AgentService:
     verified = _agent_token.get()
     if not verified:
@@ -109,5 +124,11 @@ def build_mcp_app(controller, token_store: AgentTokenStore, addon_enabled):
     ) -> str:
         return json.dumps(_service(controller).set_repo_review(repo, enabled=enabled, review=review))
 
-    core = server.streamable_http_app(streamable_http_path="/", stateless_http=True)
-    return AgentMcpMiddleware(core, token_store, addon_enabled)
+    core = server.streamable_http_app(
+        streamable_http_path="/",
+        stateless_http=True,
+        json_response=True,
+        transport_security=_transport_security(controller.base_url),
+    )
+    wrapped = AgentMcpMiddleware(core, token_store, addon_enabled)
+    return wrapped, server.session_manager

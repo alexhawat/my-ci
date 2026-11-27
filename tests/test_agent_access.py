@@ -1,5 +1,6 @@
 import asyncio
 import json
+from urllib.parse import urlparse
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,6 +21,30 @@ WORKFLOW = (
 
 def agent_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
+
+
+def mcp_headers(controller, token: str | None = None) -> dict:
+    host = urlparse(controller.base_url).netloc
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "Host": host,
+    }
+    if token is not None:
+        headers.update(agent_headers(token))
+    return headers
+
+
+_MCP_INIT = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "pytest", "version": "1"},
+    },
+}
 
 
 @pytest.fixture
@@ -61,6 +86,42 @@ def test_token_create_verify_revoke(env):
     assert token_store.verify(raw) is None
 
 
+def test_mcp_http_requires_bearer(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_TAILSCALE_LOGIN", "owner@example.com")
+    app = create_app(tmp_path, background=False)
+    controller = app.state.controller
+    controller.store.save_integrations({"agent_access": True})
+    with TestClient(app, base_url=controller.base_url) as http:
+        r = http.post("/agent/mcp/", json=_MCP_INIT, headers=mcp_headers(controller))
+        assert r.status_code == 401
+
+
+def test_mcp_http_addon_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALCI_TAILSCALE_LOGIN", "owner@example.com")
+    app = create_app(tmp_path, background=False)
+    controller = app.state.controller
+    controller.store.save_integrations({"agent_access": False})
+    token_store = token_store_from_controller(controller)
+    raw, _ = token_store.create("x", ["read"])
+    with TestClient(app, base_url=controller.base_url) as http:
+        r = http.post("/agent/mcp/", json=_MCP_INIT, headers=mcp_headers(controller, raw))
+        assert r.status_code == 404
+
+
+def test_mcp_http_tools_list(env):
+    http, controller, raw, token_store = env
+    headers = mcp_headers(controller, raw)
+    assert http.post("/agent/mcp/", json=_MCP_INIT, headers=headers).status_code == 200
+    tools = http.post(
+        "/agent/mcp/",
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        headers=headers,
+    )
+    assert tools.status_code == 200
+    names = {t["name"] for t in tools.json()["result"]["tools"]}
+    assert "list_repos" in names
+
+
 def test_addon_disabled_returns_404(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALCI_TAILSCALE_LOGIN", "owner@example.com")
     app = create_app(tmp_path, background=False)
@@ -75,10 +136,9 @@ def test_addon_disabled_returns_404(tmp_path, monkeypatch):
 def test_scope_enforcement(env):
     http, controller, raw, token_store = env
     read_only, _ = token_store.create("read", ["read"])
-    client = TestClient(http.app, headers=agent_headers(read_only))
-    assert client.get("/api/agent/v1/repos").status_code == 200
+    assert http.get("/api/agent/v1/repos", headers=agent_headers(read_only)).status_code == 200
     rid = controller.store.enqueue("o/r", _pr(), {"workflows": []})
-    assert client.post(f"/api/agent/v1/runs/{rid}/retry").status_code == 403
+    assert http.post(f"/api/agent/v1/runs/{rid}/retry", headers=agent_headers(read_only)).status_code == 403
 
 
 def test_api_repos_and_queue(env):
@@ -131,8 +191,7 @@ def test_mcp_list_repos_via_service(env):
 
 def test_invalid_token_401(env):
     http, controller, raw, token_store = env
-    with TestClient(http.app, headers=agent_headers("mci_invalid")) as client:
-        assert client.get("/api/agent/v1/repos").status_code == 401
+    assert http.get("/api/agent/v1/repos", headers=agent_headers("mci_invalid")).status_code == 401
 
 
 def test_public_view_allows_benign_begin_in_title(env):

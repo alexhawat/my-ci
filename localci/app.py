@@ -108,11 +108,16 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
     if background:
         raise ValueError("Execution is a separate service; run python -m localci.worker")
     controller = Controller(root)
+    token_store = token_store_from_controller(controller)
+    def addon_enabled() -> bool:
+        return bool(controller.store.integrations().get("agent_access", False))
+    mcp_asgi, mcp_sessions = build_mcp_app(controller, token_store, addon_enabled)
 
     @asynccontextmanager
     async def lifespan(app):
         # The web process never starts, recovers, cancels, or publishes execution tasks.
-        yield
+        async with mcp_sessions.run():
+            yield
         await asyncio.to_thread(controller.store.close)
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -489,22 +494,9 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
 
     register_dashboard(app, controller, repo_name, get_run)
 
-    token_store = token_store_from_controller(controller)
     register_agent_dashboard(app, controller)
-    register_agent_api(
-        app,
-        controller,
-        token_store,
-        addon_enabled=lambda: controller.store.integrations().get("agent_access", False),
-    )
-    app.mount(
-        "/agent/mcp",
-        build_mcp_app(
-            controller,
-            token_store,
-            lambda: controller.store.integrations().get("agent_access", False),
-        ),
-    )
+    register_agent_api(app, controller, token_store, addon_enabled=addon_enabled)
+    app.mount("/agent/mcp", mcp_asgi)
 
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
