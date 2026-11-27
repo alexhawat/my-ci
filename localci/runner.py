@@ -86,6 +86,8 @@ _PEM_ARMOR = re.compile(r"-----(?:BEGIN|END) [A-Z0-9 ]+-----")
 OUTPUT_LINE_LIMIT = 100_000
 OVERSIZED_LINE = "[oversized output line omitted]\n"
 CAPTURE_LIMIT = 2_000_000  # Bytes of captured stdout (workflow files, review.patch).
+STANDARD_JOB_ARCHIVE = Path("/opt/localci/runner-image.tar")
+LIGHTWEIGHT_JOB_ARCHIVE = Path("/opt/localci/lightweight-runner-image.tar")
 HELD_BYTES = 16_384  # Trailing base64 lines a log batch may keep back for the next one.
 
 
@@ -1055,6 +1057,7 @@ class Runner:
             else ""
         )
         run_review = review_enabled and not skip_reason
+        use_lightweight_jobs = False
         self.deadline = time.monotonic() + config.get("timeout", 7200)
         work = self.root / "work" / run["id"]
         checkout, control = work / "repo", work / "control"
@@ -1126,6 +1129,9 @@ class Runner:
                 if globs and await self.review_paths_match(checkout, run["base"], run["head"], globs):
                     skip_reason = "Review skipped by trusted base policy (review.skipWhenOnly); CI still runs"
                     run_review = False
+                    use_lightweight_jobs = (
+                        config.get("variables", {}).get("LOCALCI_LIGHTWEIGHT_JOBS") == "true"
+                    )
             if skip_reason:
                 await asyncio.to_thread(self.step, "mergeCraft", "skipped", skip_reason)
             review_secrets = self.secret_reader(run["repo"], "review") if run_review else {}
@@ -1363,7 +1369,20 @@ class Runner:
                     )
                     await self.copy_to_worker(name, checkout, "/workspace", sysbox)
                     await self.copy_to_worker(name, control, "/control", sysbox)
-                    # Seed the local runner image, avoiding a full image download on every run.
+                    # Use the same per-run Docker isolation with either runner archive.
+                    job_image, job_archive = "localci-jobs:1", STANDARD_JOB_ARCHIVE
+                    if use_lightweight_jobs:
+                        if LIGHTWEIGHT_JOB_ARCHIVE.is_file():
+                            job_image, job_archive = "localci-jobs-lightweight:1", LIGHTWEIGHT_JOB_ARCHIVE
+                            await asyncio.to_thread(
+                                self.log, "Using lightweight CI job image after review policy match.\n"
+                            )
+                        else:
+                            await asyncio.to_thread(
+                                self.log,
+                                "Lightweight CI job archive is unavailable; using the standard image.\n",
+                            )
+                    # Seed the local runner image before starting act.
                     if sysbox:
                         await self.command(
                             "docker",
@@ -1372,14 +1391,14 @@ class Runner:
                             name,
                             "docker",
                             "load",
-                            stdin_file=Path("/opt/localci/runner-image.tar"),
+                            stdin_file=job_archive,
                             max_seconds=600,
                         )
                     else:
                         await self.command(
                             "docker",
                             "cp",
-                            "/opt/localci/runner-image.tar",
+                            str(job_archive),
                             f"{name}:/runner-image.tar",
                             max_seconds=600,
                         )
@@ -1446,7 +1465,7 @@ class Runner:
                             "--rm",
                         ]
                         for label in ("ubuntu-latest", "ubuntu-24.04"):
-                            args += ["-P", f"{label}=localci-jobs:1"]
+                            args += ["-P", f"{label}={job_image}"]
                         for version in ("22.04", "20.04"):
                             args += ["-P", f"ubuntu-{version}=ghcr.io/catthehacker/ubuntu:act-{version}"]
                         # Only this workflow's secrets are present in the worker, and only

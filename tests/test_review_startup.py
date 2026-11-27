@@ -99,25 +99,33 @@ async def test_dependabot_keeps_ci_without_review_credentials_or_container(tmp_p
 
 
 @pytest.mark.parametrize(
-    "case,ci_code,review_skipped",
+    "case,ci_code,review_skipped,profile,lightweight_expected",
     [
-        ("inputs", 0, True),
-        ("inputs", 1, True),
-        ("mixed", 0, False),
-        ("empty", 0, False),
-        ("rename from outside", 0, False),
-        ("rename to outside", 0, False),
-        ("invalid filename encoding", 0, False),
-        ("git error", 0, False),
-        ("oversized output", 0, False),
-        ("head policy only", 0, False),
-        ("invalid policy", 0, False),
+        ("inputs", 0, True, "", False),
+        ("inputs", 0, True, "mounted", True),
+        ("inputs", 0, True, "sysbox", True),
+        ("inputs", 0, True, "missing", False),
+        ("inputs", 1, True, "mounted", True),
+        ("mixed", 0, False, "mounted", False),
+        ("empty", 0, False, "", False),
+        ("rename from outside", 0, False, "", False),
+        ("rename to outside", 0, False, "", False),
+        ("invalid filename encoding", 0, False, "", False),
+        ("git error", 0, False, "", False),
+        ("oversized output", 0, False, "", False),
+        ("head policy only", 0, False, "mounted", False),
+        ("invalid policy", 0, False, "", False),
     ],
 )
 async def test_trusted_path_policy_controls_the_review_lane(
-    tmp_path, monkeypatch, case, ci_code, review_skipped
+    tmp_path, monkeypatch, case, ci_code, review_skipped, profile, lightweight_expected
 ):
     monkeypatch.setenv("LOCALCI_REVIEW_IMAGE", "review:test")
+    monkeypatch.setenv("LOCALCI_WORKER_RUNTIME", "sysbox-runc" if profile == "sysbox" else "privileged")
+    lightweight_archive = tmp_path / "lightweight-runner-image.tar"
+    monkeypatch.setattr("localci.runner.LIGHTWEIGHT_JOB_ARCHIVE", lightweight_archive)
+    if profile != "missing":
+        lightweight_archive.touch()
 
     async def git_command(directory, *args, check=True, output=None):
         command = await asyncio.create_subprocess_exec(
@@ -188,6 +196,8 @@ async def test_trusted_path_policy_controls_the_review_lane(
 
     runner = Runner(store, GitHub(token), tmp_path / "data", secrets)
     created_reviews = []
+    seeded_archives = []
+    act_args = []
 
     async def run_command(*args, **kwargs):
         if args[:2] == ("git", "clone") and args[-2].startswith("https://"):
@@ -207,7 +217,12 @@ async def test_trusted_path_policy_controls_the_review_lane(
             env = Path(args[args.index("--env-file") + 1])
             config = (env.parent / "review-control/review-config.yaml").read_text()
             created_reviews.append(config)
+        if args[:2] == ("docker", "cp") and args[-1].endswith(":/runner-image.tar"):
+            seeded_archives.append(Path(args[-2]))
+        if args[-2:] == ("docker", "load"):
+            seeded_archives.append(kwargs["stdin_file"])
         if "act" in args:
+            act_args.extend(args)
             runner.completed_jobs = 1
             return ci_code, ""
         return 0, ""
@@ -218,10 +233,24 @@ async def test_trusted_path_policy_controls_the_review_lane(
     snapshot["base"]["sha"] = base
     snapshot["head"]["sha"] = head
     snapshot["labels"] = [{"name": "execution-files"}]
-    rid = store.enqueue("owner/repo", snapshot, {"review": True, "workflows": [".github/workflows/ci.yml"]})
+    rid = store.enqueue(
+        "owner/repo",
+        snapshot,
+        {
+            "review": True,
+            "workflows": [".github/workflows/ci.yml"],
+            "variables": {"LOCALCI_LIGHTWEIGHT_JOBS": "true"} if profile else {},
+        },
+    )
     await runner.execute(store.claim())
     run = store.rows("SELECT * FROM runs WHERE id=?", (rid,))[0]
     review = next(step for step in json.loads(run["steps"]) if step["name"] == "mergeCraft")
+    assert seeded_archives == [
+        lightweight_archive if lightweight_expected else Path("/opt/localci/runner-image.tar")
+    ]
+    image = "localci-jobs-lightweight:1" if lightweight_expected else "localci-jobs:1"
+    assert f"ubuntu-latest={image}" in act_args
+    assert f"ubuntu-24.04={image}" in act_args
     if review_skipped:
         assert review["state"] == "skipped"
         assert "review.skipWhenOnly" in review["message"]

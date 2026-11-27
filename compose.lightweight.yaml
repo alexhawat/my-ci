@@ -1,0 +1,10 @@
+# Optional override for an operator-provisioned lightweight runner archive.
+services:
+  worker:
+    volumes:
+      - type: bind
+        source: ./runtime/lightweight-runner-image.tar
+        target: /opt/localci/lightweight-runner-image.tar
+        read_only: true
+        bind:
+          create_host_path: false

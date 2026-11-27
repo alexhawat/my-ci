@@ -1,0 +1,11 @@
+# Seeded into the usual isolated CI worker for explicitly opted-in light workflows.
+FROM docker:29-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b82e2509b7d7a7030740d6d AS docker
+FROM node:24-bookworm-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530
+COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git python3 sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1001 -g root -s /bin/bash runner \
+    && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+    && chmod 440 /etc/sudoers.d/runner
+USER runner:root

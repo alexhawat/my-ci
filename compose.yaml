@@ -75,5 +75,11 @@ services:
       context: .
       dockerfile: Dockerfile.jobs
     profiles: [build]
+  lightweight-jobs-image:
+    image: localci-jobs-lightweight:1
+    build:
+      context: .
+      dockerfile: Dockerfile.jobs-lightweight
+    profiles: [build]
 volumes:
   localci-data:

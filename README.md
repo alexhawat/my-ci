@@ -105,6 +105,29 @@ Local CI records the skip and runs the configured CI workflows. CI failures
 still fail the run. The worker reads the rule before scheduling review and
 uses the base commit from the run snapshot.
 
+### Optional lightweight job image
+
+A repository with a lightweight workflow for the paths covered by
+`review.skipWhenOnly` can set the Local CI repository variable
+`LOCALCI_LIGHTWEIGHT_JOBS` to `true`. Configure this only for workflows whose
+`ubuntu-latest` and `ubuntu-24.04` jobs on that path need the lightweight image's
+Bash, Git, Python 3, Node.js 24 and Docker CLI. Local CI uses the normal per-run
+Docker worker and swaps only the job image archive. A mixed diff, a Dependabot
+exemption, or an unavailable archive uses the standard image.
+
+Build and archive the image on the Docker host that runs Local CI:
+
+```sh
+docker compose --profile build build lightweight-jobs-image
+docker image save -o runtime/lightweight-runner-image.tar localci-jobs-lightweight:1
+docker compose -f compose.yaml -f compose.lightweight.yaml up -d app worker
+```
+
+For a custom deployment, mount that archive read-only at
+`/opt/localci/lightweight-runner-image.tar` in the execution worker. You can
+include any pinned Docker images the lightweight jobs use in the same
+`docker image save` command to seed their layers before the workflow runs.
+
 ### Repository credentials
 
 The dashboard separates two credential scopes:
