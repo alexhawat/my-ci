@@ -92,6 +92,19 @@ Do not place credentials in `.env.example`, Compose, workflow YAML, or documenta
 
 Repository settings expose an optional **Review token ceiling** (1–100,000,000). This is an operator-controlled override: the worker writes it into its trusted review config with zero tolerance and a flat round multiplier, and pins the same value in the review process environment. Other base settings and all review gates remain intact. Blank preserves the trusted base budget. PR-head config cannot change its own review policy. Settings are snapshotted per run; save and Retry to apply a new ceiling. The startup log identifies the operator override. Usage arrives after each response, so the final in-flight response may exceed the limit.
 
+### Skip review for matching diffs
+
+Set `review.skipWhenOnly` in the base branch's `.mergecraft/config.yaml` to skip
+mergeCraft when every changed path in a nonempty PR diff matches one of the
+listed case-sensitive globs. Patterns match full paths relative to the
+repository root. For example, `review: {skipWhenOnly: ["execution_files/**"]}`
+covers an input-only PR. A cross-directory rename counts as a change at both
+paths, and an unreadable diff keeps the normal review path.
+
+Local CI records the skip and runs the configured CI workflows. CI failures
+still fail the run. The worker reads the rule before scheduling review and
+uses the base commit from the run snapshot.
+
 ### Repository credentials
 
 The dashboard separates two credential scopes:

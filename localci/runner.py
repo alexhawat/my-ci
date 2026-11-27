@@ -26,10 +26,12 @@ from localci.github import GitHub
 from localci.policy import (
     Blocked,
     dependabot_pr,
+    diff_matches_review_skip,
     github_token_referenced,
     is_local_workflow,
     plan,
     secret_references,
+    take_review_skip_globs,
     workflow_files,
 )
 from localci.review_evidence import (
@@ -1020,12 +1022,39 @@ class Runner:
             "UPDATE runs SET steps=?,published=0 WHERE id=?", (json.dumps(steps), self.run["id"])
         )
 
+    async def review_paths_match(self, checkout: Path, base: str, head: str, globs: tuple[str, ...]) -> bool:
+        try:
+            # Treat renames as delete plus add so both paths must be covered by the policy.
+            code, paths = await self.command(
+                "git",
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "--no-ext-diff",
+                "-z",
+                f"{base}...{head}",
+                "--",
+                cwd=checkout,
+                check=False,
+                capture=True,
+            )
+        except Cancelled:
+            raise
+        except (OSError, RuntimeError):
+            return False
+        return code == 0 and diff_matches_review_skip(paths, globs)
+
     async def execute(self, run: dict):
         self.run = run
         config = json.loads(run["config"])
         pr = json.loads(run["snapshot"])
-        skip_review = bool(config.get("review") and dependabot_pr(pr))
-        run_review = bool(config.get("review") and not skip_review)
+        review_enabled = bool(config.get("review"))
+        skip_reason = (
+            "Dependabot PR: mergeCraft review is disabled; CI still runs"
+            if review_enabled and dependabot_pr(pr)
+            else ""
+        )
+        run_review = review_enabled and not skip_reason
         self.deadline = time.monotonic() + config.get("timeout", 7200)
         work = self.root / "work" / run["id"]
         checkout, control = work / "repo", work / "control"
@@ -1044,18 +1073,10 @@ class Runner:
             control.mkdir()
             token = self.github.token()
             secrets = self.secret_reader(run["repo"], "ci")
-            review_secrets = self.secret_reader(run["repo"], "review") if run_review else {}
             if config.get("github_auth") == "gh":
                 secrets = {**secrets, "GITHUB_TOKEN": token, "GH_TOKEN": token}
-            self.sensitive = [token, *redaction_values(secrets, review_secrets)]
+            self.sensitive = [token, *redaction_values(secrets, {})]
             metrics = asyncio.create_task(sample_resources(self.store, run["id"], {name, review_name}))
-            if skip_review:
-                await asyncio.to_thread(
-                    self.step,
-                    "mergeCraft",
-                    "skipped",
-                    "Dependabot PR: mergeCraft review is disabled; CI still runs",
-                )
             await asyncio.to_thread(self.step, "Checkout", "running")
             basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
             self.sensitive.append(basic)
@@ -1081,6 +1102,35 @@ class Runner:
                     raise Blocked("Invalid GitHub commit SHA")
                 await self.command("git", "fetch", "origin", sha, cwd=checkout, env=git_env, max_seconds=300)
             await self.command("git", "checkout", "--detach", run["base"], cwd=checkout)
+            review_config = {}
+            review_config_error = None
+            if run_review:
+                try:
+                    code, base_config = await self.command(
+                        "git",
+                        "show",
+                        f"{run['base']}:.mergecraft/config.yaml",
+                        cwd=checkout,
+                        capture=True,
+                        check=False,
+                        quiet=True,  # Optional file: absent in most repositories.
+                    )
+                    review_config = (yaml.safe_load(base_config) or {}) if code == 0 else {}
+                except Cancelled:
+                    raise
+                except (OSError, RuntimeError, yaml.YAMLError) as exc:
+                    # Let the review lane report the config error while CI still runs.
+                    review_config_error = exc
+
+                globs = take_review_skip_globs(review_config)
+                if globs and await self.review_paths_match(checkout, run["base"], run["head"], globs):
+                    skip_reason = "Review skipped by trusted base policy (review.skipWhenOnly); CI still runs"
+                    run_review = False
+            if skip_reason:
+                await asyncio.to_thread(self.step, "mergeCraft", "skipped", skip_reason)
+            review_secrets = self.secret_reader(run["repo"], "review") if run_review else {}
+            self.sensitive.extend(redaction_values({}, review_secrets))
+
             # Pin workflows to the trusted base. The tested tree is a real merge, like PR CI on GitHub.
             prepared = []
             workflow_secrets: dict[str, set[str]] = {}
@@ -1454,17 +1504,8 @@ class Runner:
                                 self.log,
                                 f"Removed {len(removed)} PR-authored agent configuration entries from the review tree.\n",
                             )
-                        code, base_config = await self.command(
-                            "git",
-                            "show",
-                            f"{run['base']}:.mergecraft/config.yaml",
-                            cwd=checkout,
-                            capture=True,
-                            check=False,
-                            quiet=True,  # Optional file: absent in most repositories.
-                        )
-                        review_config = yaml.safe_load(base_config) if code == 0 else {}
-                        review_config = review_config or {}
+                        if review_config_error is not None:
+                            raise review_config_error
                         # Only the operator's snapshotted repo setting can override
                         # the trusted base budget; never load this from the PR head.
                         token_ceiling = config.get("review_token_ceiling")

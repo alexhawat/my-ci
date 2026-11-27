@@ -1,11 +1,35 @@
 import copy
 import re
+from fnmatch import fnmatchcase
 
 import yaml
 
 
 class Blocked(RuntimeError):
     pass
+
+
+def take_review_skip_globs(config: object) -> tuple[str, ...]:
+    """Consume the Local CI setting before passing the remaining policy to mergeCraft."""
+    if not isinstance(config, dict) or not isinstance(review := config.get("review"), dict):
+        return ()
+    globs = review.pop("skipWhenOnly", None)
+    if not isinstance(globs, list) or not all(
+        isinstance(pattern, str)
+        and "\0" not in pattern
+        and all(part not in {"", ".", ".."} for part in pattern.split("/"))
+        for pattern in globs
+    ):
+        return ()
+    return tuple(globs)
+
+
+def diff_matches_review_skip(diff: str, globs: tuple[str, ...]) -> bool:
+    """Require a complete, readable, nonempty NUL-delimited list of Git paths."""
+    if not diff.endswith("\0") or "\ufffd" in diff:
+        return False
+    paths = diff[:-1].split("\0")
+    return all(path and any(fnmatchcase(path, pattern) for pattern in globs) for path in paths)
 
 
 # Where a selected workflow comes from. A repository path names a YAML file anywhere in
