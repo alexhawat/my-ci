@@ -546,12 +546,20 @@ def test_open_prs_show_github_checks_without_the_local_ci_status(client):
                         check_run("test"),
                         check_run("lint", conclusion="FAILURE"),
                         check_run("deploy", status="IN_PROGRESS", conclusion=None),
-                        check_run("local-ci", workflow_name=None),
+                        check_run("my-ci", workflow_name=None),
+                        {
+                            "__typename": "StatusContext",
+                            "context": "my-ci",
+                            "state": "SUCCESS",
+                            "targetUrl": "https://ci.example.com/?run=1",
+                        },
+                        # Published before the rename; still this service's own result.
+                        check_run("local-ci", workflow_name=None, conclusion="FAILURE"),
                         {
                             "__typename": "StatusContext",
                             "context": "local-ci",
-                            "state": "SUCCESS",
-                            "targetUrl": "https://ci.example.com/?run=1",
+                            "state": "FAILURE",
+                            "targetUrl": "https://ci.example.com/?run=0",
                         },
                         {
                             "__typename": "StatusContext",

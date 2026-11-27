@@ -495,6 +495,95 @@ async def test_app_check_run_reconciles_by_external_id_and_revokes_token(tmp_pat
     assert calls[-1][:2] == ("DELETE", "installation/token")
 
 
+async def test_app_check_run_renames_and_retires_legacy_local_ci_runs(tmp_path, monkeypatch):
+    github = GitHub(tmp_path / "token")
+    monkeypatch.setattr("localci.github.app_jwt", lambda *_: "jwt")
+    listed = {
+        "my-ci": [],
+        "local-ci": [
+            # This run, started before the rename: renamed in place, not duplicated.
+            {"id": 1, "external_id": "run2", "app": {"id": 123}, "conclusion": None},
+            # An earlier attempt's failure: neutralised.
+            {"id": 2, "external_id": "run1", "app": {"id": 123}, "conclusion": "failure"},
+            # Already retired, or another App's: left alone.
+            {"id": 3, "external_id": "run0", "app": {"id": 123}, "conclusion": "neutral"},
+            {"id": 4, "external_id": "other", "app": {"id": 999}, "conclusion": "failure"},
+        ],
+    }
+    calls = []
+
+    async def request(method, path, **kwargs):
+        calls.append((method, path, copy.deepcopy(kwargs)))
+        if path.endswith("/installation"):
+            return {"id": 9}
+        if path.endswith("/access_tokens"):
+            return {"token": "installation-token"}
+        if "/commits/" in path:
+            return {"check_runs": listed[kwargs["params"]["check_name"]]}
+        return {}
+
+    github.request = request
+    run = {"id": "run2", "repo": "owner/repo", "head": "a" * 40, "state": "failure", "steps": "[]"}
+    await github.check_run(
+        run, "failure", "Failed", "https://local.example", {"app_id": "123", "private_key": "k"}
+    )
+    names = [k["params"]["check_name"] for m, p, k in calls if m == "GET" and "/commits/" in p]
+    assert names == ["my-ci", "local-ci"]
+    writes = {
+        p.rsplit("/", 1)[1]: (m, k["json"])
+        for m, p, k in calls
+        if m in ("POST", "PATCH") and "check-runs" in p
+    }
+    assert set(writes) == {"1", "2"}
+    assert writes["1"][0] == "PATCH" and writes["1"][1]["name"] == "my-ci"
+    assert writes["1"][1]["conclusion"] == "failure"
+    assert (
+        writes["2"][1]["conclusion"] == "neutral" and writes["2"][1]["output"]["title"] == "Renamed to my-ci"
+    )
+
+    # A run that never had a local-ci Check Run gets one new my-ci run.
+    listed["local-ci"] = []
+    calls.clear()
+    await github.check_run(
+        run, "pending", "Running", "https://local.example", {"app_id": "123", "private_key": "k"}
+    )
+    posted = [k["json"] for m, p, k in calls if m == "POST" and p.endswith("/check-runs")]
+    assert [body["name"] for body in posted] == ["my-ci"]
+    assert not any(m == "PATCH" for m, *_ in calls)
+
+
+async def test_commit_status_retires_a_legacy_local_ci_status_once(tmp_path):
+    from localci.github import RETIRED_SUMMARY
+
+    github = GitHub(tmp_path / "token")
+    statuses = [
+        {"context": "my-ci", "state": "pending", "description": "Running"},
+        {"context": "local-ci", "state": "failure", "description": "Failed"},
+    ]
+    calls = []
+
+    async def request(method, path, **kwargs):
+        calls.append((method, path, copy.deepcopy(kwargs)))
+        if path.endswith("/status"):
+            return {"statuses": statuses}
+        return {}
+
+    github.request = request
+    run = {"id": "run1", "repo": "owner/repo", "head": "a" * 40}
+    await github.status(run, "failure", "Failed", "https://local.example/?run=run1")
+    posted = [k["json"] for m, p, k in calls if m == "POST"]
+    assert [(body["context"], body["state"]) for body in posted] == [
+        ("my-ci", "failure"),
+        ("local-ci", "success"),
+    ]
+    assert posted[1]["description"] == RETIRED_SUMMARY
+
+    statuses[1] = {"context": "local-ci", "state": "success", "description": RETIRED_SUMMARY}
+    calls.clear()
+    await github.status(run, "success", "Passed", "https://local.example/?run=run1")
+    assert [k["json"]["context"] for m, p, k in calls if m == "POST"] == ["my-ci"]
+
+
 def test_retry_limit_survives_restart_and_new_revisions_get_fresh_budget(tmp_path):
     from localci.store import RetryLimitReached
 

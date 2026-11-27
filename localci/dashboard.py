@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 
 from localci import updater
-from localci.github import GitHubError
+from localci.github import CHECK_NAME, LEGACY_CHECK_NAME, GitHubError
 from localci.policy import (
     WORKFLOW_PATH_HELP,
     is_local_workflow,
@@ -22,7 +22,7 @@ from localci.policy import (
 )
 from localci.results import check_summary
 
-PR_TRIGGER_HELP = "Local CI runs workflows for pull requests; keep an on: pull_request trigger"
+PR_TRIGGER_HELP = "my-ci runs workflows for pull requests; keep an on: pull_request trigger"
 
 
 class ExecutionSettings(BaseModel):
@@ -67,8 +67,9 @@ CHECK_LABELS = {"success": "passed", "failure": "failed"}
 
 
 def github_checks(node: dict) -> dict:
-    """Summarize GitHub's checks for one PR head, leaving out the ``local-ci`` result
-    this service publishes itself (the Local CI column already shows it)."""
+    """Summarize GitHub's checks for one PR head, leaving out the ``my-ci`` result
+    this service publishes itself (the my-ci column already shows it) and the
+    ``local-ci`` result it published before the rename."""
     commits = (node.get("commits") or {}).get("nodes") or []
     rollup = ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") if commits else None
     contexts = (rollup or {}).get("contexts") or {}
@@ -88,7 +89,7 @@ def github_checks(node: dict) -> dict:
         else:
             name, url = item.get("context") or "", item.get("targetUrl") or ""
             state, label = STATUS_STATES.get(item.get("state") or "", "running"), name
-        if name == "local-ci":
+        if name in (CHECK_NAME, LEGACY_CHECK_NAME):
             continue
         checks.append({"name": label, "state": state, "url": url if url.startswith("https://") else ""})
     counts = {state: sum(c["state"] == state for c in checks) for state in CHECK_ORDER}
@@ -557,9 +558,9 @@ def register_dashboard(app, controller, repo_name, get_run):
         if not path.exists():
             return PlainTextResponse(
                 "Waiting for worker…",
-                headers={"Content-Disposition": f'attachment; filename="local-ci-{rid}.log"'},
+                headers={"Content-Disposition": f'attachment; filename="my-ci-{rid}.log"'},
             )
-        return FileResponse(path, filename=f"local-ci-{rid}.log", media_type="text/plain")
+        return FileResponse(path, filename=f"my-ci-{rid}.log", media_type="text/plain")
 
     @app.get("/api/runs/{rid}/resources")
     def resources(rid: str):

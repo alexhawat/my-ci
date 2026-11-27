@@ -45,7 +45,7 @@ class Store:
             db.execute("PRAGMA journal_mode=WAL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
-                raise RuntimeError("Database is newer than this Local CI release")
+                raise RuntimeError("Database is newer than this my-ci release")
             if 0 < version < SCHEMA_VERSION:
                 backup = path.with_suffix(f".pre-v{version + 1}.sqlite")
                 if not backup.exists():
@@ -195,7 +195,7 @@ class Store:
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("Local CI database writer did not become available") from None
+                        raise TimeoutError("my-ci database writer did not become available") from None
                     time.sleep(0.02)
             try:
                 yield

@@ -528,9 +528,7 @@ def test_run_level_error_outside_steps_is_not_reported_as_ci_success(tmp_path):
     report = reports(run, tmp_path, store, [])["ci"]
     assert report["state"] == "error"
     body = comment_body(run, "ci", report, "https://private.test")
-    assert (
-        "## Local CI: error" in body and "wall\\-clock limit" in body and "success" not in body.split("\n")[1]
-    )
+    assert "## my-ci: error" in body and "wall\\-clock limit" in body and "success" not in body.split("\n")[1]
 
 
 def test_failed_review_does_not_turn_successful_ci_into_a_failure(tmp_path):
@@ -548,7 +546,7 @@ def test_failed_review_does_not_turn_successful_ci_into_a_failure(tmp_path):
     [
         "line\n===\n",
         "line\n---",
-        "x\n# Local CI: success",
+        "x\n# my-ci: success",
         "x\n> quoted",
         "x\n- **ci.yml: success**",
         "x\n1. numbered",

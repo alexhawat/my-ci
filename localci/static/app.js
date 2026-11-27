@@ -70,11 +70,11 @@ function openMerge(key) {
   $('merge-summary').innerHTML=`<strong>${esc(p.title)}</strong><br>${esc(p.branch)} → ${esc(p.base_branch)} · <code>${esc(p.head.slice(0,8))}</code>`;
   const local=!r?'not run':r.current?r.state:'outdated';
   const warnings=[];
-  if(local!=='success')warnings.push(`Local CI for this commit: ${local}.`);
+  if(local!=='success')warnings.push(`my-ci for this commit: ${local}.`);
   if(!['success','none'].includes(g.state))warnings.push(`GitHub CI: ${g.summary||g.state}.`);
   if(g.merge_state==='BLOCKED')warnings.push('GitHub reports this merge as blocked by branch rules; it will probably be refused.');
   if(g.review_decision==='CHANGES_REQUESTED'||g.review_decision==='REVIEW_REQUIRED')warnings.push(g.review_decision==='REVIEW_REQUIRED'?'A required review is missing.':'Changes were requested.');
-  $('merge-warnings').innerHTML=warnings.length?warnings.map(w=>`<div>⚠ ${esc(w)}</div>`).join(''):'Local CI and GitHub checks are green.';
+  $('merge-warnings').innerHTML=warnings.length?warnings.map(w=>`<div>⚠ ${esc(w)}</div>`).join(''):'my-ci and GitHub checks are green.';
   $('merge-method').innerHTML=p.merge_methods.map(m=>`<option value="${esc(m)}">${esc({merge:'Create a merge commit',squash:'Squash and merge',rebase:'Rebase and merge'}[m]||m)}</option>`).join('');
   $('merge-result').textContent='';$('merge-confirm').disabled=false;
   $('merge-dialog').showModal();
@@ -83,7 +83,7 @@ function filterPRs() {
   const q=$('pr-search').value.toLowerCase();
   const prs=openPRs.filter(p=>[p.repo,`#${p.number}`,p.title,p.author,p.branch,p.state==='closed'?(p.merged?'merged':'closed'):(p.draft?'draft':'open'),p.latest_run?.state].join(' ').toLowerCase().includes(q));
   const iso=t=>t?date(Date.parse(t)/1000):'—';
-  replaceHTML($('pr-list'),prs.length?`<div class="table-wrap"><table class="pr-table"><thead><tr><th>Repository / PR</th><th>Title</th><th>Author / state</th><th>Branch → base</th><th>Local CI</th><th>Checks</th><th>GitHub CI</th><th>Updated</th><th>Opened</th><th></th></tr></thead><tbody>${prs.map(p=>{
+  replaceHTML($('pr-list'),prs.length?`<div class="table-wrap"><table class="pr-table"><thead><tr><th>Repository / PR</th><th>Title</th><th>Author / state</th><th>Branch → base</th><th>my-ci</th><th>Checks</th><th>GitHub CI</th><th>Updated</th><th>Opened</th><th></th></tr></thead><tbody>${prs.map(p=>{
     const r=p.latest_run,current=r?.current,status=r?(current?badge(r.state):badge('outdated')):'<span class="muted">Not run</span>';
     return `<tr><td><a class="text-button" href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.repo)} #${p.number} ↗</a></td><td><strong>${esc(p.title)}</strong></td><td>${esc(p.author)}<small>${p.state==='closed'?(p.merged?'Merged':'Closed'):(p.draft?'Draft':'Open')}${p.fork?' · Fork':''}</small></td><td>${esc(p.branch)} → ${esc(p.base_branch)}<small><code>${esc(p.head.slice(0,8))}</code></small></td><td>${status}<small>${esc(p.ci_eligibility)}</small>${p.sync_error?'<small>Sync needs attention</small>':''}</td><td>${r?`${current?'':'Previous revision: '}${esc(r.checks_summary||r.state)}`:'—'}</td><td>${githubCell(p)}</td><td>${iso(p.updated)}</td><td>${iso(p.created)}</td><td><div class="button-row">${r?`<button class="button" data-run="${esc(r.id)}">View run ↗</button>`:''}${mergeButton(p)}</div></td></tr>`;
   }).join('')}</tbody></table></div>`:`<div class="empty"><strong>No matching ${prMode} pull requests.</strong>Only repositories that run checks here or that you watch appear here.</div>`);
@@ -444,7 +444,7 @@ $('analytics-days').addEventListener('change',()=>loadAnalytics().catch(e=>notic
 $('app-form').addEventListener('submit',async e=>{e.preventDefault();try{const file=$('app-key').files[0];if(!file||file.size>20000)throw new Error('Choose a PEM key under 20 KB');const result=await api('/github-app',{method:'PUT',body:JSON.stringify({app_id:$('app-id').value,private_key:await file.text()})});$('app-key').value='';$('app-id').value='';$('app-result').textContent=`Connected ${result.name}. New results are published as Check Runs.`;await refresh();}catch(e){$('app-result').textContent=e.message;}});
 function renderPreferences() {
   const app=state.github_app;
-  $('reporting-status').innerHTML=app?`<strong>Check Runs via GitHub App ${esc(app.name||'')}</strong> (App ID ${esc(app.app_id)}). Repositories the App is not installed on get a commit status from ${esc(state.login||'the worker\u2019s GitHub login')} instead.`:`<strong>Commit statuses via ${esc(state.login||'the worker\u2019s GitHub login')}.</strong> Each PR gets a <code>local-ci</code> status. No GitHub App is connected, and none is required.`;
+  $('reporting-status').innerHTML=app?`<strong>Check Runs via GitHub App ${esc(app.name||'')}</strong> (App ID ${esc(app.app_id)}). Repositories the App is not installed on get a commit status from ${esc(state.login||'the worker\u2019s GitHub login')} instead.`:`<strong>Commit statuses via ${esc(state.login||'the worker\u2019s GitHub login')}.</strong> Each PR gets a <code>my-ci</code> status. No GitHub App is connected, and none is required.`;
   $('app-heading').textContent=app?'Replace or disconnect the GitHub App':'Optional: publish Check Runs with a GitHub App';
   $('app-connect').textContent=app?'Validate & replace App':'Validate & connect App';$('app-disconnect').hidden=!app;
   if(document.activeElement!==$('integration-mergecraft'))$('integration-mergecraft').checked=mergecraft();
