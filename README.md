@@ -1,6 +1,6 @@
 # My CI
 
-The `my-ci` repository contains **Local CI**, the name the service, dashboard, and GitHub statuses use.
+The service, its dashboard and the results it posts to GitHub are all named **my-ci**. It used to be called Local CI; the Python package (`localci`), `LOCALCI_*` environment variables, image tags and container names keep that name.
 
 Self-hosted pull-request CI, optional mergeCraft reviews, and a private web dashboard. Jobs run in disposable Docker containers on your infrastructure; GitHub supplies source and receives results but provides no runners or compute.
 
@@ -27,7 +27,7 @@ The FastAPI dashboard and execution worker share a versioned SQLite database and
 
 The dashboard has no Docker socket, but the execution worker has host Docker access and starts `--privileged` Docker-in-Docker workers (or, with `LOCALCI_WORKER_RUNTIME=sysbox-runc`, Sysbox system containers). Per-run networks are not a host boundary and do not change this: **PR code is effectively root on the host.** It can access the host data volume and every stored credential, regardless of which values a job references. Enable only repositories and contributors you would trust with host-root access.
 
-Bot-authored PRs (GitHub user type `Bot` or a login ending in `[bot]`, such as Dependabot) do not run automatically. Local CI records a blocked run, "awaiting operator approval"; after reviewing the change, start it from the dashboard with **Retry latest PR** or **Run selected as new runs**. The approval applies to the exact revision of that held run: if the PR's head or base commit has changed since (the bot pushed, or the base branch moved), the retry is refused and the new revision's own held run must be reviewed and started. An approval counts as one attempt in the retry budget. A system-ended run of a bot-authored PR is re-queued automatically only if an operator had started that revision or the repository allows automatic bot runs; otherwise a new held run awaits approval (see [Execution limits](#execution-limits)). The per-repository setting `run_bot_prs` (off by default) restores automatic runs for that repository and starts PRs that are currently held.
+Bot-authored PRs (GitHub user type `Bot` or a login ending in `[bot]`, such as Dependabot) do not run automatically. my-ci records a blocked run, "awaiting operator approval"; after reviewing the change, start it from the dashboard with **Retry latest PR** or **Run selected as new runs**. The approval applies to the exact revision of that held run: if the PR's head or base commit has changed since (the bot pushed, or the base branch moved), the retry is refused and the new revision's own held run must be reviewed and started. An approval counts as one attempt in the retry budget. A system-ended run of a bot-authored PR is re-queued automatically only if an operator had started that revision or the repository allows automatic bot runs; otherwise a new held run awaits approval (see [Execution limits](#execution-limits)). The per-repository setting `run_bot_prs` (off by default) restores automatic runs for that repository and starts PRs that are currently held.
 
 ## Prerequisites
 
@@ -101,21 +101,21 @@ repository root. For example, `review: {skipWhenOnly: ["execution_files/**"]}`
 covers an input-only PR. A cross-directory rename counts as a change at both
 paths, and an unreadable diff keeps the normal review path.
 
-Local CI records the skip and runs the configured CI workflows. CI failures
+my-ci records the skip and runs the configured CI workflows. CI failures
 still fail the run. The worker reads the rule before scheduling review and
 uses the base commit from the run snapshot.
 
 ### Optional lightweight job image
 
 A repository with a lightweight workflow for the paths covered by
-`review.skipWhenOnly` can set the Local CI repository variable
+`review.skipWhenOnly` can set the my-ci repository variable
 `LOCALCI_LIGHTWEIGHT_JOBS` to `true`. Configure this only for workflows whose
 `ubuntu-latest` and `ubuntu-24.04` jobs on that path need the lightweight image's
-Bash, Git, Python 3, Node.js 24 and Docker CLI. Local CI uses the normal per-run
+Bash, Git, Python 3, Node.js 24 and Docker CLI. my-ci uses the normal per-run
 Docker worker and swaps only the job image archive. A mixed diff, a Dependabot
 exemption, or an unavailable archive uses the standard image.
 
-Build and archive the image on the Docker host that runs Local CI:
+Build and archive the image on the Docker host that runs my-ci:
 
 ```sh
 docker compose --profile build build lightweight-jobs-image
@@ -139,7 +139,14 @@ Values are encrypted, write-only, and never imported automatically from GitHub A
 
 The optional host GitHub login grants CI jobs all permissions of that login; workflow YAML `permissions` does not narrow it under `act`. Leaving it disabled keeps the token out of CI jobs, but once `login.sh` has run the token file exists on the host, where PR code can read it regardless of the setting. Use a dedicated low-privilege GitHub account and token.
 
-Results reach GitHub as a `local-ci` commit status posted with the worker's GitHub login; no GitHub App is needed. To publish a `local-ci` Check Run instead, connect a GitHub App under **Settings → Reporting results to GitHub**. Any App you own works (it need not be a mergeCraft App, although one you already use for mergeCraft can be reused) if it has Checks read/write permission and is installed on the repository; repositories it is not installed on keep getting commit statuses. Provide its App ID and an RSA private key. **Disconnect App** deletes the stored credentials and goes back to commit statuses. App credentials are not passed to CI or review containers, but they are stored in the data volume, which host-root-equivalent PR code can read.
+Results reach GitHub as a `my-ci` commit status posted with the worker's GitHub login; no GitHub App is needed. To publish a `my-ci` Check Run instead, connect a GitHub App under **Settings → Reporting results to GitHub**. Any App you own works (it need not be a mergeCraft App, although one you already use for mergeCraft can be reused) if it has Checks read/write permission and is installed on the repository; repositories it is not installed on keep getting commit statuses. Provide its App ID and an RSA private key. **Disconnect App** deletes the stored credentials and goes back to commit statuses. App credentials are not passed to CI or review containers, but they are stored in the data volume, which host-root-equivalent PR code can read.
+
+The status context and Check Run were called `local-ci` before they were renamed to `my-ci`. A PR whose head commit already has a `local-ci` result gets `my-ci` from its next run, and the old result is retired so it does not stay beside the new one:
+
+- Check Run: a run that started under `local-ci` is renamed to `my-ci` in place when it is next updated, so no second run appears. Any other `local-ci` Check Run from the same App on that commit is completed as **neutral**, titled "Renamed to my-ci".
+- Commit status: a status cannot be deleted or made neutral, so the `local-ci` context on that commit is set once to success with the description "Renamed to my-ci; see the my-ci result for this commit." The `my-ci` status beside it carries the real result.
+
+Nothing is changed until my-ci next publishes for that commit, so a PR that is not re-run keeps its `local-ci` result. Branch protection, rulesets or tools that require `local-ci` need to require `my-ci` instead, because the retired context reports success whatever the new result is. Disconnecting the App before an old Check Run has been retired leaves it in place, since only that App can change it.
 
 Enable **Settings → Integrations → mergeCraft AI review** to reveal **mergeCraft** at the bottom of a repository’s **Configure** dialog. CI workflow credentials have their own section. An empty reviewer pipeline uses the trusted base roster and its existing review credentials.
 
@@ -214,9 +221,9 @@ Base images are pinned by digest. The job image installs Chrome from Google's si
 
 ## GitHub CI and merging
 
-The **PRs** view shows two results for each open pull request. **Local CI** is the run on your worker. **GitHub CI** is what GitHub reports for the PR's head commit: GitHub Actions check runs and commit statuses from other integrations, with a link to each. The `local-ci` result this service publishes is left out of that column. GitHub CI is display only: it never starts, cancels or changes a local run. It is read with the worker's GitHub login (one GraphQL request per enabled or watched repository, cached for 20 seconds) and covers the 200 most recently updated open PRs of a repository and the first 100 checks of each.
+The **PRs** view shows two results for each open pull request. **my-ci** is the run on your worker. **GitHub CI** is what GitHub reports for the PR's head commit: GitHub Actions check runs and commit statuses from other integrations, with a link to each. The `my-ci` result this service publishes, and the `local-ci` result it published before the rename, are left out of that column. GitHub CI is display only: it never starts, cancels or changes a local run. It is read with the worker's GitHub login (one GraphQL request per enabled or watched repository, cached for 20 seconds) and covers the 200 most recently updated open PRs of a repository and the first 100 checks of each.
 
-**Merge** asks GitHub to merge the pull request as the worker's GitHub login, using the merge method you choose from those the repository allows. The request names the head commit shown in the dashboard, so GitHub refuses it if the PR has changed since. Local CI does not gate the button: the confirmation lists a local or GitHub result that is not green, and GitHub's branch protection, required checks and required reviews decide whether the merge is accepted. Draft PRs and PRs with merge conflicts cannot be merged from the dashboard. The login needs write access to the repository; anyone who can reach the dashboard can merge with it.
+**Merge** asks GitHub to merge the pull request as the worker's GitHub login, using the merge method you choose from those the repository allows. The request names the head commit shown in the dashboard, so GitHub refuses it if the PR has changed since. my-ci does not gate the button: the confirmation lists a local or GitHub result that is not green, and GitHub's branch protection, required checks and required reviews decide whether the merge is accepted. Draft PRs and PRs with merge conflicts cannot be merged from the dashboard. The login needs write access to the repository; anyone who can reach the dashboard can merge with it.
 
 ### Watching a repository
 

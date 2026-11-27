@@ -224,7 +224,7 @@ class Controller:
                 "success": "success",
                 "failure": "failure",
             }.get(run["state"], "error")
-            description = run["message"] or f"Local CI {run['state']} on {self.host_label}"
+            description = run["message"] or f"my-ci {run['state']} on {self.host_label}"
             try:
                 evidence = await asyncio.to_thread(self.reports, run)
                 # Recheck before final phase comments as well as aggregate results.

@@ -1,1 +1,1 @@
-"""Local CI control plane. Never imports or runs code from watched repositories."""
+"""my-ci control plane. Never imports or runs code from watched repositories."""
