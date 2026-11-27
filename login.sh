@@ -17,4 +17,4 @@ test -s runtime/github-token.new
 cat runtime/github-token.new > runtime/github-token
 rm runtime/github-token.new
 chmod 600 runtime/github-token
-printf 'GitHub login ready for Local CI.\n'
+printf 'GitHub login ready for my-ci.\n'

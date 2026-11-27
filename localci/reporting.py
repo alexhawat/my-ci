@@ -234,7 +234,7 @@ def comment_body(run: dict, kind: str, report: dict, url: str) -> str:
         return f"### mergeCraft: skipped\n\n{literal(reason, block=True)}\n\n{footer}"
     if kind == "review":
         return review_body(run, report, url)
-    title = "Local CI"
+    title = "my-ci"
     lines = [
         f"<!-- localci:ci:v2:{run['id']} -->",
         f"## {title}: {report['state']}",
@@ -559,7 +559,7 @@ def review_body(run: dict, report: dict, url: str) -> str:
         "",
         f"- Outcome: **{literal(report.get('result_label', report['state']))}**",
         f"- Failure threshold: {literal(report.get('failure_threshold', 'Legacy exit-code policy'))}",
-        f"- Signals behind the outcome: CLI exit code {literal(record.get('exit_code', 'Not recorded'))} · agent verdict {literal(record.get('verdict', 'Unavailable'))} (diagnostic only; the outcome above applies the local-ci failure threshold)",
+        f"- Signals behind the outcome: CLI exit code {literal(record.get('exit_code', 'Not recorded'))} · agent verdict {literal(record.get('verdict', 'Unavailable'))} (diagnostic only; the outcome above applies the my-ci failure threshold)",
         f"- Change: {literal(run['repo'])}#{run['pr']}",
         f"- Reviewed commit: `{run['head']}` · base `{run.get('base', 'unavailable')}`",
         f"- Blast radius: {literal(record.get('blast_radius', 'Unavailable'))} — {literal(record.get('scope_reason', ''))}",
@@ -575,12 +575,12 @@ def review_body(run: dict, report: dict, url: str) -> str:
         f"- Run: `{run['id']}` · [Full run, logs and artifacts — Tailscale access required]({url})",
         f"- Review image: {literal(record.get('image') or 'Not recorded by this run')}",
         f"- Container wall time: {literal(record.get('container_seconds', 'Not recorded'))} seconds · deadline {literal(record.get('timeout_seconds', 'Not recorded'))} seconds · model attempt cap {literal(record.get('model_attempt_limit', 'Not recorded'))}",
-        "- Publication path: local-ci native GitHub COMMENT review",
+        "- Publication path: my-ci native GitHub COMMENT review",
         "",
         "### Pre-merge checks",
         "",
         "- Review sandbox: separate Docker container; shell, push, approval and auto-merge disabled.",
-        "- CI runs independently. Its outcome is reported separately by Local CI.",
+        "- CI runs independently. Its outcome is reported separately by my-ci.",
     ]
     lines += [
         f"- {literal(c['name'])}: **{literal(c['state'])}** — {literal(c['message'])}"

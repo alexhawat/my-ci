@@ -157,8 +157,10 @@ async def test_missing_app_installation_uses_gh_commit_status_only(tmp_path, sta
     if fallback:
         mode = await github.status(run, "failure", "CI failed; review errored", "https://local.test")
         assert "gh login" in mode
-        assert github.request.call_args.args == ("POST", "repos/owner/repo/statuses/" + "a" * 40)
-        assert github.request.call_args.kwargs["json"]["state"] == "failure"
+        post = github.request.call_args_list[0]
+        assert post.args == ("POST", "repos/owner/repo/statuses/" + "a" * 40)
+        assert post.kwargs["json"]["state"] == "failure"
+        assert post.kwargs["json"]["context"] == "my-ci"
     else:
         with pytest.raises(GitHubError):
             await github.status(run, "failure", "failed", "https://local.test")

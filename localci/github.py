@@ -53,6 +53,16 @@ query($owner: String!, $name: String!, $cursor: String) {
 """
 
 
+# The name of the commit status context and Check Run this service publishes.
+CHECK_NAME = "my-ci"
+# The name it published under before the rename. Still read, so that a result posted
+# under it before the rename is renamed in place or retired instead of left beside the
+# new one. Remove once no open PR's head commit carries a local-ci result: every PR
+# opened before the rename has been pushed to, re-run or closed.
+LEGACY_CHECK_NAME = "local-ci"
+RETIRED_SUMMARY = f"Renamed to {CHECK_NAME}; see the {CHECK_NAME} result for this commit."
+
+
 class GitHubError(RuntimeError):
     def __init__(self, status: int, method: str, path: str, retry_after: float | None = None):
         self.status, self.method, self.path = status, method, path.split("?")[0]
@@ -194,6 +204,7 @@ class GitHub:
         if credentials:
             try:
                 await self.check_run(run, state, description, url, credentials)
+                await self.retire_legacy_status(run, url)
                 return "GitHub App Check Run"
             except GitHubError as exc:
                 if (
@@ -210,14 +221,42 @@ class GitHub:
             f"repos/{run['repo']}/statuses/{run['head']}",
             json={
                 "state": state,
-                "context": "local-ci",
+                "context": CHECK_NAME,
                 "description": description[:140],
                 "target_url": url,
             },
         )
+        await self.retire_legacy_status(run, url)
         return "GitHub commit status via gh login" + (
             " (App has no repository installation access)" if credentials else ""
         )
+
+    async def retire_legacy_status(self, run: dict, url: str):
+        """Overwrite a ``local-ci`` commit status left on this head before the rename.
+
+        A commit status cannot be removed or made neutral, and GitHub shows the latest
+        status of every context, so an old failure would otherwise stay next to the new
+        result. It is replaced once with a success that says where the result went;
+        nothing in GitHub requires the retired context.
+        """
+        combined = await self.request(
+            "GET", f"repos/{run['repo']}/commits/{run['head']}/status", params={"per_page": 100}
+        )
+        legacy = next(
+            (s for s in (combined or {}).get("statuses") or [] if s.get("context") == LEGACY_CHECK_NAME),
+            None,
+        )
+        if legacy and (legacy.get("state"), legacy.get("description")) != ("success", RETIRED_SUMMARY):
+            await self.request(
+                "POST",
+                f"repos/{run['repo']}/statuses/{run['head']}",
+                json={
+                    "state": "success",
+                    "context": LEGACY_CHECK_NAME,
+                    "description": RETIRED_SUMMARY,
+                    "target_url": url,
+                },
+            )
 
     async def comment(self, run: dict, kind: str, body: str):
         if kind == "review":
@@ -305,23 +344,26 @@ class GitHub:
         )
         token = issued["token"]
         try:
-            existing = await self.request(
-                "GET",
-                f"repos/{run['repo']}/commits/{run['head']}/check-runs",
-                credential=token,
-                params={"check_name": "local-ci", "filter": "latest", "per_page": 100},
-            )
-            match = next(
-                (
-                    c
-                    for c in existing["check_runs"]
-                    if c.get("external_id") == run["id"] and str(c["app"]["id"]) == str(credentials["app_id"])
-                ),
-                None,
-            )
+            # This App's latest runs on the head under the current and the retired name.
+            existing = []
+            for name in (CHECK_NAME, LEGACY_CHECK_NAME):
+                listed = await self.request(
+                    "GET",
+                    f"repos/{run['repo']}/commits/{run['head']}/check-runs",
+                    credential=token,
+                    params={"check_name": name, "filter": "latest", "per_page": 100},
+                )
+                existing += [
+                    (name, c)
+                    for c in listed["check_runs"]
+                    if str(c["app"]["id"]) == str(credentials["app_id"])
+                ]
+            # A run that started before the rename is found by its external ID under the
+            # old name, and the PATCH below renames it in place rather than adding a second.
+            match = next((c for _, c in existing if c.get("external_id") == run["id"]), None)
             steps = json.loads(run.get("steps", "[]"))
             payload = {
-                "name": "local-ci",
+                "name": CHECK_NAME,
                 "head_sha": run["head"],
                 "external_id": run["id"],
                 "details_url": url,
@@ -346,6 +388,27 @@ class GitHub:
                 await self.request("PATCH", f"{endpoint}/{match['id']}", credential=token, json=payload)
             else:
                 await self.request("POST", endpoint, credential=token, json=payload)
+            # Another run's result under the old name would otherwise stay next to this
+            # one. Neutral is GitHub's "does not count" conclusion; it is set only once.
+            retired = {match["id"]} if match else set()
+            for name, legacy in existing:
+                if (
+                    name != LEGACY_CHECK_NAME
+                    or legacy["id"] in retired
+                    or legacy.get("conclusion") == "neutral"
+                ):
+                    continue
+                retired.add(legacy["id"])
+                await self.request(
+                    "PATCH",
+                    f"{endpoint}/{legacy['id']}",
+                    credential=token,
+                    json={
+                        "status": "completed",
+                        "conclusion": "neutral",
+                        "output": {"title": f"Renamed to {CHECK_NAME}", "summary": RETIRED_SUMMARY},
+                    },
+                )
         finally:
             # Short-lived and repository-scoped, and never shared with a worker.
             try:
