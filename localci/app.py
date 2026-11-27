@@ -129,7 +129,8 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
                     or request.headers.get("tailscale-user-login", "").casefold() != expected.casefold()
                 ):
                     return JSONResponse(
-                        {"detail": "Open this dashboard through its private Tailscale HTTPS URL"}, status_code=403
+                        {"detail": "Open this dashboard through its private Tailscale HTTPS URL"},
+                        status_code=403,
                     )
                 if request.method not in {"GET", "HEAD", "OPTIONS"}:
                     if request.headers.get("origin", "").rstrip("/") != controller.base_url:

@@ -40,7 +40,11 @@ def env(tmp_path, monkeypatch):
     raw, _meta = token_store.create("test", ["read", "write-config", "write-runs"])
     with TestClient(
         app,
-        headers={"Tailscale-User-Login": "owner@example.com", "Origin": controller.base_url, **agent_headers(raw)},
+        headers={
+            "Tailscale-User-Login": "owner@example.com",
+            "Origin": controller.base_url,
+            **agent_headers(raw),
+        },
     ) as http:
         yield http, controller, raw, token_store
 
