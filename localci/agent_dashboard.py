@@ -37,7 +37,10 @@ def tailscale_hint() -> dict:
     except (OSError, subprocess.TimeoutExpired):
         return {"available": False, "summary": "Could not read Tailscale status."}
     if proc.returncode != 0:
-        return {"available": False, "summary": (proc.stderr or proc.stdout or "Tailscale offline").strip()[:200]}
+        return {
+            "available": False,
+            "summary": (proc.stderr or proc.stdout or "Tailscale offline").strip()[:200],
+        }
     try:
         payload = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError:
@@ -46,7 +49,9 @@ def tailscale_hint() -> dict:
     return {
         "available": True,
         "backend_state": payload.get("BackendState", ""),
-        "summary": "Connected to tailnet." if backend == "running" else f"Tailscale state: {payload.get('BackendState', 'unknown')}",
+        "summary": "Connected to tailnet."
+        if backend == "running"
+        else f"Tailscale state: {payload.get('BackendState', 'unknown')}",
     }
 
 

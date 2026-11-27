@@ -42,7 +42,9 @@ def register_agent_api(main_app, controller, token_store: AgentTokenStore, *, ad
         token_store.audit(token.id, action, request.url.path, detail)
 
     @router.get("/repos")
-    def list_repos(request: Request, svc: AgentService = Depends(service), token: VerifiedToken = Depends(require_token)):
+    def list_repos(
+        request: Request, svc: AgentService = Depends(service), token: VerifiedToken = Depends(require_token)
+    ):
         audit(token, request, "read")
         return svc.list_repos()
 
@@ -91,7 +93,9 @@ def register_agent_api(main_app, controller, token_store: AgentTokenStore, *, ad
         return svc.logs_metadata(run_id)
 
     @router.get("/queue")
-    def queue(request: Request, svc: AgentService = Depends(service), token: VerifiedToken = Depends(require_token)):
+    def queue(
+        request: Request, svc: AgentService = Depends(service), token: VerifiedToken = Depends(require_token)
+    ):
         audit(token, request, "read")
         return svc.queue_status()
 

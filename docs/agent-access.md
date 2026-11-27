@@ -28,11 +28,11 @@ Assume anyone who can reach the dashboard origin on your tailnet can attempt aut
 - OpenAPI: `{LOCALCI_URL}/api/agent/v1/docs`
 - Header: `Authorization: Bearer mci_…`
 
-Example:
+Example (set `MY_CI_TOKEN` to the value from the dashboard; do not commit it):
 
 ```sh
-curl -sS -H "Authorization: Bearer YOUR_TOKEN" \
-  "$LOCALCI_URL/api/agent/v1/queue"
+export MY_CI_TOKEN='paste-once-from-dashboard'
+curl -sS "$LOCALCI_URL/api/agent/v1/queue" -H "Authorization: Bearer ${MY_CI_TOKEN}"
 ```
 
 When the add-on is disabled, agent routes return **404**. Invalid tokens return **401**; missing scope returns **403**.

@@ -49,7 +49,16 @@ class AgentTokenStore:
         expires_at = created + expires_days * 86400 if expires_days else None
         self.store.execute(
             "INSERT INTO agent_tokens VALUES(?,?,?,?,?,?,?,?,NULL)",
-            (token_id, name.strip(), json.dumps(sorted(set(scopes))), salt, token_hash, created, expires_at, None),
+            (
+                token_id,
+                name.strip(),
+                json.dumps(sorted(set(scopes))),
+                salt,
+                token_hash,
+                created,
+                expires_at,
+                None,
+            ),
         )
         return raw, self._public_row(token_id)
 
@@ -82,7 +91,9 @@ class AgentTokenStore:
             if secrets.compare_digest(_hash_token(raw, row["salt"], self.pepper), row["token_hash"]):
                 if row["expires_at"] and row["expires_at"] < time.time():
                     return None
-                self.store.execute("UPDATE agent_tokens SET last_used_at=? WHERE id=?", (time.time(), row["id"]))
+                self.store.execute(
+                    "UPDATE agent_tokens SET last_used_at=? WHERE id=?", (time.time(), row["id"])
+                )
                 return VerifiedToken(row["id"], row["name"], frozenset(json.loads(row["scopes"])))
         return None
 

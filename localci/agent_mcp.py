@@ -10,7 +10,9 @@ from mcp.server.mcpserver import MCPServer
 from localci.agent_service import AgentService
 from localci.agent_tokens import AgentTokenStore, VerifiedToken
 
-_agent_token: contextvars.ContextVar[VerifiedToken | None] = contextvars.ContextVar("agent_token", default=None)
+_agent_token: contextvars.ContextVar[VerifiedToken | None] = contextvars.ContextVar(
+    "agent_token", default=None
+)
 
 
 class AgentMcpMiddleware:
