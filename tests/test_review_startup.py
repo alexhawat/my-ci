@@ -1,4 +1,6 @@
+import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -47,8 +49,6 @@ def test_configuration_errors_keep_multiline_context_and_redaction(tmp_path):
 
 
 async def test_dependabot_keeps_ci_without_review_credentials_or_container(tmp_path):
-    from pathlib import Path
-
     token = tmp_path / "token"
     token.write_text("fixture-token")
     store = Store(tmp_path / "data/db")
@@ -96,6 +96,143 @@ async def test_dependabot_keeps_ci_without_review_credentials_or_container(tmp_p
     body = comment_body(run, "review", review, "https://private.test")
     assert "Dependabot PR" in body and "unavailable" not in body
     assert not dependabot_pr(pr())
+
+
+@pytest.mark.parametrize(
+    "case,ci_code,review_skipped",
+    [
+        ("inputs", 0, True),
+        ("inputs", 1, True),
+        ("mixed", 0, False),
+        ("empty", 0, False),
+        ("rename from outside", 0, False),
+        ("rename to outside", 0, False),
+        ("invalid filename encoding", 0, False),
+        ("git error", 0, False),
+        ("oversized output", 0, False),
+        ("head policy only", 0, False),
+        ("invalid policy", 0, False),
+    ],
+)
+async def test_trusted_path_policy_controls_the_review_lane(
+    tmp_path, monkeypatch, case, ci_code, review_skipped
+):
+    monkeypatch.setenv("LOCALCI_REVIEW_IMAGE", "review:test")
+
+    async def git_command(directory, *args, check=True, output=None):
+        command = await asyncio.create_subprocess_exec(
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            *args,
+            cwd=directory,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await command.communicate()
+        if check:
+            assert command.returncode == 0, stderr
+        if output:
+            output.write_bytes(stdout)
+        return command.returncode, stdout.decode(errors="replace")
+
+    async def git(directory, *args):
+        _, output = await git_command(directory, *args)
+        return output
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    await git(origin, "init", "-q")
+    (origin / ".mergecraft").mkdir()
+    policy = origin / ".mergecraft/config.yaml"
+    original_policy = "review:\n  ignorePaths: [scratch/**]\n"
+    valid_rule = '  skipWhenOnly: ["execution_files/**"]\n'
+    rule = "" if case == "head policy only" else valid_rule
+    if case == "invalid policy":
+        rule = "  skipWhenOnly: ['execution_files/**', 42]\n"
+    policy.write_text(original_policy + rule)
+    (origin / ".github/workflows").mkdir(parents=True)
+    (origin / ".github/workflows/ci.yml").write_text(
+        "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: [{run: echo ok}]\n"
+    )
+    (origin / "execution_files/batch").mkdir(parents=True)
+    (origin / "execution_files/batch/plan.md").write_text("Plan\n")
+    (origin / "outside.txt").write_text("Code-adjacent input\n")
+    await git(origin, "add", "-A")
+    await git(origin, "commit", "-qm", "base")
+    base = (await git(origin, "rev-parse", "HEAD")).strip()
+    if case == "rename from outside":
+        await git(origin, "mv", "outside.txt", "execution_files/previous.txt")
+    elif case == "rename to outside":
+        await git(origin, "mv", "execution_files/batch/plan.md", "previous-plan.md")
+    elif case != "empty":
+        (origin / "execution_files/batch/plan\nrevision.md").write_text("Revised plan\n")
+        if case == "mixed":
+            (origin / "outside.txt").write_text("Mixed change\n")
+        if case == "head policy only":
+            policy.write_text(original_policy + valid_rule)
+    await git(origin, "add", "-A")
+    await git(origin, "commit", "-qm", "pull request", "--allow-empty")
+    head = (await git(origin, "rev-parse", "HEAD")).strip()
+
+    token = tmp_path / "token"
+    token.write_text("fixture-token")
+    store = Store(tmp_path / "data/db")
+    scopes = []
+
+    def secrets(repo, scope):
+        scopes.append(scope)
+        return {"KEY": "synthetic-review-key"} if scope == "review" else {}
+
+    runner = Runner(store, GitHub(token), tmp_path / "data", secrets)
+    created_reviews = []
+
+    async def run_command(*args, **kwargs):
+        if args[:2] == ("git", "clone") and args[-2].startswith("https://"):
+            args = (*args[:-2], str(origin), args[-1])
+        if args[:2] == ("git", "diff") and "--name-only" in args:
+            if case == "invalid filename encoding":
+                return 0, "execution_files/\ufffd.txt\0"
+            if case == "git error":
+                return 128, ""
+            if case == "oversized output":
+                raise RuntimeError("Command output exceeded limit")
+        if args[0] == "git":
+            return await git_command(
+                kwargs.get("cwd"), *args[1:], check=kwargs.get("check", True), output=kwargs.get("output")
+            )
+        if args[:2] == ("docker", "create"):
+            env = Path(args[args.index("--env-file") + 1])
+            config = (env.parent / "review-control/review-config.yaml").read_text()
+            created_reviews.append(config)
+        if "act" in args:
+            runner.completed_jobs = 1
+            return ci_code, ""
+        return 0, ""
+
+    runner.command = run_command
+    runner.cleanup = AsyncMock()
+    snapshot = pr()
+    snapshot["base"]["sha"] = base
+    snapshot["head"]["sha"] = head
+    snapshot["labels"] = [{"name": "execution-files"}]
+    rid = store.enqueue("owner/repo", snapshot, {"review": True, "workflows": [".github/workflows/ci.yml"]})
+    await runner.execute(store.claim())
+    run = store.rows("SELECT * FROM runs WHERE id=?", (rid,))[0]
+    review = next(step for step in json.loads(run["steps"]) if step["name"] == "mergeCraft")
+    if review_skipped:
+        assert review["state"] == "skipped"
+        assert "review.skipWhenOnly" in review["message"]
+        assert scopes == ["ci"] and not created_reviews
+        assert run["state"] == ("failure" if ci_code else "success")
+    else:
+        assert review["state"] != "skipped"
+        assert scopes == ["ci", "review"]
+        assert len(created_reviews) == 1
+        assert "skipWhenOnly" not in created_reviews[0]
+        assert "scratch/**" in created_reviews[0]
 
 
 @pytest.mark.parametrize("version", ["1.19.0", "1.21.0"])
@@ -169,8 +306,6 @@ def test_live_budget_breakdown_survives_missing_final_review(tmp_path):
 async def test_operator_ceiling_reaches_review_container_without_trusting_head(
     tmp_path, monkeypatch, ceiling
 ):
-    from pathlib import Path
-
     import yaml
 
     monkeypatch.setenv("LOCALCI_REVIEW_IMAGE", "review:test")
