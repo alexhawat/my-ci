@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {availableForRerun, selectedPRs, retrySelected} from '../localci/static/selection.mjs';
+import {availableForRerun, selectedPRs, retrySelected, workflowsToSave} from '../localci/static/selection.mjs';
 const run = (id, pr, state='failure', repo='o/r') => ({id, pr, state, repo});
 test('allows finished results but excludes disabled repositories and already active PRs', () => {
   const runs=[run('failed',1),run('passed',2,'success'),run('cancelled',3,'cancelled'),run('old',4),run('new',4,'running'),run('queued',5,'queued'),run('disabled',6,'failure','o/off')];
@@ -22,4 +22,17 @@ test('partial failures and active-race responses are reported without aborting t
 test('bulk selection excludes exhausted revision budgets', () => {
   const runs=[{...run('exhausted',1),retry_limit_reached:true}, {...run('available',2),retry_limit_reached:false}];
   assert.deepEqual([...availableForRerun(runs,[{name:'o/r',enabled:1}])],['available']);
+});
+test('settings save keeps the saved workflows until the list has loaded', () => {
+  const saved=['.github/workflows/review.yml'];
+  assert.deepEqual(workflowsToSave({saved,choices:[],checked:[],loaded:false}),saved);
+});
+test('settings save sends the ticked workflows once the list has loaded', () => {
+  const choices=[{path:'a.yml'},{path:'b.yml'}];
+  assert.deepEqual(workflowsToSave({saved:['a.yml'],choices,checked:['b.yml'],loaded:true}),['b.yml']);
+  assert.deepEqual(workflowsToSave({saved:['a.yml'],choices,checked:[],loaded:true}),[]);
+});
+test('a saved workflow that failed to load stays selected', () => {
+  const choices=[{path:'a.yml',error:'Not found on main'},{path:'b.yml'}];
+  assert.deepEqual(workflowsToSave({saved:['a.yml','b.yml'],choices,checked:['b.yml'],loaded:true}),['b.yml','a.yml']);
 });

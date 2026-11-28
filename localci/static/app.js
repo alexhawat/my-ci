@@ -1,5 +1,5 @@
 import {historyColumns, historyRows} from './history.mjs';
-import {availableForRerun, selectedPRs, retrySelected} from './selection.mjs';
+import {availableForRerun, selectedPRs, retrySelected, workflowsToSave} from './selection.mjs';
 import {pipelineEditor} from './pipeline.mjs';
 import {replaceHTML} from './render.mjs';
 const $ = id => document.getElementById(id);
@@ -8,7 +8,7 @@ let openPRs = [], prMode = 'open', prRequest = 0;
 let historySort = 'created', historyDirection = 'desc';
 const selectedRuns = new Set();
 let retryingSelection = false;
-let loading = false, currentView = 'overview', workflowChoices = [], editor = null, logEvents = [];
+let loading = false, currentView = 'overview', workflowChoices = [], workflowsLoaded = false, editor = null, logEvents = [];
 const esc = text => String(text ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const badge = s => `<span class="badge ${esc(s)}">${esc(s)}</span>`;
 const date = t => t ? new Date(t*1000).toLocaleString(undefined, {dateStyle:'short',timeStyle:'medium'}) : '—';
@@ -20,7 +20,7 @@ let workerError='';
 let mergeTarget=null;
 const openChecks=new Set();
 const pipeline = pipelineEditor({get:$, escape:esc});
-function notice(message) {if($('settings').open) $('settings-error').textContent=message; $('notice').textContent=message; $('notice').hidden=!message;}
+function notice(message) {if($('settings').open){$('settings-error').textContent=message;if(message)$('settings-error').scrollIntoView({block:'nearest'});} $('notice').textContent=message; $('notice').hidden=!message;}
 async function api(path, options={}) {
   const response=await fetch('/api'+path,{...options,headers:{'Content-Type':'application/json',...options.headers}});
   if(!response.ok) {const body=await response.json().catch(()=>({})); throw new Error(typeof body.detail==='string'?body.detail:JSON.stringify(body.detail||`Request failed (${response.status})`));}
@@ -176,7 +176,7 @@ async function configure(name) {
   selectedRepo=state.repos.find(r=>r.name===name);const r=selectedRepo;addedPaths.clear();
   $('settings-error').textContent='';$('settings-title').textContent=name;$('repo-watch-only').checked=watchOnly(r);$('repo-enabled').checked=!!r.enabled;showLocalSettings();$('repo-run-bot-prs').checked=!!r.config.run_bot_prs;$('repo-publish-workflow-review').checked=!!r.config.publish_workflow_review;$('repo-review').checked=!!r.config.review;$('repo-review-threshold').value=r.config.review_failure_threshold||'major';
   $('repo-github-auth').value=r.config.github_auth||'none';$('repo-parallel').value=r.config.job_parallelism||1;$('repo-timeout').value=(r.config.timeout||7200)/60;$('repo-review-timeout').value=(r.config.review_timeout||3000)/60;$('repo-review-token-ceiling').value=r.config.review_token_ceiling??'';
-  variableRows(r.config.variables||{});$('workflow-options').textContent='Loading workflows…';workflowChoices=[];
+  variableRows(r.config.variables||{});$('workflow-options').textContent='Loading workflows…';workflowChoices=[];workflowsLoaded=false;
   $('add-workflow').open=false;for(const id of ['add-path','add-name','add-yaml','add-file'])$(id).value='';$('add-workflow-result').textContent='';
   pipeline.reset(r.config.review_pipeline);$('base-credentials').open=false;
   renderSecrets();credentialChoices();$('settings').showModal();
@@ -187,7 +187,7 @@ const addedPaths=new Set();
 const sourceLabel={workflows:'GITHUB BASE → LOCAL DOCKER',repository:'REPOSITORY FILE · BASE → LOCAL DOCKER',local:'LOCAL ONLY'};
 async function loadWorkflowChoices(selected) {
   const name=selectedRepo.name, include=[...addedPaths].map(p=>'include='+encodeURIComponent(p)).join('&');
-  try {const choices=await api(`/repos/${name}/workflows${include?'?'+include:''}`);if(selectedRepo.name!==name)return;workflowChoices=choices.filter(w=>!w.review);
+  try {const choices=await api(`/repos/${name}/workflows${include?'?'+include:''}`);if(selectedRepo.name!==name)return;workflowChoices=choices.filter(w=>!w.review);workflowsLoaded=true;
     replaceHTML($('workflow-options'),workflowChoices.length?workflowChoices.map(w=>{
       const off=!w.pr||!!w.error, why=w.error?` · ${w.error}`:!w.pr?' · not a PR workflow':'';
       const version=w.local_version?`${w.source==='local'?'LOCAL ONLY':'LOCAL'} v${w.local_version}`:sourceLabel[w.source]||sourceLabel.workflows;
@@ -401,7 +401,7 @@ $('merge-confirm').addEventListener('click',async()=>{
 $('search').addEventListener('input',filterRepos);$('run-search').addEventListener('input',filterRuns);$('pr-search').addEventListener('input',filterPRs);
 $('add-variable').addEventListener('click',()=>addVariable());
 $('apply-vars').addEventListener('click',()=>{try{const v=JSON.parse($('repo-vars').value);if(!v||Array.isArray(v)||typeof v!=='object'||Object.values(v).some(x=>typeof x!=='string'))throw new Error('Use a JSON object with string values, for example {"RUN_CODEQL":"false"}.');variableRows(v);}catch(e){notice(e.message);}});
-$('settings-form').addEventListener('submit',async e=>{e.preventDefault();try{const watch=$('repo-watch-only').checked,config={watch_only:watch,enabled:!watch&&$('repo-enabled').checked,run_bot_prs:$('repo-run-bot-prs').checked,publish_workflow_review:$('repo-publish-workflow-review').checked,review:mergecraft()&&$('repo-review').checked,review_failure_threshold:$('repo-review-threshold').value,github_auth:$('repo-github-auth').value,workflows:selectedWorkflows(),variables:variables(),timeout:Number($('repo-timeout').value)*60,review_timeout:Number($('repo-review-timeout').value)*60,review_token_ceiling:$('repo-review-token-ceiling').value===''?null:Number($('repo-review-token-ceiling').value),job_parallelism:Number($('repo-parallel').value),...(mergecraft()&&!watch?pipeline.payload():{})};await api(`/repos/${selectedRepo.name}`,{method:'PUT',body:JSON.stringify(config)});$('settings').close();notice(watch?`Watching ${selectedRepo.name}. Its PRs and GitHub CI appear on the PRs page after the next sync, within a few seconds; nothing runs on this worker.`:'Settings saved. Existing runs keep their snapshot; Retry uses your latest configuration.');await refresh();}catch(e){notice(e.message);}});
+$('settings-form').addEventListener('submit',async e=>{e.preventDefault();try{const watch=$('repo-watch-only').checked,config={watch_only:watch,enabled:!watch&&$('repo-enabled').checked,run_bot_prs:$('repo-run-bot-prs').checked,publish_workflow_review:$('repo-publish-workflow-review').checked,review:mergecraft()&&$('repo-review').checked,review_failure_threshold:$('repo-review-threshold').value,github_auth:$('repo-github-auth').value,workflows:workflowsToSave({saved:selectedRepo.config.workflows||[],choices:workflowChoices,checked:selectedWorkflows(),loaded:workflowsLoaded}),variables:variables(),timeout:Number($('repo-timeout').value)*60,review_timeout:Number($('repo-review-timeout').value)*60,review_token_ceiling:$('repo-review-token-ceiling').value===''?null:Number($('repo-review-token-ceiling').value),job_parallelism:Number($('repo-parallel').value),...(mergecraft()&&!watch?pipeline.payload():{})};await api(`/repos/${selectedRepo.name}`,{method:'PUT',body:JSON.stringify(config)});$('settings').close();notice(watch?`Watching ${selectedRepo.name}. Its PRs and GitHub CI appear on the PRs page after the next sync, within a few seconds; nothing runs on this worker.`:'Settings saved. Existing runs keep their snapshot; Retry uses your latest configuration.');await refresh();}catch(e){notice(e.message);}});
 $('secret-choice').addEventListener('change',credentialHelp);$('workflow-options').addEventListener('change',credentialChoices);
 async function saveCredential(scope,name,valueInput) {
   const repo=selectedRepo;
