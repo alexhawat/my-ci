@@ -22,3 +22,14 @@ export async function retrySelected(runs, selected, retry) {
   }
   return results;
 }
+
+// The workflows a repository-settings save sends. Until the dialog's workflow list
+// has loaded, the saved selection is kept: an empty list would be refused for a
+// repository without review, or would silently clear a reviewed repository's CI.
+// A saved workflow that could not be loaded this time (shown disabled with its
+// error) stays selected rather than being dropped.
+export function workflowsToSave({saved = [], choices = [], checked = [], loaded = false}) {
+  if (!loaded) return [...saved];
+  const unavailable = new Set(choices.filter(w => w.error).map(w => w.path));
+  return [...checked, ...saved.filter(path => unavailable.has(path) && !checked.includes(path))];
+}
