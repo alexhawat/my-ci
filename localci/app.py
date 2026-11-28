@@ -4,7 +4,6 @@ import os
 import re
 import shutil
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path
 from typing import Literal
 
@@ -16,13 +15,16 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
+from localci.agent_api import register_agent_api
+from localci.agent_dashboard import register_agent_dashboard
+from localci.agent_mcp import build_mcp_app
+from localci.agent_operations import persist_repo_config, retry_pull_request_run
+from localci.agent_tokens import token_store_from_controller
 from localci.controller import Controller
 from localci.dashboard import enrich_run, register_dashboard
 from localci.github import GitHubError, app_jwt
 from localci.policy import (
-    BOT_HOLD,
     WORKFLOW_PATH_HELP,
-    bot_pr,
     eligible,
     is_local_workflow,
     is_pr_workflow,
@@ -31,7 +33,6 @@ from localci.policy import (
     workflow,
 )
 from localci.review_pipeline import ReviewChain, validate_pipeline
-from localci.store import RetryLimitReached, RevisionChanged
 
 ROOT = Path(os.environ.get("LOCALCI_DATA", "/data"))
 
@@ -95,17 +96,34 @@ class AppInput(BaseModel):
 
 class Integrations(BaseModel):
     mergecraft: bool = False
+    agent_access: bool = False
+
+
+class IntegrationsUpdate(BaseModel):
+    mergecraft: bool | None = None
+    agent_access: bool | None = None
+
+
+def _agent_path(path: str) -> bool:
+    return path.startswith("/api/agent/") or path.startswith("/agent/mcp")
 
 
 def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
     if background:
         raise ValueError("Execution is a separate service; run python -m localci.worker")
     controller = Controller(root)
+    token_store = token_store_from_controller(controller)
+
+    def addon_enabled() -> bool:
+        return bool(controller.store.integrations().get("agent_access", False))
+
+    mcp_asgi, mcp_sessions = build_mcp_app(controller, token_store, addon_enabled)
 
     @asynccontextmanager
     async def lifespan(app):
         # The web process never starts, recovers, cancels, or publishes execution tasks.
-        yield
+        async with mcp_sessions.run():
+            yield
         await asyncio.to_thread(controller.store.close)
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -123,16 +141,21 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
     async def access(request: Request, call_next):
         expected = os.environ.get("LOCALCI_TAILSCALE_LOGIN", "")
         if request.url.path != "/healthz":
-            if (
-                not expected
-                or request.headers.get("tailscale-user-login", "").casefold() != expected.casefold()
-            ):
-                return JSONResponse(
-                    {"detail": "Open this dashboard through its private Tailscale HTTPS URL"}, status_code=403
-                )
-            if request.method not in {"GET", "HEAD", "OPTIONS"}:
-                if request.headers.get("origin", "").rstrip("/") != controller.base_url:
-                    return JSONResponse({"detail": "Invalid request origin"}, status_code=403)
+            agent = _agent_path(request.url.path)
+            if agent and not addon_enabled():
+                return JSONResponse({"detail": "Agent access is disabled"}, status_code=404)
+            if not agent:
+                if (
+                    not expected
+                    or request.headers.get("tailscale-user-login", "").casefold() != expected.casefold()
+                ):
+                    return JSONResponse(
+                        {"detail": "Open this dashboard through its private Tailscale HTTPS URL"},
+                        status_code=403,
+                    )
+                if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                    if request.headers.get("origin", "").rstrip("/") != controller.base_url:
+                        return JSONResponse({"detail": "Invalid request origin"}, status_code=403)
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -318,56 +341,7 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
             raise HTTPException(
                 400, "Just watch this repo runs nothing locally; turn it off to run PR checks here"
             )
-        controller.store.keep_integrations()
-        with controller.store.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            active = json.loads(
-                db.execute("SELECT value FROM settings WHERE key='integrations'").fetchone()[0]
-            )
-            if config.review and not active["mergecraft"]:
-                raise HTTPException(
-                    400, "Add mergeCraft review in Settings before turning it on for a repository"
-                )
-            if config.enabled and not config.workflows and not config.review:
-                raise HTTPException(
-                    400,
-                    "Select at least one CI workflow"
-                    + (" or mergeCraft review" if active["mergecraft"] else ""),
-                )
-            current = json.loads(db.execute("SELECT config FROM repos WHERE name=?", (name,)).fetchone()[0])
-            saved = config.model_dump()
-            if "review_pipeline" not in config.model_fields_set:
-                saved["review_pipeline"] = current.get("review_pipeline", [])
-            if not active["mergecraft"] and (
-                config.review_key_updates or saved["review_pipeline"] != current.get("review_pipeline", [])
-            ):
-                raise HTTPException(400, "Enable the mergeCraft integration to edit its pipeline")
-            keys = {slot["credential"] for chain in saved["review_pipeline"] for slot in chain}
-            for key, secret_value in config.review_key_updates.items():
-                raw = secret_value.get_secret_value()
-                if key not in keys or not raw.strip() or len(raw) > 20000 or any(c in raw for c in "\0\n\r"):
-                    raise HTTPException(
-                        400, "Enter a single-line API key for a credential used in the pipeline"
-                    )
-                db.execute(
-                    "INSERT INTO secrets VALUES(?,?,?) ON CONFLICT(repo,name) DO UPDATE SET ciphertext=excluded.ciphertext",
-                    (name, f"review:{key}", controller.cipher.encrypt(raw.encode()).decode()),
-                )
-            if "review_pipeline" in config.model_fields_set:
-                existing = {row[0] for row in db.execute("SELECT name FROM secrets WHERE repo=?", (name,))}
-                for key in sorted(keys):
-                    if f"review:{key}" not in existing:
-                        raise HTTPException(400, f"Enter a private value for {key}")
-            db.execute(
-                "UPDATE repos SET enabled=?,config=? WHERE name=?",
-                (int(config.enabled), json.dumps(saved), name),
-            )
-        if not config.enabled:
-            for row in controller.store.rows(
-                "SELECT id FROM runs WHERE repo=? AND state IN ('queued','running')", (name,)
-            ):
-                controller.store.request_cancel(row["id"], "repo_disabled", "Repository disabled")
-        controller.notify()
+        persist_repo_config(controller, name, config)
         return {"ok": True}
 
     @app.put("/api/repos/{owner}/{repo}/secrets")
@@ -435,9 +409,11 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
         return {"ok": True}
 
     @app.put("/api/integrations")
-    def integrations(value: Integrations):
+    def integrations(value: IntegrationsUpdate):
+        current = controller.store.integrations()
+        payload = {**current, **value.model_dump(exclude_unset=True)}
         try:
-            changed = controller.store.save_integrations(value.model_dump())
+            changed = controller.store.save_integrations(payload)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
         controller.notify()
@@ -488,41 +464,15 @@ def create_app(root: Path = ROOT, *, background: bool = False) -> FastAPI:
 
     @app.post("/api/runs/{rid}/retry")
     async def retry(rid: str):
-        run = get_run(rid)
-        repo = controller.store.repo(run["repo"])
-        if not repo["enabled"]:
-            raise HTTPException(400, "Enable the repository before retrying")
-        pr = await controller.github.request("GET", f"repos/{run['repo']}/pulls/{run['pr']}")
-        if not eligible(pr, run["repo"]):
-            raise HTTPException(400, "Only open, non-draft, same-repository PRs can run")
-        # Settings may have changed while this request waited on GitHub: use the current
-        # configuration for the new run. The enabled flag and the bot-PR gate are checked
-        # again inside the enqueue transaction.
-        config = json.loads(controller.store.repo(run["repo"])["config"])
-        try:
-            new_id = await asyncio.to_thread(
-                partial(
-                    controller.store.enqueue,
-                    run["repo"],
-                    pr,
-                    config,
-                    retry=True,
-                    require_enabled=True,
-                    # Starting a held bot PR is the operator's approval of one exact revision.
-                    # A retry runs the PR's current head, so it is refused when that is not
-                    # the revision of the run being retried.
-                    bot_hold=BOT_HOLD if bot_pr(pr) else None,
-                    reviewed=(run["head"], run["base"]),
-                )
-            )
-        except (RetryLimitReached, RevisionChanged) as exc:
-            raise HTTPException(409, str(exc)) from None
-        if new_id is None and not controller.store.repo(run["repo"])["enabled"]:
-            raise HTTPException(400, "Enable the repository before retrying")
-        controller.notify()
+        get_run(rid)
+        new_id = await retry_pull_request_run(controller, rid)
         return {"id": new_id}
 
     register_dashboard(app, controller, repo_name, get_run)
+
+    register_agent_dashboard(app, controller)
+    register_agent_api(app, controller, token_store, addon_enabled=addon_enabled)
+    app.mount("/agent/mcp", mcp_asgi)
 
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")

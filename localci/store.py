@@ -17,7 +17,7 @@ ACTIVE = ("queued", "running")
 # system-caused endings are re-queued automatically; an operator's cancel is final.
 RECOVERABLE = ("pr_inactive", "repo_disabled", "worker_interrupted")
 MAX_RECOVERIES = 3  # Unbilled automatic re-runs per PR revision; bounds crash loops.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 _SELECT = re.compile(r"\s*SELECT\b", re.IGNORECASE)
 
 
@@ -131,6 +131,35 @@ class Store:
                     "UPDATE runs SET end_reason='worker_interrupted' WHERE state IN ('error','failure') "
                     "AND end_reason='' AND (message LIKE '%Execution worker restarted; retry this run%' "
                     "OR message LIKE '%Controller stopped during execution; retry this run%')"
+                )
+            if version < SCHEMA_VERSION:
+                db.executescript("""
+                    CREATE TABLE IF NOT EXISTS agent_tokens (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        scopes TEXT NOT NULL,
+                        salt TEXT NOT NULL,
+                        token_hash TEXT NOT NULL,
+                        created REAL NOT NULL,
+                        expires_at REAL,
+                        last_used_at REAL,
+                        revoked_at REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS agent_token_audit (
+                        id INTEGER PRIMARY KEY,
+                        token_id TEXT NOT NULL,
+                        timestamp REAL NOT NULL,
+                        action TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        detail TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE INDEX IF NOT EXISTS agent_token_audit_token ON agent_token_audit(token_id, id);
+                """)
+            if version == 5:
+                # Agent tokens issued before id-prefixed format use PBKDF2 over the full
+                # secret; revoke them so operators create new mci_<id>.<secret> tokens.
+                db.execute(
+                    "UPDATE agent_tokens SET revoked_at=created WHERE salt != '' AND revoked_at IS NULL"
                 )
             if version in (1, 2):
                 # One-time backfill for databases that predate the budget table. Running it on
@@ -266,6 +295,8 @@ class Store:
             value["mergecraft"] = any(
                 json.loads(repo["config"]).get("review") for repo in self.rows("SELECT config FROM repos")
             )
+        if "agent_access" not in value:
+            value["agent_access"] = False
         return value
 
     def keep_integrations(self) -> dict:

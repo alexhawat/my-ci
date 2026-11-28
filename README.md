@@ -195,6 +195,10 @@ Git runs as the checkout's owner. The update fast-forwards only; a checkout with
 - `LOCALCI_UPDATE_REPO` and `LOCALCI_UPDATE_BRANCH` (optional): the repository whose latest commit is shown, default `alexhawat/my-ci`, and the branch to fetch from `origin`, default `main`.
 - `LOCALCI_SELF_UPDATE=0` turns the button off.
 
+### Agent access (API + MCP)
+
+Optional **Settings → Integrations → Agent access** exposes a versioned HTTP API at `/api/agent/v1` and an MCP server at `/agent/mcp` on the same tailnet origin as the dashboard. Access is **tailnet-only** (use `tailscale serve`, not Funnel) plus a **Bearer token** you create in the dashboard. Scopes are least-privilege (`read`, `write-config`, `write-runs`); tokens are hashed, audited, and revocable. Setup, threat model, and client JSON examples are in [docs/agent-access.md](docs/agent-access.md).
+
 ### Settings and the mergeCraft add-on
 
 The **Settings** page holds the GitHub App described above and the optional integrations. mergeCraft review is an add-on: until it is added under **Settings → Integrations**, **Configure** shows no review options and the API refuses to turn review on. Installations that already review a repository with it keep it added. Removing it turns review off in every repository (queued runs keep their snapshot) and is refused while an enabled repository has nothing but review to run.

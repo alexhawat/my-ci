@@ -128,6 +128,7 @@ function repoCards(repos) {return repos.length?`<div class="repo-grid">${repos.m
 function filterRepos() {const q=$('search').value.toLowerCase(); replaceHTML($('repo-list'),repoCards(state.repos.filter(r=>r.name.toLowerCase().includes(q))));}
 const watchOnly=r=>!r.enabled&&!!r.config?.watch_only;
 const mergecraft=()=>!!state.integrations?.mergecraft;
+const agentAccess=()=>!!state.integrations?.agent_access;
 function filterRuns() {
   const repo=$('run-repo'), selected=repo.value;
   const names=[...new Set(state.runs.map(r=>r.repo))].sort();
@@ -447,7 +448,41 @@ function renderPreferences() {
   $('app-heading').textContent=app?'Replace or disconnect the GitHub App':'Optional: publish Check Runs with a GitHub App';
   $('app-connect').textContent=app?'Validate & replace App':'Validate & connect App';$('app-disconnect').hidden=!app;
   if(document.activeElement!==$('integration-mergecraft'))$('integration-mergecraft').checked=mergecraft();
+  if(document.activeElement!==$('integration-agent-access'))$('integration-agent-access').checked=agentAccess();
+  $('agent-access-panel').hidden=!agentAccess();
+  if(agentAccess())renderAgentAccess();
 }
+async function renderAgentAccess(){
+  try{
+    const info=await api('/agent-access');
+    $('agent-access-status').innerHTML=`<strong>HTTP API:</strong> <code>${esc(info.http_base)}</code><br><strong>MCP URL:</strong> <code>${esc(info.mcp_url)}</code><br><span class="muted">${esc(info.tailscale?.summary||'')}</span>`;
+    $('agent-mcp-cursor').textContent=JSON.stringify(info.mcp_config_cursor,null,2);
+    $('agent-mcp-claude').textContent=JSON.stringify(info.mcp_config_claude,null,2);
+    const tokens=await api('/agent-tokens');
+    $('agent-token-list').innerHTML=tokens.length?`<table><thead><tr><th>Name</th><th>Scopes</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody>${tokens.map(t=>`<tr><td>${esc(t.name)}</td><td>${esc((t.scopes||[]).join(', '))}</td><td>${date(t.created)}</td><td>${t.last_used_at?date(t.last_used_at):'—'}</td><td>${t.revoked?'revoked':`<button type="button" class="button danger agent-revoke" data-id="${esc(t.id)}">Revoke</button>`}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">No tokens yet.</p>';
+    document.querySelectorAll('.agent-revoke').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('Revoke this token? Agents using it get 401 immediately.'))return;await api('/agent-tokens/'+b.dataset.id,{method:'DELETE'});await renderAgentAccess();}));
+  }catch(e){$('agent-access-status').textContent=e.message;}
+}
+$('integration-agent-access').addEventListener('change',async e=>{
+  const on=e.target.checked;e.target.disabled=true;
+  try{await api('/integrations',{method:'PUT',body:JSON.stringify({agent_access:on})});
+    $('integration-agent-result').textContent=on?'Agent access enabled. Create a token and share the MCP URL only over your tailnet.':'Agent access disabled. API and MCP return 404 for agents.';await refresh();renderPreferences();}
+  catch(err){e.target.checked=!on;$('integration-agent-result').textContent=err.message;}
+  finally{e.target.disabled=false;}
+});
+$('agent-token-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const scopes=[...document.querySelectorAll('input[name=agent-scope]:checked')].map(el=>el.value);
+  const expires=$('agent-token-expiry').value;
+  try{
+    const result=await api('/agent-tokens',{method:'POST',body:JSON.stringify({name:$('agent-token-name').value,scopes,expires_days:expires===''?null:Number(expires)})});
+    $('agent-token-once').hidden=false;
+    $('agent-token-once').innerHTML=`<strong>Copy this token now.</strong> It will not be shown again.<pre>${esc(result.token)}</pre>`;
+    $('agent-token-result').textContent='Token created.';
+    $('agent-token-name').value='';$('agent-token-expiry').value='';
+    await renderAgentAccess();
+  }catch(err){$('agent-token-result').textContent=err.message;}
+});
 $('app-disconnect').addEventListener('click',async()=>{
   if(!confirm('Disconnect the GitHub App? New results are posted as commit statuses with the worker\u2019s GitHub login. Check Runs already published stay on GitHub.'))return;
   try{await api('/github-app',{method:'DELETE'});$('app-result').textContent='Disconnected. New results are posted as commit statuses.';await refresh();}catch(e){$('app-result').textContent=e.message;}

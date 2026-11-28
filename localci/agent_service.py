@@ -1,0 +1,216 @@
+"""Shared read/write operations for the agent HTTP API and MCP tools."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from fastapi import HTTPException
+
+from localci.agent_operations import persist_repo_config, retry_pull_request_run
+from localci.dashboard import enrich_run
+
+FORBIDDEN_KEYS = frozenset(
+    {
+        "ciphertext",
+        "private_key",
+        "value",
+        "token",
+        "api_key",
+        "secret",
+        "password",
+    }
+)
+
+
+class AgentService:
+    def __init__(self, controller, scopes: frozenset[str]):
+        self.controller = controller
+        self.scopes = scopes
+
+    def _need(self, scope: str) -> None:
+        if scope not in self.scopes:
+            raise HTTPException(403, f"Scope {scope!r} required")
+
+    @staticmethod
+    def public_view(data: Any) -> Any:
+        """Drop secret-shaped keys; responses are built from allow-listed fields elsewhere."""
+        return AgentService._strip_secret_keys(data)
+
+    @staticmethod
+    def _strip_secret_keys(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: AgentService._strip_secret_keys(item)
+                for key, item in value.items()
+                if key not in FORBIDDEN_KEYS
+            }
+        if isinstance(value, list):
+            return [AgentService._strip_secret_keys(item) for item in value]
+        return value
+
+    def list_repos(self) -> list[dict]:
+        self._need("read")
+        result = []
+        for repo in self.controller.store.rows("SELECT * FROM repos ORDER BY name"):
+            config = json.loads(repo["config"])
+            data = json.loads(repo["data"])
+            result.append(
+                {
+                    "name": repo["name"],
+                    "enabled": bool(repo["enabled"]),
+                    "error": repo["error"],
+                    "watch_only": bool(config.get("watch_only")),
+                    "review": bool(config.get("review")),
+                    "workflows": list(config.get("workflows", [])),
+                    "private": data.get("private"),
+                    "default_branch": data.get("default_branch"),
+                    "url": data.get("html_url"),
+                }
+            )
+        return self.public_view(result)
+
+    def list_runs(
+        self,
+        *,
+        repo: str | None = None,
+        state: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        self._need("read")
+        limit = max(1, min(limit, 200))
+        sql = "SELECT * FROM runs"
+        args: list = []
+        clauses = []
+        if repo:
+            clauses.append("repo=?")
+            args.append(repo)
+        if state:
+            clauses.append("state=?")
+            args.append(state)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created DESC LIMIT ?"
+        args.append(limit)
+        runs = self.controller.store.rows(sql, tuple(args))
+        return self.public_view([self._run_summary(enrich_run(r, self.controller.store)) for r in runs])
+
+    def get_run(self, run_id: str) -> dict:
+        self._need("read")
+        rows = self.controller.store.rows("SELECT * FROM runs WHERE id=?", (run_id,))
+        if not rows:
+            raise HTTPException(404, "Unknown run")
+        run = enrich_run(rows[0], self.controller.store)
+        return self.public_view(self._run_detail(run))
+
+    def get_review(self, run_id: str) -> dict:
+        self._need("read")
+        rows = self.controller.store.rows("SELECT * FROM runs WHERE id=?", (run_id,))
+        if not rows:
+            raise HTTPException(404, "Unknown run")
+        reports = self.controller.reports(rows[0])
+        review = reports.get("review", {"state": "unavailable"})
+        return self.public_view({"run_id": run_id, "review": review})
+
+    def logs_metadata(self, run_id: str) -> dict:
+        self._need("read")
+        rows = self.controller.store.rows("SELECT * FROM runs WHERE id=?", (run_id,))
+        if not rows:
+            raise HTTPException(404, "Unknown run")
+        log_path = self.controller.root / "logs" / f"{run_id}.log"
+        artifacts = self.controller.root / "artifacts" / run_id
+        artifact_files = (
+            [
+                {"path": str(p.relative_to(artifacts)), "bytes": p.stat().st_size}
+                for p in artifacts.rglob("*")
+                if p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(artifacts.resolve())
+            ]
+            if artifacts.is_dir()
+            else []
+        )
+        return self.public_view(
+            {
+                "run_id": run_id,
+                "log_bytes": log_path.stat().st_size if log_path.is_file() else 0,
+                "events_count": len(
+                    self.controller.store.rows("SELECT 1 FROM run_events WHERE run_id=?", (run_id,))
+                ),
+                "artifacts": artifact_files[:100],
+            }
+        )
+
+    def queue_status(self) -> dict:
+        self._need("read")
+        worker = self.controller.status()
+        queued = self.controller.store.rows("SELECT COUNT(*) AS n FROM runs WHERE state='queued'")[0]["n"]
+        running = self.controller.store.rows("SELECT COUNT(*) AS n FROM runs WHERE state='running'")[0]["n"]
+        execution = self.controller.store.settings()
+        return self.public_view(
+            {
+                "queued": queued,
+                "running": running,
+                "worker_online": worker.get("online", False),
+                "paused": execution.get("paused", False),
+                "capacity": worker.get("capacity"),
+                "error": worker.get("error", ""),
+            }
+        )
+
+    async def rerun(self, run_id: str) -> dict:
+        self._need("write-runs")
+        new_id = await retry_pull_request_run(self.controller, run_id)
+        return self.public_view({"id": new_id})
+
+    def set_repo_review(
+        self,
+        name: str,
+        *,
+        enabled: bool | None = None,
+        review: bool | None = None,
+    ) -> dict:
+        self._need("write-config")
+        try:
+            record = self.controller.store.repo(name)
+        except KeyError:
+            raise HTTPException(404, "Unknown repository") from None
+        config = json.loads(record["config"])
+        if enabled is not None:
+            config["enabled"] = enabled
+        if review is not None:
+            config["review"] = review
+        if config.get("watch_only") and config.get("enabled"):
+            raise HTTPException(400, "Cannot enable execution while watch-only is set")
+        from localci.app import RepoConfig
+
+        parsed = RepoConfig(**config)
+        persist_repo_config(self.controller, name, parsed)
+        return self.public_view({"name": name, "enabled": parsed.enabled, "review": parsed.review})
+
+    def _run_summary(self, run: dict) -> dict:
+        return {
+            "id": run["id"],
+            "repo": run["repo"],
+            "pr": run["pr"],
+            "state": run["state"],
+            "created": run["created"],
+            "started": run.get("started"),
+            "finished": run.get("finished"),
+            "message": run.get("message"),
+            "title": run.get("title"),
+            "branch": run.get("branch"),
+            "checks_summary": run.get("checks_summary"),
+        }
+
+    def _run_detail(self, run: dict) -> dict:
+        detail = self._run_summary(run)
+        detail.update(
+            {
+                "head": run["head"],
+                "base": run["base"],
+                "steps": run.get("steps", []),
+                "workflow_sources": run.get("workflow_sources", []),
+                "retries_remaining": run.get("retries_remaining"),
+                "usage": run.get("usage"),
+            }
+        )
+        return detail

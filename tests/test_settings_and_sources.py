@@ -191,13 +191,13 @@ def test_retry_of_an_earlier_run_is_refused_while_only_watching(client):
 
 def test_mergecraft_is_off_until_added_and_gates_review(client):
     http, c = client
-    assert http.get("/api/state").json()["integrations"] == {"mergecraft": False}
+    assert http.get("/api/state").json()["integrations"] == {"mergecraft": False, "agent_access": False}
     refused = http.put("/api/repos/o/r", json={"enabled": True, "review": True})
     assert refused.status_code == 400 and "Settings" in refused.json()["detail"]
     nothing = http.put("/api/repos/o/r", json={"enabled": True})
     assert nothing.json()["detail"] == "Select at least one CI workflow"
     assert http.put("/api/integrations", json={"mergecraft": True}).status_code == 200
-    assert http.get("/api/state").json()["integrations"] == {"mergecraft": True}
+    assert http.get("/api/state").json()["integrations"] == {"mergecraft": True, "agent_access": False}
     assert http.put("/api/repos/o/r", json={"enabled": True, "review": True}).status_code == 200
     assert (
         http.put("/api/integrations", json={"mergecraft": True}, headers={"Origin": "https://x"}).status_code
@@ -208,16 +208,16 @@ def test_mergecraft_is_off_until_added_and_gates_review(client):
 def test_installations_that_already_review_keep_mergecraft(tmp_path):
     store = Store(tmp_path / "db")
     store.discover([repo()])
-    assert store.integrations() == {"mergecraft": False}
+    assert store.integrations() == {"mergecraft": False, "agent_access": False}
     store.execute("UPDATE repos SET config=? WHERE name='o/r'", (json.dumps({"review": True}),))
-    assert store.integrations() == {"mergecraft": True}
+    assert store.integrations() == {"mergecraft": True, "agent_access": False}
 
 
 def test_turning_review_off_in_the_last_repository_keeps_mergecraft(client):
     http, c = client
     c.store.execute("UPDATE repos SET config=? WHERE name='o/r'", (json.dumps({"review": True}),))
     assert http.put("/api/repos/o/r", json={"review": False}).status_code == 200
-    assert http.get("/api/state").json()["integrations"] == {"mergecraft": True}
+    assert http.get("/api/state").json()["integrations"] == {"mergecraft": True, "agent_access": False}
 
 
 def test_removing_mergecraft_turns_review_off_but_never_empties_a_running_repository(client):
@@ -234,11 +234,14 @@ def test_removing_mergecraft_turns_review_off_but_never_empties_a_running_reposi
     assert http.put("/api/repos/o/off", json={"review": True}).status_code == 200
     refused = http.put("/api/integrations", json={"mergecraft": False})
     assert refused.status_code == 409 and "o/r run only mergeCraft review" in refused.json()["detail"]
-    assert c.store.integrations() == {"mergecraft": True}  # Nothing changed.
+    assert c.store.integrations() == {"mergecraft": True, "agent_access": False}  # Nothing changed.
     assert json.loads(c.store.repo("o/s")["config"])["review"] is True
     assert http.put("/api/repos/o/r", json={"enabled": False, "review": True}).status_code == 200
     removed = http.put("/api/integrations", json={"mergecraft": False}).json()
-    assert removed == {"integrations": {"mergecraft": False}, "review_turned_off": ["o/off", "o/r", "o/s"]}
+    assert removed == {
+        "integrations": {"mergecraft": False, "agent_access": False},
+        "review_turned_off": ["o/off", "o/r", "o/s"],
+    }
     assert not any(json.loads(r["config"]).get("review") for r in c.store.rows("SELECT config FROM repos"))
     assert json.loads(c.store.repo("o/s")["config"])["workflows"] == ["ci/a.yml"]
 
