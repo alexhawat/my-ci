@@ -20,6 +20,7 @@ result or my-ci's review sandbox.
 import json
 import re
 import zipfile
+import zlib
 from pathlib import Path
 
 ARTIFACT = "mergecraft-agents-sdk-review"
@@ -78,13 +79,13 @@ def read(directory: Path) -> dict:
                 raise Unavailable(f"{FILENAME} is larger than {MAX_REPORT_BYTES} bytes.")
             with bundle.open(member) as handle:
                 raw = handle.read(MAX_REPORT_BYTES + 1)
-    except (zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError, EOFError) as exc:
+    except (zipfile.BadZipFile, zlib.error, OSError, RuntimeError, NotImplementedError, EOFError) as exc:
         raise Unavailable(f"The {ARTIFACT} artifact could not be opened ({type(exc).__name__}).") from None
     if len(raw) > MAX_REPORT_BYTES:
         raise Unavailable(f"{FILENAME} is larger than {MAX_REPORT_BYTES} bytes.")
     try:
         document = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise Unavailable(f"{FILENAME} is not UTF-8 JSON.") from None
     if not isinstance(document, dict):
         raise Unavailable(f"{FILENAME} is not a JSON object.")
@@ -193,10 +194,16 @@ def report(directory: Path, head: str, clean) -> dict:
     try:
         review = normalize(read(directory), head, clean)
     except Unavailable as exc:
+        reason = str(exc)
+    except Exception as exc:  # noqa: BLE001 - PR-controlled input must never block publishing
+        reason = f"The {ARTIFACT} artifact could not be read ({type(exc).__name__})."
+    else:
+        reason = None
+    if reason is not None:
         return base | {
             "state": "unavailable",
             "result_label": "no review report",
-            "diagnostics": [str(exc)],
+            "diagnostics": [reason],
         }
     state, label = outcome(review)
     return base | {

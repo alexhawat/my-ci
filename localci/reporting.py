@@ -238,14 +238,16 @@ def literal(value, *, block: bool = False) -> str:
 
 def comment_body(run: dict, kind: str, report: dict, url: str) -> str:
     footer = f"Commit `{run['head']}` · run `{run['id']}`\n\n[Full run — Tailscale access required]({url})"
+    # Before the generic skipped branch: a workflow that skipped its own review still
+    # gets the workflow message and its disclaimer, not my-ci's "mergeCraft: skipped".
+    if kind == "review" and report.get("source") == "workflow":
+        return workflow_review_body(run, report, url)
     if kind == "review" and report["state"] == "not run":
         reason = "; ".join(report["diagnostics"]) or report.get("run_state", "")
         return f"### mergeCraft: not run\n\nThe run ended before the review started — {literal(reason)}\n\n{footer}"
     if kind == "review" and report["state"] == "skipped":
         reason = "; ".join(c["message"] for c in report["checks"]) or "; ".join(report["diagnostics"])
         return f"### mergeCraft: skipped\n\n{literal(reason, block=True)}\n\n{footer}"
-    if kind == "review" and report.get("source") == "workflow":
-        return workflow_review_body(run, report, url)
     if kind == "review":
         return review_body(run, report, url)
     title = "my-ci"

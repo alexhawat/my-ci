@@ -199,6 +199,51 @@ def test_missing_duplicate_misnamed_and_oversized_artifacts_are_not_read(tmp_pat
     assert "larger than 100 bytes" in reports(run, tmp_path, store, [])["review"]["diagnostics"][0]
 
 
+def test_workflow_skip_keeps_the_workflow_message_and_disclaimer(tmp_path):
+    store, run = finished(tmp_path, state="success")
+    upload(tmp_path, run["id"], document(status="skipped", reason="no reviewable files changed", findings=[]))
+    review = reports(run, tmp_path, store, [])["review"]
+    assert review["state"] == "skipped"
+    body = comment_body(run, "review", review, "https://example.com/run")
+    assert body.startswith("### mergeCraft review (OpenAI Agents SDK, run by CI)")
+    assert "- Outcome: **skipped by the workflow**" in body
+    assert "no reviewable files changed" in body
+    assert "not in my-ci's review sandbox" in body
+    assert "The workflow completed no review" in body
+
+
+def test_corrupt_deflate_and_deeply_nested_json_are_no_report_not_a_crash(tmp_path):
+    store, run = finished(tmp_path)
+    archive = upload(tmp_path, run["id"], document())
+    data = bytearray(archive.read_bytes())
+    # Damage the compressed stream after the local header, leaving the directory intact.
+    start = 30 + len(FILENAME)
+    data[start : start + 40] = b"\xff" * 40
+    archive.write_bytes(bytes(data))
+    review = reports(run, tmp_path, store, [])["review"]
+    assert review["state"] == "unavailable"
+    assert "could not be" in review["diagnostics"][0]
+
+    shutil.rmtree(archive.parent.parent)
+    upload(tmp_path, run["id"], "[" * 200_000 + "]" * 200_000)
+    review = reports(run, tmp_path, store, [])["review"]
+    assert review["state"] == "unavailable"
+    assert "is not UTF-8 JSON" in review["diagnostics"][0]
+
+
+def test_any_unexpected_reader_error_is_no_report(tmp_path, monkeypatch):
+    store, run = finished(tmp_path)
+    upload(tmp_path, run["id"], document())
+
+    def broken(*_):
+        raise MemoryError
+
+    monkeypatch.setattr("localci.workflow_review.read", broken)
+    review = reports(run, tmp_path, store, [])["review"]
+    assert review["state"] == "unavailable"
+    assert "could not be read (MemoryError)" in review["diagnostics"][0]
+
+
 def test_symlinked_artifact_is_ignored(tmp_path):
     store, run = finished(tmp_path)
     elsewhere = upload(tmp_path, "elsewhere", document())
