@@ -56,6 +56,9 @@ class RepoConfig(BaseModel):
 
     # Bot-authored PRs carry third-party content; they wait for an operator unless enabled.
     run_bot_prs: bool = False
+    # With native review off, publish the mergeCraft review report a CI workflow uploaded
+    # (artifact mergecraft-agents-sdk-review) as this run's review message.
+    publish_workflow_review: bool = False
 
     @field_validator("workflows")
     @classmethod
