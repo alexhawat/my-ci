@@ -242,10 +242,23 @@ class Controller:
                 reporting = await self.github.status(
                     run, state, description, f"{self.base_url}/?run={run['id']}"
                 )
-                for kind, report in evidence.items():
-                    await self.github.comment(
+                order = list(evidence)
+                if evidence.get("review", {}).get("source") == "workflow" and "ci" in evidence:
+                    # The CI comment links the review a workflow reported, so post that first.
+                    order = ["review", "ci"]
+                for kind in order:
+                    report = evidence[kind]
+                    published = await self.github.comment(
                         run, kind, comment_body(run, kind, report, f"{self.base_url}/?run={run['id']}")
                     )
+                    if (
+                        kind == "review"
+                        and report.get("source") == "workflow"
+                        and "ci" in evidence
+                        and isinstance(published, dict)
+                        and str(published.get("html_url", "")).startswith("https://github.com/")
+                    ):
+                        evidence["ci"]["review_url"] = published["html_url"]
                 if reporting:
                     await asyncio.to_thread(
                         self.store.execute,

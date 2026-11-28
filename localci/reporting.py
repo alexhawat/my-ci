@@ -16,6 +16,8 @@ from localci.review_evidence import (
 )
 from localci.review_profile import summarize as summarize_profile
 from localci.runner import sanitize
+from localci.workflow_review import ARTIFACT as WORKFLOW_REVIEW_ARTIFACT
+from localci.workflow_review import report as workflow_review_report
 
 TERMINAL = {"success", "failure", "error", "blocked", "cancelled", "skipped"}
 
@@ -123,6 +125,11 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
                         }
                         | {"evidence": [clean(e, secrets, 1000) for e in item.get("evidence", [])[:8]]}
                     )
+        elif config.get("workflows") and config.get("publish_workflow_review") and final:
+            # Native review is off; a CI workflow reviewed and uploaded its report.
+            result["review"] = workflow_review_report(
+                root / "artifacts" / run["id"], run["head"], lambda value, limit: clean(value, secrets, limit)
+            )
         elif config.get("workflows"):
             result["review"] = {
                 "state": "skipped",
@@ -132,7 +139,12 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
             }
     if "ci" in result:
         result["ci"]["jobs"] = ci_evidence(run, store, lambda value: clean(value, secrets, 1200))
-    if "review" in result and result["review"]["state"] not in {"skipped", "not run"}:
+    # A workflow's review carries its own record; my-ci's review evidence files do not apply.
+    if (
+        "review" in result
+        and result["review"]["state"] not in {"skipped", "not run"}
+        and result["review"].get("source") != "workflow"
+    ):
         add_review_record(result["review"], root / "artifacts" / run["id"], secrets)
         if any(a.get("status") == "unavailable" for a in result["review"].get("analyzers", [])):
             rows = store.rows(
@@ -153,7 +165,7 @@ def reports(run: dict, root: Path, store, secrets: list[str]) -> dict:
             }
             for s in report["checks"]
         ]
-        if report["state"] in BAD | {"cancelled"}:
+        if report["state"] in BAD | {"cancelled"} and report.get("source") != "workflow":
             if kind == "ci":
                 for job in report.get("jobs", []):
                     for check in job["checks"]:
@@ -232,6 +244,8 @@ def comment_body(run: dict, kind: str, report: dict, url: str) -> str:
     if kind == "review" and report["state"] == "skipped":
         reason = "; ".join(c["message"] for c in report["checks"]) or "; ".join(report["diagnostics"])
         return f"### mergeCraft: skipped\n\n{literal(reason, block=True)}\n\n{footer}"
+    if kind == "review" and report.get("source") == "workflow":
+        return workflow_review_body(run, report, url)
     if kind == "review":
         return review_body(run, report, url)
     title = "my-ci"
@@ -246,6 +260,11 @@ def comment_body(run: dict, kind: str, report: dict, url: str) -> str:
     ]
     for check in report["checks"]:
         lines.append(f"- **{literal(check['name'])}: {check['state']}** — {literal(check['message'])}")
+    if report.get("review_url"):
+        lines += [
+            "",
+            f"mergeCraft review reported by the CI workflow: [review for this commit]({report['review_url']})",
+        ]
     if report["diagnostics"]:
         lines += ["", "### Diagnostic details", "", "Bounded output from failed checks:", ""]
         for diagnostic in report["diagnostics"][:6]:
@@ -654,4 +673,77 @@ def review_body(run: dict, report: dict, url: str) -> str:
             body[:58000]
             + "\n\n</details>\nReport truncated. Full evidence is available in the private run artifacts."
         )
+    return body
+
+
+def workflow_review_body(run: dict, report: dict, url: str) -> str:
+    """The review a CI workflow ran and uploaded, in the shape of the native review message."""
+    footer = f"Commit `{run['head']}` · run `{run['id']}`\n\n[Full run, logs and artifacts — Tailscale access required]({url})"
+    origin = (
+        "This review ran inside a CI job of this pull request through mergeCraft's OpenAI Agents SDK "
+        "integration, not in my-ci's review sandbox. my-ci publishes what the workflow reported: "
+        "it is the workflow's claim, and CI's own result is reported separately."
+    )
+    if report["state"] == "unavailable":
+        reason = "; ".join(report["diagnostics"]) or "no report"
+        return (
+            "### mergeCraft review (OpenAI Agents SDK): no report\n\n"
+            f"{literal(reason)} A missing report is not a clean review; see the CI workflow's log.\n\n"
+            f"{origin}\n\n{footer}"
+        )
+    review = report["workflow_review"]
+    record = report["record"]
+    lines = [
+        "### mergeCraft review (OpenAI Agents SDK, run by CI)",
+        "",
+        f"- Outcome: **{literal(report['result_label'])}**",
+        f"- Failure threshold: {literal(report['failure_threshold'])}",
+        f"- Change: {literal(run['repo'])}#{run['pr']}",
+        f"- Reviewed commit: `{run['head']}` · base `{run.get('base', 'unavailable')}`",
+        f"- Provider: {literal(record['provider'])}",
+        f"- Model: {literal(record['model'])}",
+        f"- Tokens: {literal(record['tokens'])}",
+        f"- Scope: {len(review['changed_files'])} files reviewed · "
+        f"{len(review['omitted_files'])} generated files listed without content",
+        f"- Dropped findings: {len(review['dropped'])} removed by mergeCraft's guardrails",
+        f"- Run: `{run['id']}` · [Full run, logs and artifacts — Tailscale access required]({url})",
+        f"- Publication path: my-ci native GitHub COMMENT review, from the CI artifact {WORKFLOW_REVIEW_ARTIFACT}",
+        "",
+        origin,
+        "",
+        "<details><summary>Review scope</summary>",
+        "",
+        "Files reviewed:",
+    ]
+    lines += [f"- {literal(f)}" for f in review["changed_files"]] or ["- none recorded"]
+    lines += ["", "Changed files listed without content (generated, lockfiles):"]
+    lines += [f"- {literal(f)}" for f in review["omitted_files"]] or ["- none"]
+    lines += ["", "</details>", "", "<details open><summary>Change-scoped findings</summary>", ""]
+    for f in report["findings"]:
+        location = f"{f['path']}:{f['start_line']}" if f["start_line"] else f["path"]
+        lines += [
+            f"#### {literal(f['severity'])} — {literal(location)}",
+            "",
+            literal(f["message"], block=True),
+            "",
+        ]
+        if f["remediation"]:
+            lines += [f"- Suggested fix: {literal(f['remediation'])}", ""]
+    if not report["findings"]:
+        lines += [
+            "No findings in the workflow's report. This alone is not an approval."
+            if review["status"] == "reviewed"
+            else "The workflow completed no review, so there are no findings to show."
+        ]
+    if report["finding_count"] > len(report["findings"]):
+        lines += ["", "Additional findings are in the CI artifact."]
+    lines += ["", "</details>", "", "<details><summary>Dropped findings</summary>", ""]
+    lines += [f"- {literal(d)}" for d in review["dropped"]] or ["No findings were dropped."]
+    lines += ["", "</details>", "", "### Review summary", ""]
+    lines += [literal(report.get("narrative") or "The workflow reported no summary.", block=True)]
+    if report["diagnostics"]:
+        lines += ["", "### Diagnostic details", *[f"- {literal(d)}" for d in report["diagnostics"] if d]]
+    body = "\n".join(lines)
+    if len(body) > 60000:
+        body = body[:58000] + "\n\n</details>\nReview truncated. The full report is in the CI artifact."
     return body
