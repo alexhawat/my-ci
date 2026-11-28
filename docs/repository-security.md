@@ -91,8 +91,13 @@ These cannot be set from a pull request. Do them once, in this order.
    ruleset → `.github/rulesets/protect-main.json`. It requires a pull request
    for every change to `main`, blocks force pushes and deletion, requires
    resolved review threads, and requires `CI gate` and `mergeCraft review`
-   from GitHub Actions on an up-to-date branch. The owner can bypass it, on a
-   pull request only.
+   from GitHub Actions on an up-to-date branch. Pull requests merge with a
+   merge commit or a rebase, never a squash; also turn off "Allow squash
+   merging" under Settings → General so the merge button does not offer it.
+   A merge commit made on GitHub is authored with the email picked in the
+   merge dialog, and the release tests fail on any commit on `main` without a
+   noreply identity, so merge with your `users.noreply.github.com` address.
+   The owner can bypass it, on a pull request only.
 4. **Actions → General.**
    - Fork pull request workflows: require approval for all external
      contributors.
